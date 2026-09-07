@@ -1,0 +1,14 @@
+{
+  "llm_provider": "gemini",
+  "gemini_chat_model": "gemini-3.5-flash-lite",
+  "openai_chat_model": "gpt-4o",
+  "openai_embedding_model": "text-embedding-3-small",
+  "chroma_persist_directory": "./chroma_data",
+  "chroma_collection_name": "codesage",
+  "chunk_size": 700,
+  "chunk_overlap": 150,
+  "top_k_results": 5,
+  "langchain_project": "codesage",
+  "port": 8000,
+  "cors_origins": "http://localhost:3000,http://localhost:5173"
+}
