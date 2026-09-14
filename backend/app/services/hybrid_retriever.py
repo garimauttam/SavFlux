@@ -15,6 +15,20 @@ from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
 
+def _normalize_repo_url(url: str) -> str:
+    """
+    Normalize a repo URL for comparison in the BM25 filter.
+
+    ChromaDB stores the normalized form (no trailing slash, no .git suffix).
+    The caller may pass a URL in a different form — strip these so the filter
+    doesn't silently return 0 results due to a trailing slash mismatch.
+    """
+    url = url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    return url
+
+
 def _tokenize(text: str) -> List[str]:
     """
     Code-aware tokenizer for BM25.
@@ -53,8 +67,14 @@ class BM25Index:
 
         scores = self.bm25.get_scores(tokens)
 
-        # Resolve repo filter: repo_urls (plural) takes precedence over repo_url (singular)
-        _repo_set = set(repo_urls) if repo_urls else ({repo_url} if repo_url else None)
+        # Resolve repo filter: repo_urls (plural) takes precedence over repo_url (singular).
+        # Normalize all URLs so trailing-slash / .git variants don't cause silent misses.
+        if repo_urls:
+            _repo_set: set[str] | None = {_normalize_repo_url(u) for u in repo_urls}
+        elif repo_url:
+            _repo_set = {_normalize_repo_url(repo_url)}
+        else:
+            _repo_set = None
 
         # Pair with documents and filter if needed
         doc_scores = []
@@ -63,8 +83,8 @@ class BM25Index:
                 continue
             doc = self.documents[idx]
 
-            # Apply repo filter if provided
-            if _repo_set and doc.metadata.get("repo_url") not in _repo_set:
+            # Apply repo filter if provided — compare normalized forms
+            if _repo_set and _normalize_repo_url(doc.metadata.get("repo_url", "")) not in _repo_set:
                 continue
             
             # Apply file filter if provided
@@ -105,3 +125,22 @@ def reciprocal_rank_fusion(
 
     sorted_doc_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
     return [doc_lookup[doc_id] for doc_id in sorted_doc_ids[:top_n]]
+
+
+def diversify_documents(
+    documents: List[Document],
+    top_n: int,
+    max_per_source: int = 2,
+) -> List[Document]:
+    """Keep high-ranked evidence while preventing one file dominating context."""
+    selected: List[Document] = []
+    source_counts: dict[str, int] = {}
+    for document in documents:
+        source = document.metadata.get("source", "")
+        if source_counts.get(source, 0) >= max_per_source:
+            continue
+        selected.append(document)
+        source_counts[source] = source_counts.get(source, 0) + 1
+        if len(selected) >= top_n:
+            break
+    return selected
