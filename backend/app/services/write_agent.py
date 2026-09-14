@@ -110,31 +110,45 @@ async def stream_code_write(
 
         try:
             from app.services.ingestion_service import _get_vectorstore
+            from app.services.chunk_reconstruction import reconstruct_chunks
+            from collections import defaultdict
             vs = _get_vectorstore()
             collection = vs._collection
 
-            def _reconstruct_file(src: str) -> tuple[str, str, str]:
-                """Reconstruct full file content from its ChromaDB chunks."""
-                results = collection.get(
-                    where={"source": src},
-                    include=["documents", "metadatas"],
-                )
-                docs   = results.get("documents") or []
-                metas  = results.get("metadatas") or []
-                if not docs:
+            # ── Batch-fetch all required sources in one ChromaDB call ─────────
+            # The original code called collection.get() once per source in a loop
+            # (N sequential round-trips ~50ms each). A single $in query fetches
+            # all chunks for all sources at once and we group them in Python.
+            all_sources = list(dict.fromkeys(context_sources))  # dedup, preserve order
+            where_filter = (
+                {"source": {"$in": all_sources}}
+                if len(all_sources) > 1
+                else {"source": all_sources[0]}
+            )
+            batch = collection.get(where=where_filter, include=["documents", "metadatas"])
+            all_docs  = batch.get("documents") or []
+            all_metas = batch.get("metadatas") or []
+
+            # Group chunks by source
+            grouped: dict[str, list[tuple[dict, str]]] = defaultdict(list)
+            for meta, doc in zip(all_metas, all_docs):
+                src = meta.get("source", "")
+                if src:
+                    grouped[src].append((meta, doc))
+
+            def _reconstruct_from_group(src: str) -> tuple[str, str, str]:
+                """Reconstruct a file from its pre-fetched chunks."""
+                pairs = grouped.get(src, [])
+                if not pairs:
                     return "", "", ""
-                sorted_chunks = sorted(
-                    zip(metas, docs),
-                    key=lambda x: x[0].get("chunk_index", 0),
-                )
-                content = "\n".join(c[1] for c in sorted_chunks)
-                fname   = metas[0].get("file_name", src.split("/")[-1])
-                lang    = metas[0].get("language", "")
+                content = reconstruct_chunks(pairs)
+                fname   = pairs[0][0].get("file_name", src.split("/")[-1])
+                lang    = pairs[0][0].get("language", "")
                 return content, fname, lang
 
             if mode in ("edit", "tests"):
                 # First source = the target file to edit or test
-                target_content, target_fname, target_lang = _reconstruct_file(context_sources[0])
+                target_content, target_fname, target_lang = _reconstruct_from_group(context_sources[0])
                 # Remaining sources = style references (same as generate mode below)
                 style_sources = context_sources[1:5]
             else:
@@ -173,10 +187,10 @@ async def stream_code_write(
                     else:
                         raise ValueError("no results from similarity search")
                 except Exception:
-                    # Fallback: reconstruct full files (capped at 3000 chars each)
+                    # Fallback: reconstruct from pre-fetched groups (no extra DB calls)
                     snippets = []
                     for src in style_sources:
-                        content, fname, lang = _reconstruct_file(src)
+                        content, fname, lang = _reconstruct_from_group(src)
                         if content:
                             snippets.append(f"### {fname}\n```{lang}\n{content[:3000]}\n```")
                     context_text = "\n\n".join(snippets)
@@ -185,7 +199,7 @@ async def stream_code_write(
                 # For edit/tests modes: include style references as full reconstructed files
                 snippets = []
                 for src in style_sources:
-                    content, fname, lang = _reconstruct_file(src)
+                    content, fname, lang = _reconstruct_from_group(src)
                     if content:
                         snippets.append(f"### {fname}\n```{lang}\n{content[:2000]}\n```")
                 context_text = "\n\n".join(snippets)
@@ -229,8 +243,14 @@ async def stream_code_write(
             f"\n\n## Existing test files (match this style):\n\n{context_text}"
             if context_text else ""
         )
+        # Derive the test file extension from the target file's own extension,
+        # not from the user-supplied `language` string.
+        # `language` is a human-readable name like "python" or "typescript";
+        # `target_lang` is the short extension stored in ChromaDB metadata ("py", "ts").
+        # Using `language` would produce "test_auth.python" instead of "test_auth.py".
+        target_ext = target_lang if target_lang else (target_fname.rsplit(".", 1)[-1] if "." in target_fname else language)
         base = target_fname.rsplit(".", 1)[0]
-        test_file_name = f"test_{base}.{language}" if not file_name.startswith("test_") else file_name
+        test_file_name = f"test_{base}.{target_ext}" if not file_name.startswith("test_") else file_name
         user_message = (
             f"Write a complete test file `{test_file_name}` for the following {target_lang} code:\n\n"
             f"```{target_lang}\n{target_content}\n```\n\n"
