@@ -22,8 +22,18 @@ noticeably on ambiguous questions without adding any API cost."
 """
 
 import asyncio
+import logging
 from functools import lru_cache
 from langchain_core.documents import Document
+
+logger = logging.getLogger(__name__)
+# _reranker_unavailable is NOT a module-level permanent flag.
+# Per-call exception handling falls back to unranked docs for that request only;
+# the model is retried on the next request.  A permanent flag would silently
+# disable reranking for the server lifetime after a single transient failure
+# (e.g. one bad CI test run).
+_reranker_failure_count = 0
+_RERANKER_MAX_FAILURES = 5   # disable after 5 consecutive failures (real breakage)
 
 # We import lazily inside the function to avoid loading the 80MB model
 # at import time (which would slow down every cold start, even for requests
@@ -60,8 +70,10 @@ async def rerank(
     Running it directly in the async event loop would block all other requests.
     asyncio.to_thread() moves it to a thread pool — event loop stays free.
     """
-    if len(documents) <= top_n:
-        # Not enough docs to bother re-ranking — return as-is
+    global _reranker_failure_count
+    if len(documents) <= top_n or _reranker_failure_count >= _RERANKER_MAX_FAILURES:
+        # Not enough docs to bother re-ranking — return as-is.
+        # Also skip if the cross-encoder has failed repeatedly (real breakage).
         return documents
 
     def _score():
@@ -73,4 +85,24 @@ async def rerank(
         scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
         return [doc for _, doc in scored[:top_n]]
 
-    return await asyncio.to_thread(_score)
+    try:
+        result = await asyncio.to_thread(_score)
+        _reranker_failure_count = 0  # reset on success
+        return result
+    except Exception as exc:
+        # Retrieval must remain usable when optional ML dependencies cannot load
+        # (e.g. TensorFlow/Transformers binary mismatch in CI).
+        # Count consecutive failures; only give up after _RERANKER_MAX_FAILURES.
+        _reranker_failure_count += 1
+        if _reranker_failure_count >= _RERANKER_MAX_FAILURES:
+            logger.warning(
+                "Cross-encoder reranking permanently disabled after %d failures. "
+                "Last error: %s",
+                _reranker_failure_count, exc,
+            )
+        else:
+            logger.warning(
+                "Cross-encoder reranking failed (attempt %d/%d); using fused rank: %s",
+                _reranker_failure_count, _RERANKER_MAX_FAILURES, exc,
+            )
+        return documents[:top_n]
