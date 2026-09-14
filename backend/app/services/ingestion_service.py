@@ -17,6 +17,7 @@ The pipeline:
 
 import hashlib
 import os
+import re
 import shutil
 import tempfile
 import asyncio
@@ -28,12 +29,27 @@ from langchain.text_splitter import Language, RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import TextLoader
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
+from chromadb.config import Settings as ChromaSettings
 
 from app.core.config import get_settings
 from app.services.llm_factory import get_embedding_fn
 from app.services.ast_chunker import chunk_python_file
 
 settings = get_settings()
+ingestion_lock = asyncio.Lock()
+
+
+def normalize_repo_url(repo_url: str) -> str:
+    """Normalize GitHub repo URLs so repeated ingests hit the same index scope."""
+    url = repo_url.strip()
+    git_match = re.match(r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>.+?)(?:\.git)?$", url)
+    if git_match:
+        return f"https://github.com/{git_match.group('owner')}/{git_match.group('repo')}"
+    if url.startswith("https://github.com/"):
+        url = url.rstrip("/")
+        if url.endswith(".git"):
+            url = url[:-4]
+    return url
 
 # ── Language detection ────────────────────────────────────────────────────────
 # Maps file extensions → LangChain Language enum
@@ -73,11 +89,24 @@ def _get_vectorstore() -> Chroma:
 
     get_embedding_fn() is provider-aware: OpenAI embeddings or local MiniLM
     depending on LLM_PROVIDER. MUST match whatever was used at index time.
+
+    WHY client= INSTEAD OF persist_directory= + client_settings=?
+    langchain-chroma==0.1.1 internally calls chromadb.Client(_client_settings).
+    In chromadb==0.5.0, chromadb.Client() was changed to always create an
+    ephemeral (in-memory) client regardless of Settings.is_persistent or
+    persist_directory — only chromadb.PersistentClient(path=...) creates a
+    durable client. Passing a pre-built PersistentClient via client= bypasses
+    the broken auto-creation path and ensures all writes land on disk.
     """
+    import chromadb as _chromadb
+    persistent_client = _chromadb.PersistentClient(
+        path=settings.chroma_persist_directory,
+        settings=ChromaSettings(anonymized_telemetry=False),
+    )
     return Chroma(
+        client=persistent_client,
         collection_name=settings.chroma_collection_name,
         embedding_function=get_embedding_fn(),
-        persist_directory=settings.chroma_persist_directory,
     )
 
 
@@ -101,7 +130,11 @@ def _collect_files(root: Path) -> list[Path]:
     return collected
 
 
-def _load_and_split(files: list[Path], repo_url: str) -> list[Document]:
+def _load_and_split(
+    files: list[Path],
+    repo_url: str,
+    source_root: Path | None = None,
+) -> list[Document]:
     """
     Load each file and split into chunks.
 
@@ -135,13 +168,19 @@ def _load_and_split(files: list[Path], repo_url: str) -> list[Document]:
 
         source_text = raw_docs[0].page_content if raw_docs else ""
 
+        # GitHub clones are temporary, so use a stable repo-relative source ID.
+        # The physical path remains available for the current ingestion only.
+        source_id = str(fpath)
+        if source_root is not None:
+            source_id = f"{repo_url}::{fpath.relative_to(source_root).as_posix()}"
+
         # ── Python: AST-boundary chunking ─────────────────────────────────────
         # Produces one chunk per top-level function/class — far better retrieval
         # precision than character-based splitting for code Q&A.
         if ext == ".py" and source_text:
             ast_chunks = chunk_python_file(
                 source=source_text,
-                file_path=str(fpath),
+                file_path=source_id,
                 file_name=fpath.name,
                 language="py",
                 repo_url=repo_url,
@@ -173,7 +212,8 @@ def _load_and_split(files: list[Path], repo_url: str) -> list[Document]:
         # Without metadata, you'd get answers but no way to cite where they came from
         for i, chunk in enumerate(chunks):
             chunk.metadata.update({
-                "source": str(fpath),           # absolute path on disk
+                "source": source_id,            # stable ID for cloned repos
+                "physical_path": str(fpath),    # temporary path, if still available
                 "file_name": fpath.name,         # just "auth.py"
                 "language": ext.lstrip("."),     # "py", "js", etc.
                 "repo_url": repo_url,
@@ -202,6 +242,7 @@ async def ingest_github_repo(
     branch: when provided, clones that specific branch. When None, git uses
             the repo's default branch (whatever HEAD points to).
     """
+    repo_url = normalize_repo_url(repo_url)
     tmp_dir = tempfile.mkdtemp()
 
     try:
@@ -241,7 +282,9 @@ async def ingest_github_repo(
             })
 
         # ── Step 3: Split into chunks ─────────────────────────────────────────
-        documents = await asyncio.to_thread(_load_and_split, files, repo_url)
+        documents = await asyncio.to_thread(
+            _load_and_split, files, repo_url, Path(tmp_dir)
+        )
 
         if progress_callback:
             await progress_callback({
@@ -262,17 +305,18 @@ async def ingest_github_repo(
         #   5. Embed only the new/changed chunks
         vectorstore = _get_vectorstore()
 
-        # Build a map: source_path → {hash, ids} from the current index
+        # Build a map: source_path → {hash, ids} from the current index.
+        # Normalize repo URLs while reading so older entries such as trailing
+        # slash/.git variants are treated as the same repo and cleaned up.
         indexed_map: dict[str, dict] = {}  # source → {"hash": str, "ids": [str]}
         try:
-            existing = vectorstore._collection.get(
-                where={"repo_url": repo_url},
-                include=["metadatas"],
-            )
+            existing = vectorstore._collection.get(include=["metadatas"])
             for eid, emeta in zip(
                 existing.get("ids") or [],
                 existing.get("metadatas") or [],
             ):
+                if normalize_repo_url(emeta.get("repo_url", "")) != repo_url:
+                    continue
                 src = emeta.get("source", "")
                 chash = emeta.get("content_hash", "")
                 if src not in indexed_map:
@@ -301,7 +345,10 @@ async def ingest_github_repo(
             new_docs.append(doc)
 
         # Delete IDs for files that no longer exist in the repo (removed files)
-        current_sources = {str(f) for f in files}
+        current_sources = {
+            f"{repo_url}::{f.relative_to(Path(tmp_dir)).as_posix()}"
+            for f in files
+        }
         for src, info in indexed_map.items():
             if src not in current_sources:
                 stale_ids.extend(info["ids"])
@@ -313,7 +360,13 @@ async def ingest_github_repo(
             except Exception:
                 pass
 
-        files_skipped = len(files) - len({d.metadata["source"] for d in new_docs})
+        # Count skipped files as: total files collected minus unique source paths
+        # that actually appear in new_docs (files that needed re-embedding).
+        # Using seen_sources (populated during the partition loop above) is correct:
+        # it holds exactly one entry per file that was NOT skipped.
+        # Using a set over new_docs chunks would undercount if the same source
+        # appears in multiple chunks but fewer chunks than total files.
+        files_skipped = len(files) - len(seen_sources)
 
         if progress_callback:
             msg = (
@@ -350,6 +403,15 @@ async def ingest_github_repo(
         except Exception:
             pass  # non-fatal — next cold start will fix it
 
+        # Invalidate the BM25 disk cache — the collection just changed.
+        # The next query will rebuild the BM25 index from the updated ChromaDB
+        # and re-save it to disk automatically.
+        try:
+            from app.services.retrieval_service import invalidate_bm25_cache
+            invalidate_bm25_cache()
+        except Exception:
+            pass
+
         chunks_added = len(new_docs)
         if progress_callback:
             skip_note = f" ({files_skipped} unchanged)" if files_skipped else ""
@@ -375,6 +437,13 @@ async def ingest_uploaded_files(files_content: list[tuple[str, bytes]]) -> dict:
     """
     Ingestion for direct file uploads (when user doesn't have a GitHub URL).
     files_content: list of (filename, raw_bytes) tuples
+
+    WHY _get_vectorstore() + add_documents() instead of Chroma.from_documents()?
+    In chromadb==0.5.0, Chroma.from_documents(client_settings=...) internally calls
+    chromadb.Client() which is always ephemeral (in-memory). The uploaded chunks are
+    written to a throwaway store and lost the moment the call returns.
+    Using _get_vectorstore() creates a PersistentClient — the same durable SQLite-backed
+    store used by the GitHub ingestion path — so uploads survive restarts.
     """
     tmp_dir = tempfile.mkdtemp()
 
@@ -389,7 +458,6 @@ async def ingest_uploaded_files(files_content: list[tuple[str, bytes]]) -> dict:
         documents = await asyncio.to_thread(_load_and_split, paths, "uploaded_files")
 
         # Guard: if every file failed to parse, documents will be empty.
-        # Chroma.from_documents([]) raises a ValueError — handle it explicitly.
         if not documents:
             return {
                 "status": "error",
@@ -397,18 +465,24 @@ async def ingest_uploaded_files(files_content: list[tuple[str, bytes]]) -> dict:
                            "Check that the files are valid text/code files.",
             }
 
-        await asyncio.to_thread(
-            Chroma.from_documents,
-            documents=documents,
-            embedding=get_embedding_fn(),
-            collection_name=settings.chroma_collection_name,
-            persist_directory=settings.chroma_persist_directory,
-        )
+        # Use the same PersistentClient-backed store as ingest_github_repo.
+        vectorstore = _get_vectorstore()
+        BATCH_SIZE = 100
+        for i in range(0, len(documents), BATCH_SIZE):
+            batch = documents[i:i + BATCH_SIZE]
+            await asyncio.to_thread(vectorstore.add_documents, documents=batch)
 
         # Invalidate read singleton — same reason as in ingest_github_repo
         try:
             from app.services.retrieval_service import _get_vectorstore as _rv
             _rv.cache_clear()
+        except Exception:
+            pass
+
+        # Invalidate BM25 disk cache — collection just changed
+        try:
+            from app.services.retrieval_service import invalidate_bm25_cache
+            invalidate_bm25_cache()
         except Exception:
             pass
 
@@ -433,29 +507,43 @@ async def clear_index(repo_url: str | None = None) -> dict:
     Deleting the folder works but is OS-dependent and not thread-safe if another
     request is reading. ChromaDB's own delete() API is the correct way — it handles
     locking and keeps the SQLite WAL consistent.
+
+    WHY _get_raw_collection() INSTEAD OF _get_vectorstore()?
+    _get_vectorstore() calls get_embedding_fn() which imports sentence-transformers
+    for non-OpenAI providers. If that package is absent the whole endpoint crashes
+    with 500. Clear only needs raw ChromaDB metadata + delete — no embeddings.
     """
-    vectorstore = _get_vectorstore()
-    collection = vectorstore._collection
+    collection = await asyncio.to_thread(_get_raw_collection)
 
     def _bust_read_cache():
-        """Invalidate the retrieval singleton so next query sees the mutations."""
+        """Invalidate the retrieval singleton and BM25 disk cache so next query sees the mutations."""
         try:
             from app.services.retrieval_service import _get_vectorstore as _rv
             _rv.cache_clear()
         except Exception:
             pass
+        try:
+            from app.services.retrieval_service import invalidate_bm25_cache
+            invalidate_bm25_cache()
+        except Exception:
+            pass
 
     if repo_url:
+        normalized_repo_url = normalize_repo_url(repo_url)
         # Targeted delete — only this repo's chunks
         try:
-            existing = vectorstore.get(where={"repo_url": repo_url})
-            ids = existing.get("ids") or []
+            existing = collection.get(include=["metadatas"])
+            ids = [
+                eid
+                for eid, metadata in zip(existing.get("ids") or [], existing.get("metadatas") or [])
+                if normalize_repo_url(metadata.get("repo_url", "")) == normalized_repo_url
+            ]
             if ids:
-                vectorstore.delete(ids=ids)
+                collection.delete(ids=ids)
             _bust_read_cache()
             return {
                 "status": "success",
-                "message": f"Cleared {len(ids)} chunks for repo: {repo_url}",
+                "message": f"Cleared {len(ids)} chunks for repo: {normalized_repo_url}",
                 "deleted": len(ids),
             }
         except Exception as e:
@@ -481,19 +569,36 @@ async def clear_index(repo_url: str | None = None) -> dict:
             return {"status": "error", "message": str(e)}
 
 
+def _get_raw_collection():
+    """
+    Returns a raw ChromaDB collection without requiring an embedding function.
+
+    WHY NOT USE _get_vectorstore() HERE?
+    _get_vectorstore() calls get_embedding_fn() which imports sentence-transformers for
+    non-OpenAI providers. If sentence-transformers is not installed, get_indexed_repos()
+    crashes with ImportError → HTTP 500. Metadata listing never needs embeddings.
+    """
+    import chromadb
+    from chromadb.config import Settings as ChromaSettings
+    client = chromadb.PersistentClient(
+        path=settings.chroma_persist_directory,
+        settings=ChromaSettings(anonymized_telemetry=False),
+    )
+    return client.get_or_create_collection(settings.chroma_collection_name)
+
+
 async def get_indexed_repos() -> list[dict]:
     """
     Returns all unique repo URLs currently in the vector store, with chunk counts.
     Used by the frontend's active-repo selector.
     """
-    vectorstore = _get_vectorstore()
-    collection = vectorstore._collection
+    collection = await asyncio.to_thread(_get_raw_collection)
     results = collection.get(include=["metadatas"])
     metadatas = results.get("metadatas") or []
 
     repo_counts: dict[str, int] = {}
     for m in metadatas:
-        url = m.get("repo_url", "")
+        url = normalize_repo_url(m.get("repo_url", ""))
         if url:
             repo_counts[url] = repo_counts.get(url, 0) + 1
 
