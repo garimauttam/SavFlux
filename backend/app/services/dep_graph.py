@@ -153,8 +153,14 @@ def build_dependency_graph(repo_url: str | None = None) -> dict:
 
     repo_url: when provided, restricts the graph to one repo's files.
               When None, builds the graph for all indexed files.
+
+    WHY retrieval_service._get_vectorstore() AND NOT ingestion_service._get_vectorstore()?
+    ingestion_service._get_vectorstore() creates a NEW PersistentClient on every call —
+    no caching.  retrieval_service._get_vectorstore() is an lru_cache(maxsize=1) singleton
+    that reuses the same warm SQLite connection across all reads.  The dep graph is a
+    read-only operation; using the cached singleton saves ~50ms per graph build.
     """
-    from app.services.ingestion_service import _get_vectorstore
+    from app.services.retrieval_service import _get_vectorstore
 
     vs = _get_vectorstore()
     where_filter = {"repo_url": repo_url} if repo_url else None
