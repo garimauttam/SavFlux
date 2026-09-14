@@ -1,22 +1,135 @@
 """
-query_enhancer.py — Query expansion and conversation summarization/compaction.
+query_enhancer.py — Query expansion, intent routing, and conversation summarization.
 
 1. File Tag Extraction:
    Detects `@filename` or `@path/to/file` in user queries (e.g., "@auth.py where is login implemented?")
    and extracts both the clean question and the target file filter.
 
-2. Query Expansion (Multi-Query):
+2. Intent-Based Query Routing  (Idea 2 — from awesome-llm-apps/rag_database_routing)
+   Classifies the query intent into one of 5 namespaces using pure keyword matching
+   (zero LLM calls). Each namespace maps to a ChromaDB metadata filter so retrieval
+   only scans the relevant subset of the index.
+   Namespace → typical coverage:
+     security  → auth, token, password, injection, XSS, SQL, secret files
+     tests     → test_*.py, *.spec.ts, *.test.tsx files
+     config    → .env, settings, config, yaml, json, docker files
+     api       → routes, endpoints, controllers, HTTP handlers
+     general   → everything (no filter applied)
+
+3. Query Expansion (Multi-Query):
    Generates complementary technical variations of the query for better retrieval recall.
 
-3. Context Compaction:
+4. Context Compaction:
    Compacts long conversation turns into a succinct structured summary so token budgets
    are preserved for code snippets.
 """
 
 import re
-from typing import Tuple, Optional, List
-from langchain_core.messages import SystemMessage, HumanMessage
-from app.services.llm_factory import get_chat_llm
+from typing import Tuple, Optional, List, Literal
+
+
+# ── Intent-based query routing ────────────────────────────────────────────────
+
+QueryIntent = Literal["security", "tests", "config", "api", "general"]
+
+# Keyword sets per namespace — deterministic, zero LLM cost.
+_INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "security": (
+        "auth", "authentication", "authoriz", "login", "logout", "session",
+        "jwt", "token", "password", "secret", "api key", "api_key",
+        "injection", "xss", "csrf", "sql inject", "vulnerability", "exploit",
+        "sanitiz", "escape", "hashing", "bcrypt", "oauth", "rbac", "permission",
+        "cors", "rate limit",
+    ),
+    "tests": (
+        "test", "spec", "unit test", "integration test", "pytest", "jest",
+        "fixture", "mock", "assert", "coverage", "conftest",
+    ),
+    "config": (
+        "config", "configuration", "setting", "environment", ".env", "dotenv",
+        "docker", "compose", "yaml", "yml", "json config", "secret key",
+        "deploy", "railway", "vercel", "ci/cd", "github action", "workflow",
+    ),
+    "api": (
+        "endpoint", "route", "router", "controller", "handler", "http",
+        "get request", "post request", "rest api", "fastapi", "express",
+        "middleware", "request", "response", "status code", "webhook",
+    ),
+}
+
+# Language/file-name metadata filters for each intent.
+# These are applied as ChromaDB `where` clauses.
+_INTENT_FILTERS: dict[str, dict] = {
+    "security": {
+        "$or": [
+            {"file_name": {"$contains": "auth"}},
+            {"file_name": {"$contains": "security"}},
+            {"file_name": {"$contains": "token"}},
+            {"file_name": {"$contains": "permission"}},
+            {"language": {"$in": ["py", "ts", "js"]}},
+        ]
+    },
+    "tests": {
+        "$or": [
+            {"file_name": {"$contains": "test"}},
+            {"file_name": {"$contains": "spec"}},
+            {"file_name": {"$contains": "conftest"}},
+        ]
+    },
+    "config": {
+        "$or": [
+            {"language": {"$in": ["json", "yaml", "yml", "env", "toml"]}},
+            {"file_name": {"$contains": "config"}},
+            {"file_name": {"$contains": "setting"}},
+            {"file_name": {"$contains": "docker"}},
+            {"file_name": {"$contains": ".env"}},
+        ]
+    },
+    "api": {
+        "$or": [
+            {"file_name": {"$contains": "route"}},
+            {"file_name": {"$contains": "api"}},
+            {"file_name": {"$contains": "endpoint"}},
+            {"file_name": {"$contains": "controller"}},
+            {"file_name": {"$contains": "handler"}},
+        ]
+    },
+    "general": {},  # no filter — search everything
+}
+
+
+def route_query_intent(query: str) -> QueryIntent:
+    """
+    Classify the query intent using keyword matching.
+
+    Returns one of: "security" | "tests" | "config" | "api" | "general"
+
+    Pure deterministic function — zero LLM calls, zero latency.
+    Falls back to "general" (no filter) when no keywords match, so retrieval
+    is never broken by misclassification.
+
+    Examples:
+      "where is JWT validated?" → "security"
+      "how are tests structured?" → "tests"
+      "what env vars are needed?" → "config"
+      "show me the /ingest endpoint" → "api"
+      "explain the chunking logic" → "general"
+    """
+    lower = query.lower()
+    for intent, keywords in _INTENT_KEYWORDS.items():
+        if any(kw in lower for kw in keywords):
+            return intent  # type: ignore[return-value]
+    return "general"
+
+
+def get_intent_filter(intent: QueryIntent) -> dict:
+    """
+    Return a ChromaDB `where` clause dict for the given intent.
+
+    Returns {} for "general" (no filter applied — retrieves from all files).
+    The caller merges this with any existing repo_url filter.
+    """
+    return _INTENT_FILTERS.get(intent, {})
 
 
 def extract_file_scope(question: str) -> Tuple[str, Optional[str]]:
@@ -32,31 +145,28 @@ def extract_file_scope(question: str) -> Tuple[str, Optional[str]]:
     return question, None
 
 
-async def expand_query(query: str) -> List[str]:
-    """
-    Expands a developer query into 2 alternative technical query representations
-    to improve BM25 and dense vector recall (especially for slang or shorthand queries).
-    """
-    # Don't expand very short or purely symbol queries to avoid unnecessary LLM latency
-    if len(query.split()) < 3:
-        return [query]
+def local_query_variants(query: str) -> List[str]:
+    """Create cheap code-search variants without another model round trip."""
+    variants = [query]
+    identifiers = re.findall(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", query)
+    if identifiers:
+        variants.append(" ".join(identifiers))
 
-    try:
-        llm = get_chat_llm(streaming=False)
-        prompt = [
-            SystemMessage(
-                content="You are a code search query assistant. Given a developer's question about a codebase, "
-                "generate 2 distinct, concise technical search phrases or keywords that help find relevant code. "
-                "Output each query on a new line. Do not include numbered bullets, preamble, or explanations."
-            ),
-            HumanMessage(content=f"Query: {query}"),
-        ]
-        res = await llm.ainvoke(prompt)
-        text = res.content if hasattr(res, "content") else str(res)
-        variations = [line.strip().lstrip("1234567890.- ") for line in text.strip().split("\n") if line.strip()]
-        return [query] + variations[:2]
-    except Exception:
-        return [query]
+    lower = query.lower()
+    synonym_groups = (
+        ("auth", "authentication", "authorization", "login", "token"),
+        ("error", "exception", "failure", "retry", "handling"),
+        ("database", "db", "sql", "query", "repository"),
+        ("dependency", "import", "module", "package"),
+        ("config", "configuration", "settings", "environment"),
+    )
+    for group in synonym_groups:
+        if any(term in lower for term in group):
+            variants.append(f"{query} {' '.join(group)}")
+            break
+
+    return list(dict.fromkeys(variants))[:3]
+
 
 
 def compact_chat_history(chat_history: list[dict], max_turns: int = 6) -> str:
