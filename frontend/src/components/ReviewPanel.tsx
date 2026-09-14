@@ -10,7 +10,7 @@
  * pick files and click Run. The panel routes internally.
  */
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -30,6 +30,13 @@ import {
   CheckSquare,
   Square,
   Minus,
+  Activity,
+  BrainCircuit,
+  Search,
+  BarChart3,
+  ListTree,
+  Clock3,
+  CheckCircle2,
 } from "lucide-react";
 import { IndexedFile } from "../types";
 import { useReview } from "../hooks/useReview";
@@ -62,11 +69,212 @@ const LANG_COLOR: Record<string, string> = {
 };
 
 // Map tool names to friendly labels for the reasoning trace UI
-const TOOL_LABELS: Record<string, { label: string; icon: string }> = {
-  get_function_list:           { label: "Mapped structure",    icon: "🗺️" },
-  count_complexity_indicators: { label: "Measured complexity", icon: "📊" },
-  search_pattern:              { label: "Searched for pattern", icon: "🔍" },
+const TOOL_LABELS: Record<string, string> = {
+  get_function_list:           "Mapped structure",
+  count_complexity_indicators: "Measured complexity",
+  search_pattern:              "Searched for pattern",
 };
+
+interface ActivityStep {
+  tool?: string;
+  message: string;
+  step?: string;
+  file?: string;
+  index?: number;
+  total?: number;
+  mode?: string;
+}
+
+function activityIcon(step: ActivityStep) {
+  if (step.tool === "get_function_list") return <ListTree className="w-3.5 h-3.5 text-blue-300" />;
+  if (step.tool === "count_complexity_indicators") return <BarChart3 className="w-3.5 h-3.5 text-green-300" />;
+  if (step.tool === "search_pattern") return <Search className="w-3.5 h-3.5 text-purple-300" />;
+  if (step.step === "complete") return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-300" />;
+  if (step.step === "writing") return <BrainCircuit className="w-3.5 h-3.5 text-yellow-300" />;
+  return <Activity className="w-3.5 h-3.5 text-gray-400" />;
+}
+
+function activityLabel(step: ActivityStep) {
+  if (step.tool) return TOOL_LABELS[step.tool] ?? step.tool;
+  if (step.step === "file") return step.file ? `Queued ${step.file}` : "Queued file";
+  if (step.step === "complete") return step.file ? `Finished ${step.file}` : "Finished file";
+  if (step.step === "summary_complete") return "Summary ready";
+  if (step.step === "summary") return "Synthesizing summary";
+  if (step.step === "writing") return step.mode === "fast" ? "Writing fast review" : "Writing review";
+  if (step.step === "starting") return step.mode === "fast" ? "Fast scan started" : "Review started";
+  return step.message;
+}
+
+function useElapsed(active: boolean) {
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    if (!active) {
+      setElapsed(0);
+      return;
+    }
+    const started = Date.now();
+    const id = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [active]);
+
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = elapsed % 60;
+  return minutes > 0 ? `${minutes}m ${seconds.toString().padStart(2, "0")}s` : `${seconds}s`;
+}
+
+function ReviewActivityPanel({
+  isActive,
+  currentStep,
+  steps,
+  completed,
+  total,
+  currentFile,
+  mode,
+  reviewAccuracy,
+  llmReviewedCount,
+}: {
+  isActive: boolean;
+  currentStep: string | null;
+  steps: ActivityStep[];
+  completed: number;
+  total: number;
+  currentFile?: string | null;
+  mode?: string | null;
+  reviewAccuracy?: number;
+  llmReviewedCount?: number;
+}) {
+  const elapsed = useElapsed(isActive);
+  const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+  const visibleSteps = steps.slice(-8).reverse();
+  const finishedWithGaps = !isActive && total > 0 && completed < total;
+  const title = isActive ? "Review in progress" : finishedWithGaps ? "Review finished with gaps" : "Review complete";
+
+  return (
+    <div className="border border-gray-700 bg-gray-900 rounded-lg overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-800">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-sm font-semibold text-white">
+              {isActive ? (
+                <Loader2 className="w-4 h-4 animate-spin text-yellow-400" />
+              ) : finishedWithGaps ? (
+                <Activity className="w-4 h-4 text-yellow-400" />
+              ) : (
+                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+              )}
+              <span>{title}</span>
+              {mode && <span className="rounded bg-yellow-500/10 px-2 py-0.5 text-[10px] font-medium text-yellow-300">{mode}</span>}
+            </div>
+            <p className="mt-1 truncate text-xs text-gray-400">
+              {currentStep ?? (isActive ? "Preparing review..." : "Finished")}
+            </p>
+            {currentFile && (
+              <p className="mt-1 truncate text-[11px] text-gray-500">{currentFile}</p>
+            )}
+          </div>
+          <div className="shrink-0 text-right text-xs text-gray-400">
+            <div className="flex items-center justify-end gap-1">
+              <Clock3 className="w-3.5 h-3.5" />
+              {elapsed}
+            </div>
+            {total > 0 && <div className="mt-1 font-mono">{completed}/{total}</div>}
+            {!isActive && total > 1 && (
+              <div
+                className={`mt-1 text-[11px] font-medium ${
+                  (reviewAccuracy ?? 0) >= 70
+                    ? "text-emerald-400"
+                    : (reviewAccuracy ?? 0) >= 30
+                    ? "text-yellow-400"
+                    : "text-gray-500"
+                }`}
+                title={
+                  (reviewAccuracy ?? 0) === 0
+                    ? `All ${total} files used deterministic static analysis — no LLM provider available. Configure Ollama (ollama serve) for deeper reviews.`
+                    : `${llmReviewedCount ?? 0}/${total} files had a full LLM review; ${total - (llmReviewedCount ?? 0)} used static analysis only`
+                }
+              >
+                {(reviewAccuracy ?? 0) === 0
+                  ? "⚙️ Static analysis only"
+                  : `🤖 ${llmReviewedCount ?? 0}/${total} LLM · ${(reviewAccuracy ?? 0)}%`}
+              </div>
+            )}
+          </div>
+        </div>
+        {total > 0 && (
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-gray-800">
+            <div
+              className="h-full rounded-full bg-yellow-400 transition-all duration-500"
+              style={{ width: `${isActive ? Math.max(percent, 5) : 100}%` }}
+            />
+          </div>
+        )}
+      </div>
+
+      <div className="max-h-56 overflow-y-auto px-3 py-2">
+        {visibleSteps.length === 0 ? (
+          <div className="flex items-center gap-2 px-1 py-2 text-xs text-gray-500">
+            <Activity className="w-3.5 h-3.5" />
+            Waiting for the first streamed update...
+          </div>
+        ) : (
+          <div className="space-y-1.5">
+            {visibleSteps.map((step, i) => (
+              <div key={`${step.message}-${i}`} className="flex items-start gap-2 rounded-md px-1.5 py-1.5 text-xs text-gray-400">
+                <span className="mt-0.5 shrink-0">{activityIcon(step)}</span>
+                <div className="min-w-0">
+                  <div className="truncate text-gray-300">{activityLabel(step)}</div>
+                  {step.message && step.message !== activityLabel(step) && (
+                    <div className="truncate text-[11px] text-gray-500">{step.message}</div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function sectionStatusStyle(status: ReviewSection["status"]) {
+  if (status === "complete") return "border-emerald-500/30 bg-emerald-500/10 text-emerald-300";
+  if (status === "error") return "border-red-500/30 bg-red-500/10 text-red-300";
+  if (status === "skipped") return "border-gray-500/30 bg-gray-500/10 text-gray-300";
+  if (status === "writing") return "border-yellow-500/30 bg-yellow-500/10 text-yellow-300";
+  if (status === "reviewing" || status === "scanning") return "border-blue-500/30 bg-blue-500/10 text-blue-300";
+  return "border-gray-600 bg-gray-800 text-gray-400";
+}
+
+function SectionStatusBadge({ section }: { section: ReviewSection }) {
+  const label =
+    section.status === "complete" ? "Complete" :
+    section.status === "error" ? "Error" :
+    section.status === "skipped" ? "No output" :
+    section.status === "writing" ? "Writing" :
+    section.status === "scanning" ? "Scanning" :
+    section.status === "reviewing" ? "Reviewing" :
+    "Pending";
+
+  return (
+    <span className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[10px] font-medium ${sectionStatusStyle(section.status)}`}>
+      {section.status === "complete" ? (
+        <CheckCircle2 className="w-3 h-3" />
+      ) : section.status === "error" ? (
+        <Activity className="w-3 h-3" />
+      ) : section.status === "skipped" ? (
+        <Activity className="w-3 h-3" />
+      ) : section.status === "pending" ? (
+        <Clock3 className="w-3 h-3" />
+      ) : (
+        <Loader2 className="w-3 h-3 animate-spin" />
+      )}
+      {label}
+    </span>
+  );
+}
 
 // ── Folder-tree builder ───────────────────────────────────────────────────────
 interface TreeFile {
@@ -125,7 +333,21 @@ function buildTree(files: IndexedFile[]): FolderNode {
   const label = repoLabel(firstRepoUrl);
 
   const root: FolderNode = { path: "", name: label, children: [], files: [] };
-  const commonPrefix = computeCommonPrefix(files.map((f) => f.source));
+  let commonPrefix = computeCommonPrefix(files.map((f) => f.source));
+
+  // After stripping the common prefix, if every remaining path starts with a
+  // temp-dir segment (e.g. "tmpfk4eq1jx/..."), extend the prefix to swallow it.
+  // This happens when repos are indexed across multiple clone sessions so the
+  // common prefix only reaches "/tmp/" — leaving the tmpXXX dir visible in the tree.
+  const relPaths = files.map((f) => buildRelPath(f.source, commonPrefix));
+  const firstSegments = relPaths.map((r) => r.split("/")[0]);
+  const allSameTmpSeg =
+    firstSegments.length > 0 &&
+    firstSegments.every((s) => /^tmp[a-z0-9]{6,}$/i.test(s)) &&
+    new Set(firstSegments).size === 1;
+  if (allSameTmpSeg) {
+    commonPrefix = commonPrefix + firstSegments[0] + "/";
+  }
 
   const treeFiles: TreeFile[] = files.map((f) => {
     const relPath = buildRelPath(f.source, commonPrefix);
@@ -158,9 +380,80 @@ function buildTree(files: IndexedFile[]): FolderNode {
 }
 
 // ── Section card (multi-review output) ───────────────────────────────────────
+// ── Rich markdown components for review cards ────────────────────────────────
+// Defined outside SectionCard so they're never re-created on each render.
+const reviewMdComponents: React.ComponentProps<typeof ReactMarkdown>["components"] = {
+  h1: ({ children }) => (
+    <h1 className="text-base font-bold text-white mt-4 mb-2 pb-1 border-b border-gray-600 leading-snug">{children}</h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="text-sm font-bold text-white mt-4 mb-1.5 leading-snug">{children}</h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="text-sm font-semibold text-gray-200 mt-3 mb-1 leading-snug">{children}</h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="text-xs font-semibold text-gray-300 mt-2 mb-0.5">{children}</h4>
+  ),
+  p: ({ children }) => (
+    <p className="text-sm text-gray-200 leading-relaxed my-1.5">{children}</p>
+  ),
+  ul: ({ children }) => (
+    <ul className="list-disc list-outside pl-5 my-2 space-y-1 text-sm text-gray-200">{children}</ul>
+  ),
+  ol: ({ children }) => (
+    <ol className="list-decimal list-outside pl-5 my-2 space-y-1 text-sm text-gray-200">{children}</ol>
+  ),
+  li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+  code({ className, children }: any) {
+    const match = /language-(\w+)/.exec(className || "");
+    if (match) {
+      return (
+        <div className="my-2 rounded-lg overflow-hidden border border-gray-700">
+          <div className="px-3 py-1 bg-gray-900 border-b border-gray-700 text-xs text-gray-500 font-mono">{match[1]}</div>
+          <SyntaxHighlighter
+            style={vscDarkPlus}
+            language={match[1]}
+            PreTag="div"
+            customStyle={{ margin: 0, borderRadius: 0, fontSize: "12px", background: "#0d1117" }}
+          >
+            {String(children).replace(/\n$/, "")}
+          </SyntaxHighlighter>
+        </div>
+      );
+    }
+    return (
+      <code className="bg-gray-700/70 text-purple-300 px-1.5 py-0.5 rounded text-xs font-mono">{children}</code>
+    );
+  },
+  blockquote: ({ children }) => (
+    <blockquote className="border-l-4 border-purple-500 pl-3 my-2 text-gray-400 italic text-sm">{children}</blockquote>
+  ),
+  hr: () => <hr className="border-gray-700 my-3" />,
+  table: ({ children }) => (
+    <div className="overflow-x-auto my-2 rounded-lg border border-gray-700">
+      <table className="w-full text-sm border-collapse">{children}</table>
+    </div>
+  ),
+  thead: ({ children }) => <thead className="bg-gray-800 text-gray-300 text-xs uppercase">{children}</thead>,
+  tbody: ({ children }) => <tbody className="divide-y divide-gray-700">{children}</tbody>,
+  tr: ({ children }) => <tr className="hover:bg-gray-800/40">{children}</tr>,
+  th: ({ children }) => <th className="px-3 py-2 text-left font-semibold text-gray-300">{children}</th>,
+  td: ({ children }) => <td className="px-3 py-2 text-gray-200">{children}</td>,
+  strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
+  em: ({ children }) => <em className="italic text-gray-300">{children}</em>,
+  a: ({ children, href }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer"
+       className="text-blue-400 underline underline-offset-2 hover:text-blue-300 transition-colors">
+      {children}
+    </a>
+  ),
+};
+
 function SectionCard({ section, defaultOpen }: { section: ReviewSection; defaultOpen: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
   const isSummary = section.fileName.includes("Summary");
+  const hasContent = section.content.trim().length > 0;
 
   return (
     <div className={`border rounded-xl overflow-hidden ${
@@ -175,29 +468,38 @@ function SectionCard({ section, defaultOpen }: { section: ReviewSection; default
             ? <span className="text-yellow-400">📊</span>
             : <FileCode className="w-3.5 h-3.5 text-purple-400" />
           }
-          {section.fileName}
+          <span className="truncate">{section.fileName}</span>
         </span>
-        {open ? <ChevronUp className="w-3.5 h-3.5 text-gray-500" /> : <ChevronDown className="w-3.5 h-3.5 text-gray-500" />}
+        <span className="ml-3 flex shrink-0 items-center gap-2">
+          <SectionStatusBadge section={section} />
+          {open ? <ChevronUp className="w-3.5 h-3.5 text-gray-500" /> : <ChevronDown className="w-3.5 h-3.5 text-gray-500" />}
+        </span>
       </button>
       {open && (
-        <div className="border-t border-gray-700/50 px-4 py-3 prose prose-invert prose-sm max-w-none">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            components={{
-              code({ className, children }: any) {
-                const match = /language-(\w+)/.exec(className || "");
-                return match ? (
-                  <SyntaxHighlighter style={vscDarkPlus} language={match[1]} PreTag="div" className="rounded-lg text-xs">
-                    {String(children).replace(/\n$/, "")}
-                  </SyntaxHighlighter>
+        <div className="border-t border-gray-700/50 px-4 py-3">
+          {hasContent ? (
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={reviewMdComponents}>
+              {section.content}
+            </ReactMarkdown>
+          ) : (
+            <div className="space-y-3 py-1">
+              <div className="flex items-center gap-2 text-sm text-gray-300">
+                {section.status === "skipped" ? (
+                  <Activity className="w-4 h-4 text-gray-400" />
                 ) : (
-                  <code className="bg-gray-800 text-purple-300 px-1.5 py-0.5 rounded text-xs font-mono">{children}</code>
-                );
-              },
-            }}
-          >
-            {section.content || "*Review pending...*"}
-          </ReactMarkdown>
+                  <Loader2 className="w-4 h-4 animate-spin text-yellow-400" />
+                )}
+                {section.statusMessage ?? "Review pending..."}
+              </div>
+              {section.status !== "skipped" && (
+                <div className="space-y-2">
+                  <div className="h-2 w-11/12 animate-pulse rounded bg-gray-800" />
+                  <div className="h-2 w-8/12 animate-pulse rounded bg-gray-800" />
+                  <div className="h-2 w-10/12 animate-pulse rounded bg-gray-800" />
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -349,6 +651,8 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
 
   // UI
   const [traceExpanded, setTraceExpanded] = useState(true);
+  const outputRef = useRef<HTMLDivElement | null>(null);
+  const outputEndRef = useRef<HTMLDivElement | null>(null);
 
   // ── Graph → Review navigation: pre-select the source the user double-clicked
   useEffect(() => {
@@ -410,7 +714,12 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
   // ── Download ──────────────────────────────────────────────────────────────
   const handleDownload = () => {
     if (isMulti && multi.sections.length > 0) {
-      const content = multi.sections.map((s) => `## ${s.fileName}\n\n${s.content}`).join("\n\n---\n\n");
+      const orderedSections = [...multi.sections].sort((a, b) => {
+        const aSummary = a.fileName.includes("Summary");
+        const bSummary = b.fileName.includes("Summary");
+        return aSummary === bSummary ? 0 : aSummary ? -1 : 1;
+      });
+      const content = orderedSections.map((s) => `## ${s.fileName}\n\n${s.content}`).join("\n\n---\n\n");
       triggerDownload(content, "codesage-multi-review.md");
     } else if (single.review) {
       const name = indexedFiles.find((f) => selected.has(f.source))?.file_name ?? pasteName ?? "review";
@@ -439,6 +748,26 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
   const hasOutput = isMulti ? multi.sections.length > 0 : !!single.review;
   const activeError   = isMulti ? multi.error   : single.error;
   const currentStep   = isMulti ? multi.currentStep : single.currentStep;
+  const singleToolSteps = single.agentSteps.filter((step): step is ActivityStep & { tool: string } => Boolean(step.tool));
+  const orderedMultiSections = useMemo(() => (
+    [...multi.sections].sort((a, b) => {
+      const aSummary = a.fileName.includes("Summary");
+      const bSummary = b.fileName.includes("Summary");
+      return aSummary === bSummary ? 0 : aSummary ? -1 : 1;
+    })
+  ), [multi.sections]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    outputEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [
+    isActive,
+    single.review.length,
+    single.agentSteps.length,
+    multi.sections.length,
+    multi.sections.map((section) => section.content.length).join(","),
+    multi.agentSteps.length,
+  ]);
 
   const buttonLabel = () => {
     if (isActive) return isMulti ? "Reviewing..." : "Agent running...";
@@ -613,7 +942,7 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
         </div>
 
         {/* ── Right: output ── */}
-        <div className="flex-1 overflow-y-auto bg-gray-950 flex flex-col">
+        <div ref={outputRef} className="flex-1 overflow-y-auto bg-gray-950 flex flex-col">
 
           {/* Empty state */}
           {!hasOutput && !isActive && !activeError && (
@@ -639,24 +968,34 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
           {/* Single-file review output */}
           {!isMulti && (single.isReviewing || single.review || single.agentSteps.length > 0) && (
             <div className="p-6 space-y-4">
-              {single.agentSteps.length > 0 && (
+              {(single.isReviewing || single.agentSteps.length > 0) && (
+                <ReviewActivityPanel
+                  isActive={single.isReviewing}
+                  currentStep={currentStep}
+                  steps={single.agentSteps}
+                  completed={single.isReviewing ? 0 : 1}
+                  total={1}
+                  mode={single.currentMode}
+                />
+              )}
+              {singleToolSteps.length > 0 && (
                 <div className="bg-gray-900 border border-gray-700 rounded-xl overflow-hidden">
                   <button onClick={() => setTraceExpanded((v) => !v)}
                     className="w-full flex items-center justify-between px-4 py-3 text-xs text-gray-400 hover:text-gray-200 transition-colors"
                   >
                     <span className="font-medium">
-                      Agent reasoning trace ({single.agentSteps.length} tool{single.agentSteps.length !== 1 ? "s" : ""} called)
+                      Tool trace ({singleToolSteps.length} tool{singleToolSteps.length !== 1 ? "s" : ""} called)
                     </span>
                     {traceExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                   </button>
                   {traceExpanded && (
                     <div className="px-4 pb-3 space-y-1.5 border-t border-gray-700 pt-3">
-                      {single.agentSteps.map((step, i) => {
-                        const meta = TOOL_LABELS[step.tool] ?? { label: step.tool, icon: "🔧" };
+                      {singleToolSteps.map((step, i) => {
+                        const label = TOOL_LABELS[step.tool] ?? step.tool;
                         return (
                           <div key={i} className="flex items-center gap-2 text-xs text-gray-400">
-                            <span className="text-base leading-none">{meta.icon}</span>
-                            <span className="text-gray-300 font-medium">{meta.label}</span>
+                            {activityIcon(step)}
+                            <span className="text-gray-300 font-medium">{label}</span>
                             <span className="text-gray-600 font-mono">{step.tool}()</span>
                           </div>
                         );
@@ -703,14 +1042,21 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
           {/* Multi-file review output */}
           {isMulti && (multi.isReviewing || multi.sections.length > 0) && (
             <div className="p-6 space-y-4">
-              {multi.isReviewing && currentStep && (
-                <div className="flex items-center gap-2 text-xs text-yellow-400">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  {currentStep}
-                </div>
+              {(multi.isReviewing || multi.agentSteps.length > 0) && (
+                <ReviewActivityPanel
+                    isActive={multi.isReviewing}
+                    currentStep={currentStep}
+                    steps={multi.agentSteps}
+                    completed={multi.completedFiles}
+                    total={multi.totalFileCount || multi.totalFiles || selected.size}
+                    currentFile={multi.currentFile}
+                    mode={multi.currentMode}
+                    reviewAccuracy={multi.reviewAccuracy}
+                    llmReviewedCount={multi.llmReviewedCount}
+                  />
               )}
-              {multi.sections.map((section, i) => (
-                <SectionCard key={`${section.fileName}-${i}`} section={section} defaultOpen={i === 0} />
+              {orderedMultiSections.map((section, i) => (
+                <SectionCard key={`${section.fileName}-${i}`} section={section} defaultOpen={section.fileName.includes("Summary") || i === 0} />
               ))}
               {multi.error && (
                 <div className="text-red-400 text-sm bg-red-900/20 border border-red-800 rounded-lg px-4 py-3">
@@ -728,6 +1074,7 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
               </div>
             </div>
           )}
+          <div ref={outputEndRef} />
         </div>
       </div>
     </div>
