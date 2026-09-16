@@ -156,20 +156,31 @@ def chunk_python_file(
     docs: List[Document] = []
     chunk_idx = 0
 
-    # ── Collect module-level non-definition code (imports, constants, etc.) ──
-    module_level_lines: List[str] = []
-    top_level_starts: set[int] = set()
-
+    # ── Collect all module-level non-definition code ─────────────────────────
+    # Module imports/constants are valid before, between, and after definitions.
+    # The previous implementation stopped at the first function/class and lost
+    # later imports and constants from the indexed representation.
+    definition_ranges: list[tuple[int, int]] = []
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            top_level_starts.add(node.lineno)
+            start = min(
+                [node.lineno]
+                + [decorator.lineno for decorator in node.decorator_list]
+            )
+            definition_ranges.append((start, node.end_lineno))
 
-    for i, line in enumerate(lines, start=1):
-        if i not in top_level_starts:
-            # Not the start of a top-level function/class — it's module-level code
+    # Build a set of all line numbers that fall inside a definition.
+    # Using a set instead of checking every (start, end) range per line
+    # reduces the complexity from O(N×M) to O(N+M) — important for large
+    # files with many definitions (e.g. 1000 lines, 50 functions = 50k→1050 ops).
+    definition_line_set: set[int] = set()
+    for start, end in definition_ranges:
+        definition_line_set.update(range(start, end + 1))
+
+    module_level_lines: List[str] = []
+    for line_number, line in enumerate(lines, start=1):
+        if line_number not in definition_line_set:
             module_level_lines.append(line)
-        else:
-            break  # once we hit the first definition, stop collecting module code
 
     module_content = "".join(module_level_lines).strip()
     if len(module_content) >= MIN_CHUNK_CHARS:
