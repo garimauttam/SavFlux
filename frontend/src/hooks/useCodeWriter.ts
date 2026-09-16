@@ -7,8 +7,7 @@
  */
 
 import { useState, useCallback } from "react";
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+import { apiFetch } from "../api";
 
 export interface WriterStep {
   step: string;
@@ -42,7 +41,7 @@ export function useCodeWriter() {
     setState({ isGenerating: true, output: "", steps: [], currentStep: "Starting...", error: null });
 
     try {
-      const response = await fetch(`${API_BASE}/api/v1/write/generate`, {
+      const response = await apiFetch("/api/v1/write/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -85,40 +84,68 @@ export function useCodeWriter() {
           }
         }
 
-        // Drain STATUS markers
-        while (buffer.includes("__STATUS_END__")) {
-          const start = buffer.indexOf("__STATUS__");
-          const end = buffer.indexOf("__STATUS_END__");
-          if (start === -1 || end === -1) break;
+        // Drain STATUS markers — same logic as useChat.ts with start-present-no-end guard.
+        let changed = true;
+        while (changed) {
+          changed = false;
 
-          const statusText = buffer.slice(start + 10, end);
-          buffer = buffer.slice(end + 14 + 1); // +1 for trailing \n
+          if (buffer.includes("__STATUS__") && buffer.includes("__STATUS_END__")) {
+            const start = buffer.indexOf("__STATUS__");
+            const end   = buffer.indexOf("__STATUS_END__");
+            if (start !== -1 && end !== -1 && end > start) {
+              const statusText = buffer.slice(start + 10, end);
+              buffer = buffer.slice(end + 14 + 1); // +1 for trailing \n
 
-          const jsonMatch = statusText.match(/(\{.*\})$/);
-          const message = jsonMatch
-            ? statusText.slice(0, statusText.lastIndexOf(jsonMatch[0])).trim()
-            : statusText.trim();
-          let meta: { step?: string } = {};
-          if (jsonMatch) {
-            try { meta = JSON.parse(jsonMatch[1]); } catch {}
+              const jsonMatch = statusText.match(/(\{.*\})$/);
+              const message = jsonMatch
+                ? statusText.slice(0, statusText.lastIndexOf(jsonMatch[0])).trim()
+                : statusText.trim();
+              let meta: { step?: string } = {};
+              if (jsonMatch) {
+                try { meta = JSON.parse(jsonMatch[1]); } catch {}
+              }
+
+              setState((prev) => ({
+                ...prev,
+                currentStep: message,
+                steps: meta.step
+                  ? [...prev.steps, { step: meta.step, message }]
+                  : prev.steps,
+              }));
+              changed = true;
+              continue;
+            }
           }
 
-          setState((prev) => ({
-            ...prev,
-            currentStep: message,
-            steps: meta.step
-              ? [...prev.steps, { step: meta.step, message }]
-              : prev.steps,
-          }));
+          // Guard: start present but no end yet — hold buffer, wait for next chunk
+          const siStart = buffer.indexOf("__STATUS__");
+          if (siStart !== -1 && buffer.indexOf("__STATUS_END__", siStart) === -1) {
+            // Don't flush anything past the start marker — end tag hasn't arrived
+            break;
+          }
         }
 
-        // Flush non-STATUS buffer content to output
+        // Flush non-STATUS, non-partial-marker content to output
         if (!buffer.includes("__STATUS__")) {
-          const partialMatch = buffer.match(/_{1,2}(?:S(?:T(?:A(?:T(?:U(?:S)?)?)?)?)?)?$/);
-          if (partialMatch) {
-            const splitIdx = partialMatch.index ?? buffer.length;
-            const text = buffer.slice(0, splitIdx);
-            buffer = buffer.slice(splitIdx);
+          // Hold back tails that could be a partial start or end marker
+          // (same extended pattern as useChat.ts to catch splits inside end-tags)
+          const HOLD = [
+            "__STATUS__", "__STATUS_END__", "STATUS_END__", "_STATUS_END__",
+          ];
+          let markerStart = -1;
+          const tail = buffer.slice(-20);
+          for (const pfx of HOLD) {
+            for (let len = Math.min(pfx.length - 1, tail.length); len > 0; len--) {
+              if (tail.endsWith(pfx.slice(0, len))) {
+                markerStart = buffer.length - len;
+                break;
+              }
+            }
+            if (markerStart !== -1) break;
+          }
+          if (markerStart !== -1) {
+            const text = buffer.slice(0, markerStart);
+            buffer = buffer.slice(markerStart);
             if (text) setState((prev) => ({ ...prev, output: prev.output + text }));
           } else {
             const text = buffer;
