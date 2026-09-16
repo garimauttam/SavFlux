@@ -7,9 +7,9 @@ Why Pydantic BaseSettings?
 - Gives you autocomplete in your IDE
 
 PROVIDER SYSTEM:
-  LLM_PROVIDER=openai  → GPT-4o for chat, text-embedding-3-small for embeddings (paid)
-  LLM_PROVIDER=gemini  → Gemini 1.5 Flash for chat (free tier), local all-MiniLM-L6-v2 for
-                          embeddings (completely free, runs on CPU, no API key needed)
+  LLM_PROVIDER=deepseek → DeepSeek API primary, Ollama local fallback (recommended)
+  LLM_PROVIDER=ollama   → fully local, no API key needed
+  LLM_PROVIDER=openai   → GPT-4o, paid
 
   Switch with a single env var. No code changes required.
 """
@@ -41,37 +41,58 @@ def _load_json_configs() -> dict:
 
 class Settings(BaseSettings):
     # --- LLM Provider ---
-    # "openai"  → GPT-4o + text-embedding-3-small  (best quality, paid)
-    # "gemini"  → Gemini 1.5 Flash + local MiniLM  (free, good quality for code)
-    llm_provider: Literal["openai", "gemini"] = "openai"
+    # "deepseek" → DeepSeek hosted API (primary), Ollama local (fallback)
+    # "ollama"   → fully local, no API key, no quota
+    # "openai"   → GPT-4o, paid
+    llm_provider: Literal["openai", "ollama", "deepseek"] = "deepseek"
 
     # --- OpenAI (used when llm_provider=openai) ---
-    openai_api_key: Optional[str] = None        # Required when llm_provider=openai
-    openai_chat_model: str = "gpt-4o"           # Which OpenAI LLM to use
-    openai_embedding_model: str = "text-embedding-3-small"  # OpenAI embedding model
+    openai_api_key: Optional[str] = None
+    openai_chat_model: str = "gpt-4o"
+    openai_embedding_model: str = "text-embedding-3-small"
 
-    # --- Gemini (used when llm_provider=gemini) ---
-    # Free tier: 15 req/min, 1M tokens/day — plenty for dev + demos.
-    # Get key at: https://aistudio.google.com/app/apikey  (no credit card)
-    gemini_api_key: Optional[str] = None        # Required when llm_provider=gemini
-    gemini_chat_model: str = "gemini-3.5-flash-lite" # Lowest-latency free-tier model
+    # --- Ollama (self-hosted local models) ---
+    # Requires Ollama running at ollama_base_url with the model already pulled.
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_chat_model: str = "qwen2.5-coder:14b"
+    # ollama_review_model: dedicated model for code reviews (Tier 2 — full reasoning).
+    # deepseek-r1:14b has strong reasoning for code. Falls back to ollama_chat_model if empty.
+    ollama_review_model: str = "deepseek-r1:14b"
+    # ollama_fast_model: cheap/fast model for Tier-1 files (config, yaml, small utils).
+    # Set to "" to disable Tier-1 routing (all LLM files use the full model).
+    # Example: "qwen2.5-coder:7b" — smaller, faster, good enough for low-risk files.
+    ollama_fast_model: str = ""
+    # summary_mixture_models: list of Ollama model names to use for MoA repo summary.
+    # If empty (default), the repo summary uses the single configured provider as before.
+    # Example: "qwen2.5-coder:7b,deepseek-r1:1.5b" (comma-separated)
+    # Each model gets the same prompt in parallel; an aggregator synthesises their drafts.
+    summary_mixture_models: str = ""
+
+    # --- DeepSeek API (OpenAI-compatible, primary provider) ---
+    deepseek_api_key: Optional[str] = None
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_chat_model: str = "deepseek-chat"
 
     # --- ChromaDB ---
-    # We store ChromaDB data on disk so it survives server restarts
     chroma_persist_directory: str = "./chroma_data"
     chroma_collection_name: str = "codesage"
 
-    # --- Chunking strategy ---
-    # chunk_size: how many characters per chunk
-    # 700 chars fits within the 256 token limit of local MiniLM embeddings without silent truncation,
-    # while still providing complete syntax blocks for GPT-4o / Gemini 1.5 Flash.
+    # --- Chunking ---
     chunk_size: int = 700
-    chunk_overlap: int = 150   # Overlap prevents cutting a function definition in half
+    chunk_overlap: int = 150
 
     # --- Retrieval ---
-    # How many chunks to pull from ChromaDB per question
-    # More = more context for LLM, but also more tokens = more cost
     top_k_results: int = 5
+    max_context_chars: int = 14000
+    query_expansion_enabled: bool = True
+    review_mode: Literal["fast", "agentic"] = "fast"
+    # review_max_full_files: max files that get a full LLM review per batch.
+    # Remaining files get fast deterministic static analysis.
+    # Set to 61 to cover full-repo reviews (CodeSage itself has 61 indexed files).
+    # Raise further for larger repos; the only cost is wall-clock time at
+    # review_concurrency=3 concurrent LLM calls.
+    review_max_full_files: int = 61
+    review_concurrency: int = 3
 
     # --- LangSmith Observability ---
     # LangSmith traces every LangChain call automatically when these vars are set.
@@ -81,6 +102,14 @@ class Settings(BaseSettings):
     langchain_tracing_v2: Optional[str] = None       # "true" to enable
     langchain_api_key: Optional[str] = None           # from smith.langchain.com
     langchain_project: str = "codesage"               # project name in LangSmith UI
+
+    # --- Authentication ---
+    # API key that protects all write/query endpoints.
+    # If unset (default), the server runs open — safe for local dev.
+    # In production (Railway), set API_KEY to a random secret so only your
+    # frontend can call the API.
+    # Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
+    api_key: Optional[str] = None
 
     # --- App ---
     # PORT: Railway injects the PORT env var and routes external traffic to it.
@@ -120,6 +149,26 @@ class Settings(BaseSettings):
 @lru_cache()
 def get_settings() -> Settings:
     json_config = _load_json_configs()
-    if json_config:
-        return Settings(**json_config)
-    return Settings()
+    if not json_config:
+        return Settings()
+
+    # configs.json provides portable defaults, while environment/.env values
+    # must win for deployment-specific choices such as the LLM provider and key.
+    # Passing the JSON directly to Settings would make it override .env.
+    dotenv_values = {}
+    try:
+        from dotenv import dotenv_values as read_dotenv
+        dotenv_values = {
+            key.lower(): value
+            for key, value in read_dotenv(".env").items()
+            if value is not None
+        }
+    except Exception:
+        pass
+
+    env_overrides = {
+        key: value
+        for key, value in json_config.items()
+        if os.getenv(key.upper()) is None and key.lower() not in dotenv_values
+    }
+    return Settings(**env_overrides)
