@@ -1,0 +1,19 @@
+# Training-only dependencies — NOT required to run the CodeSage server.
+# Install with:  pip install -r training/requirements-train.txt
+# Recommended: use a separate virtualenv or conda env for training.
+
+# Core training stack
+torch>=2.2.0                    # CUDA 12.1+ recommended; MPS for Apple Silicon
+transformers>=4.41.0            # HuggingFace transformers
+datasets>=2.19.0                # HuggingFace datasets (loads JSONL)
+accelerate>=0.30.0              # distributed training backend for TRL
+peft>=0.11.0                    # LoRA / QLoRA adapter library
+trl>=0.9.0                      # SFTTrainer, DataCollatorForCompletionOnlyLM
+bitsandbytes>=0.43.0            # 4-bit NF4 quantisation (QLoRA); requires CUDA
+
+# Evaluation (optional — used to measure base vs. fine-tuned quality)
+evaluate>=0.4.0
+
+# Utilities
+sentencepiece>=0.2.0            # tokeniser for some models (Qwen uses tiktoken)
+protobuf>=4.25.0                # required by some tokenizers
