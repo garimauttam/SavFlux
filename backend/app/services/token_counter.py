@@ -48,8 +48,8 @@ def get_totals() -> dict:
     """Return a snapshot of current totals (safe to call from any thread)."""
     with _lock:
         t = _totals
-        # Cost estimate: Gemini Flash is free on dev tier, but show an OpenAI-equivalent
-        # approximation so the dashboard has a meaningful number when using OpenAI.
+        # Cost estimate: local Ollama calls are free (0 API cost).
+        # When using OpenAI (GPT-4o-mini) these are approximate charges.
         # GPT-4o-mini pricing: $0.15/1M prompt, $0.60/1M completion (as of 2024).
         estimated_usd = (
             t.prompt_tokens * 0.00000015
