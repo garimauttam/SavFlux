@@ -5,10 +5,11 @@ This is the endpoint the React frontend calls every time the user sends a messag
 It returns a streaming response so the UI can render tokens in real time.
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
+from app.api.deps import require_api_key
 from app.limiter import limiter
 from app.services.retrieval_service import stream_answer, get_indexed_files
 
@@ -49,7 +50,7 @@ class ChatRequest(BaseModel):
 
 @router.post("/stream")
 @limiter.limit("20/minute")   # 20 req/min/IP — humans type ~2/min at most
-async def chat_stream(request: Request, body: ChatRequest):
+async def chat_stream(request: Request, body: ChatRequest, _: None = Depends(require_api_key)):
     """
     Streams the answer to a question using RAG.
 
@@ -82,7 +83,7 @@ async def chat_stream(request: Request, body: ChatRequest):
 
 
 @router.get("/indexed-files")
-async def get_files():
+async def get_files(_: None = Depends(require_api_key)):
     """
     Returns all files currently in the vector store.
     Used by the frontend's Repo Map panel.

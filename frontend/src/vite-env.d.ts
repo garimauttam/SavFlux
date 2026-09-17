@@ -14,6 +14,7 @@
 interface ImportMetaEnv {
   /** Base URL of the FastAPI backend. Set to your Railway URL in Vercel's env vars. */
   readonly VITE_API_URL: string;
+  readonly VITE_API_KEY: string;
 }
 
 interface ImportMeta {

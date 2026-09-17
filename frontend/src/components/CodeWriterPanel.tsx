@@ -37,8 +37,7 @@ import {
 } from "lucide-react";
 import { IndexedFile } from "../types";
 import { useCodeWriter } from "../hooks/useCodeWriter";
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+import { apiFetch } from "../api";
 
 interface CodeWriterPanelProps {
   indexedFiles: IndexedFile[];
@@ -357,7 +356,7 @@ export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
     if (!editFile) { setOriginalContent(""); return; }
     const src = editFile.source;
     fetchingSourceRef.current = src;
-    fetch(`${API_BASE}/api/v1/write/file-content?source=${encodeURIComponent(src)}`)
+    apiFetch(`/api/v1/write/file-content?source=${encodeURIComponent(src)}`)
       .then((r) => r.ok ? r.json() : Promise.reject(r.status))
       .then((data) => {
         // Only apply result if this is still the active selection

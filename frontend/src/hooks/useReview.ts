@@ -16,12 +16,14 @@
 
 import { useState, useCallback } from "react";
 import { IndexedFile } from "../types";
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+import { apiFetch } from "../api";
 
 export interface AgentStep {
-  tool: string;
+  tool?: string;
   message: string;
+  step?: string;
+  file?: string;
+  mode?: string;
 }
 
 export interface ReviewState {
@@ -29,6 +31,7 @@ export interface ReviewState {
   review: string;               // the streamed markdown review text
   agentSteps: AgentStep[];      // tool calls the agent made (shown as a trace)
   currentStep: string | null;   // what the agent is doing right now
+  currentMode: string | null;
   error: string | null;
 }
 
@@ -38,14 +41,15 @@ export function useReview() {
     review: "",
     agentSteps: [],
     currentStep: null,
+    currentMode: null,
     error: null,
   });
 
   const reviewFile = useCallback(async (file: IndexedFile) => {
-    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", error: null });
+    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null });
 
     try {
-      const response = await fetch(`${API_BASE}/api/v1/review/file`, {
+      const response = await apiFetch("/api/v1/review/file", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -71,10 +75,10 @@ export function useReview() {
   }, []);
 
   const reviewPaste = useCallback(async (code: string, language: string, fileName: string) => {
-    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", error: null });
+    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null });
 
     try {
-      const response = await fetch(`${API_BASE}/api/v1/review/paste`, {
+      const response = await apiFetch("/api/v1/review/paste", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code, language, file_name: fileName }),
@@ -145,7 +149,7 @@ export function useReview() {
         // Extract the message (before the JSON) and the JSON metadata
         const jsonMatch = statusText.match(/(\{.*\})$/);
         const message = jsonMatch ? statusText.slice(0, statusText.lastIndexOf(jsonMatch[0])).trim() : statusText.trim();
-        let meta: { step?: string; tool?: string } = {};
+        let meta: { step?: string; tool?: string; file?: string; mode?: string } = {};
         if (jsonMatch) {
           try { meta = JSON.parse(jsonMatch[1]); } catch {}
         }
@@ -153,9 +157,8 @@ export function useReview() {
         setState((prev) => ({
           ...prev,
           currentStep: message,
-          agentSteps: meta.tool
-            ? [...prev.agentSteps, { tool: meta.tool, message }]
-            : prev.agentSteps,
+          currentMode: meta.mode ?? prev.currentMode,
+          agentSteps: [...prev.agentSteps, { ...meta, message }].slice(-40),
         }));
       }
 
@@ -192,7 +195,7 @@ export function useReview() {
   }, []); // setState is stable — no deps needed
 
   const reset = useCallback(() => {
-    setState({ isReviewing: false, review: "", agentSteps: [], currentStep: null, error: null });
+    setState({ isReviewing: false, review: "", agentSteps: [], currentStep: null, currentMode: null, error: null });
   }, []);
 
   return { ...state, reviewFile, reviewPaste, reset };

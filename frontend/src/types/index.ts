@@ -6,6 +6,7 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   sources?: SourceFile[];  // citations from the RAG retrieval
+  generationSteps?: string[]; // safe retrieval/model activity trace
   isStreaming?: boolean;   // true while the answer is being typed out
 }
 

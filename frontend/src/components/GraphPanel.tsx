@@ -22,8 +22,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import ForceGraph2D from "react-force-graph-2d";
 import { Network, Search, RefreshCw, Loader2, Info, X } from "lucide-react";
 import { IndexedRepo } from "../types";
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+import { apiFetch } from "../api";
 
 // ── Language colour palette ───────────────────────────────────────────────────
 const LANG_COLOR: Record<string, string> = {
@@ -105,10 +104,10 @@ export function GraphPanel({ indexedRepos, activeRepoUrl, onNavigateToReview }: 
     setError(null);
     setSelectedNode(null);
     try {
-      const url = activeRepoUrl
-        ? `${API_BASE}/api/v1/ingest/dependency-graph?repo_url=${encodeURIComponent(activeRepoUrl)}`
-        : `${API_BASE}/api/v1/ingest/dependency-graph`;
-      const res = await fetch(url);
+      const path = activeRepoUrl
+        ? `/api/v1/ingest/dependency-graph?repo_url=${encodeURIComponent(activeRepoUrl)}`
+        : "/api/v1/ingest/dependency-graph";
+      const res = await apiFetch(path);
       if (!res.ok) throw new Error(`Server error ${res.status}`);
       const data: GraphData = await res.json();
       setGraphData(data);

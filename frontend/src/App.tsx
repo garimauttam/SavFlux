@@ -17,8 +17,7 @@ import { CodeWriterPanel } from "./components/CodeWriterPanel";
 import { GraphPanel } from "./components/GraphPanel";
 import { MetricsBar } from "./components/MetricsBar";
 import { IndexedFile, IndexedRepo } from "./types";
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+import { apiFetch } from "./api";
 
 // localStorage helpers for persisting activeRepoUrl across page refreshes
 const ACTIVE_REPO_KEY = "codesage:activeRepoUrl";
@@ -52,8 +51,8 @@ function App() {
   const fetchIndexedFiles = useCallback(async () => {
     try {
       const [filesRes, reposRes] = await Promise.all([
-        fetch(`${API_BASE}/api/v1/chat/indexed-files`),
-        fetch(`${API_BASE}/api/v1/ingest/repos`),
+        apiFetch("/api/v1/chat/indexed-files"),
+        apiFetch("/api/v1/ingest/repos"),
       ]);
       const filesData = await filesRes.json();
       const reposData = await reposRes.json();

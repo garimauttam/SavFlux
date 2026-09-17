@@ -11,17 +11,21 @@ Keeping them separate = testable, maintainable code.
 import json
 import asyncio
 from typing import List
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
+from app.api.deps import require_api_key
 from app.services.ingestion_service import (
     ingest_github_repo,
     ingest_uploaded_files,
     clear_index,
     get_indexed_repos,
+    ingestion_lock,
+    normalize_repo_url,
 )
 from app.services.dep_graph import build_dependency_graph
+from app.services.job_store import create_job, update_job, finish_job, get_job
 
 router = APIRouter(prefix="/ingest", tags=["ingestion"])
 
@@ -39,7 +43,7 @@ class GitHubIngestRequest(BaseModel):
         # Accept https://github.com/... or git@ URLs
         if not (v.startswith("https://") or v.startswith("git@")):
             raise ValueError("repo_url must start with https:// or git@")
-        return v
+        return normalize_repo_url(v)
 
     @field_validator("branch")
     @classmethod
@@ -52,10 +56,17 @@ class GitHubIngestRequest(BaseModel):
 
 
 @router.post("/github")
-async def ingest_github(request: GitHubIngestRequest):
+async def ingest_github(request: GitHubIngestRequest, _: None = Depends(require_api_key)):
     """
     Ingest a public GitHub repo.
-    Returns a Server-Sent Events (SSE) stream of progress updates.
+    Returns a Server-Sent Events (SSE) stream of progress updates AND a job_id.
+
+    WHY SSE + JOB ID?
+    The SSE stream is the primary progress channel — it delivers real-time updates
+    while the connection is live. The job_id lets the client poll
+    GET /ingest/status/{job_id} if the SSE connection drops (browser refresh,
+    network blip, Railway's 60s idle timeout). This way ingestion is never
+    silently lost — the client can always check what happened.
 
     WHY SSE INSTEAD OF WEBSOCKETS FOR PROGRESS?
     SSE is one-directional (server → client), which is all we need here.
@@ -63,24 +74,29 @@ async def ingest_github(request: GitHubIngestRequest):
     and browsers reconnect automatically if the connection drops.
     Format: each event is a JSON line prefixed with "data: "
     """
+    job_id = create_job()
     progress_events = []
     completed = asyncio.Event()
     final_result = {}
 
     async def progress_callback(event: dict):
         progress_events.append(event)
+        # Keep the job store in sync so polling works even if SSE is disconnected
+        update_job(job_id, status="running", message=event.get("message", ""))
 
     async def run_ingestion():
         nonlocal final_result
         try:
-            final_result = await ingest_github_repo(
-                repo_url=request.repo_url,
-                branch=request.branch or None,
-                progress_callback=progress_callback,
-            )
+            async with ingestion_lock:
+                final_result = await ingest_github_repo(
+                    repo_url=request.repo_url,
+                    branch=request.branch or None,
+                    progress_callback=progress_callback,
+                )
         except Exception as e:
             final_result = {"status": "error", "message": str(e)}
         finally:
+            finish_job(job_id, final_result)
             completed.set()
 
     # Start ingestion in background — don't await it here
@@ -90,6 +106,9 @@ async def ingest_github(request: GitHubIngestRequest):
         """
         Yields SSE-formatted progress events.
 
+        First event is always {"step": "queued", "job_id": "<uuid>"} so the
+        client can store the job_id before any work starts.
+
         RACE CONDITION FIX:
         Original code checked `completed.is_set()` and `len(progress_events)` in
         the same condition. If `completed` was set between the two checks, the loop
@@ -98,6 +117,9 @@ async def ingest_github(request: GitHubIngestRequest):
         Fix: flush all pending events FIRST, then check completion.
         The final `complete` event is only emitted AFTER we know the queue is empty.
         """
+        # Always emit job_id first — client stores this for fallback polling
+        yield f"data: {json.dumps({'step': 'queued', 'job_id': job_id})}\n\n"
+
         sent = 0
         while True:
             # Drain any pending events first
@@ -114,7 +136,7 @@ async def ingest_github(request: GitHubIngestRequest):
             await asyncio.sleep(0.1)  # Poll every 100ms
 
         # Final result event — sent after all progress events
-        yield f"data: {json.dumps({**final_result, 'step': 'complete'})}\n\n"
+        yield f"data: {json.dumps({**final_result, 'step': 'complete', 'job_id': job_id})}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -126,8 +148,37 @@ async def ingest_github(request: GitHubIngestRequest):
     )
 
 
+@router.get("/status/{job_id}")
+async def get_ingestion_status(job_id: str, _: None = Depends(require_api_key)):
+    """
+    Poll the status of a running or completed ingestion job.
+
+    WHY THIS EXISTS:
+    The SSE stream in /ingest/github is the primary progress channel, but SSE
+    connections can drop (browser refresh, network blip, Railway's idle timeout).
+    This endpoint lets the client check the job outcome without needing the stream
+    to stay alive for the full duration.
+
+    Returns:
+      200 with {"status": "pending"|"running"|"success"|"error", ...}
+      404 if job_id is unknown or has expired (jobs expire after 1 hour)
+    """
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job '{job_id}' not found or has expired (jobs are kept for 1 hour).",
+        )
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "message": job["message"],
+        "result": job["result"],   # None until complete; full result dict on finish
+    }
+
+
 @router.post("/files")
-async def ingest_files(files: List[UploadFile] = File(...)):
+async def ingest_files(files: List[UploadFile] = File(...), _: None = Depends(require_api_key)):
     """
     Ingest uploaded files directly.
     Accepts multiple files at once via multipart/form-data.
@@ -142,7 +193,8 @@ async def ingest_files(files: List[UploadFile] = File(...)):
         filename = f.filename or "uploaded_file"
         files_content.append((filename, content))
 
-    result = await ingest_uploaded_files(files_content)
+    async with ingestion_lock:
+        result = await ingest_uploaded_files(files_content)
 
     if result["status"] == "error":
         raise HTTPException(status_code=422, detail=result["message"])
@@ -151,7 +203,7 @@ async def ingest_files(files: List[UploadFile] = File(...)):
 
 
 @router.delete("/clear")
-async def clear_vector_store(repo_url: str | None = None):
+async def clear_vector_store(repo_url: str | None = None, _: None = Depends(require_api_key)):
     """
     Clear the vector store.
 
@@ -164,12 +216,13 @@ async def clear_vector_store(repo_url: str | None = None):
     - DELETE /ingest/clear?repo_url=https://...  → clear one specific repo
     - DELETE /ingest/clear                        → clear everything (full reset)
     """
-    result = await clear_index(repo_url=repo_url)
+    async with ingestion_lock:
+        result = await clear_index(repo_url=repo_url)
     return result
 
 
 @router.get("/repos")
-async def list_indexed_repos():
+async def list_indexed_repos(_: None = Depends(require_api_key)):
     """
     Returns a list of all unique repo URLs that have been indexed.
     Used by the frontend to show which repos are active and let the user
@@ -180,7 +233,7 @@ async def list_indexed_repos():
 
 
 @router.get("/dependency-graph")
-async def get_dependency_graph(repo_url: str | None = None):
+async def get_dependency_graph(repo_url: str | None = None, _: None = Depends(require_api_key)):
     """
     Return the file dependency graph for the indexed codebase.
 

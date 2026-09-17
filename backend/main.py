@@ -19,7 +19,19 @@ from contextlib import asynccontextmanager
 # ChromaDB's posthog telemetry library has a signature mismatch that spams
 # "capture() takes 1 positional argument but 3 were given" on every DB call,
 # drowning real log output. Setting this env var disables the telemetry client.
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["CHROMA_TELEMETRY"] = "false"
+
+# Chroma 0.5.0 can still call the installed PostHog client even when
+# anonymized_telemetry=False. The PostHog API changed its capture signature,
+# which produces noisy warnings on every Chroma operation. Make the optional
+# telemetry sink a no-op before any Chroma client is constructed.
+try:
+    import posthog
+    posthog.disabled = True
+    posthog.capture = lambda *args, **kwargs: None
+except Exception:
+    pass
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,32 +91,45 @@ logger.info(
 # request is instant — the model is already hot.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ──────────────────────────────────────────────────────────────
-    try:
-        from app.services.reranker import _get_cross_encoder
-        from app.services.llm_factory import get_embedding_fn
-        logger.info("Warming up models (reranker + embedding)...")
-        # Run in thread — model loading is CPU-bound, would block the event loop
-        await asyncio.to_thread(_get_cross_encoder)
-        await asyncio.to_thread(get_embedding_fn)
-        logger.info("Models warm and ready.")
-    except Exception as e:
-        # Don't crash startup if model download fails (e.g. no internet in CI)
-        logger.warning(f"Reranker warmup skipped: {e}")
+    async def warm_models():
+        try:
+            from app.services.reranker import _get_cross_encoder
+            from app.services.llm_factory import get_embedding_fn
+            logger.info("Warming up models (reranker + embedding)...")
+            await asyncio.to_thread(_get_cross_encoder)
+            await asyncio.to_thread(get_embedding_fn)
+            logger.info("Models warm and ready.")
+        except Exception as e:
+            logger.warning(f"Model warmup skipped: {e}")
 
-    # Pre-build the BM25 index so the first user query doesn't pay the build cost.
-    # This is a no-op if the collection is empty (fresh install).
-    try:
-        from app.services.retrieval_service import _get_vectorstore, _get_bm25_index
-        vs = await asyncio.to_thread(_get_vectorstore)
-        await asyncio.to_thread(_get_bm25_index, vs)
-        logger.info("BM25 index warmed.")
-    except Exception as e:
-        logger.warning(f"BM25 warmup skipped: {e}")
+    async def warm_bm25():
+        try:
+            from app.services.retrieval_service import _get_vectorstore, _get_bm25_index
+            vs = await asyncio.to_thread(_get_vectorstore)
+            await asyncio.to_thread(_get_bm25_index, vs)
+            logger.info("BM25 index warmed.")
+        except Exception as e:
+            logger.warning(f"BM25 warmup skipped: {e}")
+
+    # Do not block socket binding on model downloads or a large BM25 rebuild.
+    # Requests can arrive immediately and pay the warmup cost only if needed.
+    warmup_tasks = [asyncio.create_task(warm_models()), asyncio.create_task(warm_bm25())]
 
     yield   # ← server is live and handling requests here
 
-    # ── Shutdown (nothing to clean up, but the pattern is complete) ───────────
+    for task in warmup_tasks:
+        task.cancel()
+    await asyncio.gather(*warmup_tasks, return_exceptions=True)
+
+    # ── Shutdown — persist BM25 index to disk ─────────────────────────────────
+    # Saving here ensures the next cold start skips the expensive rebuild.
+    # This runs even on graceful SIGTERM (Railway rolling deploys, etc.).
+    try:
+        from app.services.retrieval_service import save_bm25_on_shutdown
+        await asyncio.to_thread(save_bm25_on_shutdown)
+        logger.info("BM25 index saved to disk on shutdown.")
+    except Exception as e:
+        logger.warning(f"BM25 shutdown save skipped: {e}")
 
 
 app = FastAPI(
@@ -174,13 +199,29 @@ async def health_check():
     overall_ok = True
 
     # ── Check 1: LLM provider ─────────────────────────────────────────────────
-    if settings.llm_provider == "gemini":
+    # Supported providers: "openai" | "ollama" | "deepseek"  (see config.py Literal)
+    if settings.llm_provider == "ollama":
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=settings.gemini_api_key)
-            # list_models is a lightweight API call — just validates the key
-            list(genai.list_models())
-            checks["llm"] = f"ok (Gemini — {settings.gemini_chat_model})"
+            import httpx
+            async with httpx.AsyncClient(
+                base_url=settings.ollama_base_url,
+                timeout=5.0,
+            ) as client:
+                response = await client.get("/api/tags")
+            response.raise_for_status()
+            checks["llm"] = f"ok (Ollama — {settings.ollama_chat_model})"
+        except Exception as e:
+            checks["llm"] = f"error: {str(e)[:120]}"
+            overall_ok = False
+    elif settings.llm_provider == "deepseek":
+        try:
+            import openai
+            client = openai.AsyncOpenAI(
+                api_key=settings.deepseek_api_key,
+                base_url=settings.deepseek_base_url,
+            )
+            await client.models.list()
+            checks["llm"] = f"ok (DeepSeek — {settings.deepseek_chat_model})"
         except Exception as e:
             checks["llm"] = f"error: {str(e)[:120]}"
             overall_ok = False
@@ -197,7 +238,11 @@ async def health_check():
     # ── Check 2: ChromaDB ─────────────────────────────────────────────────────
     try:
         import chromadb
-        client = chromadb.PersistentClient(path=settings.chroma_persist_directory)
+        from chromadb.config import Settings as ChromaSettings
+        client = chromadb.PersistentClient(
+            path=settings.chroma_persist_directory,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
         client.heartbeat()
         checks["chromadb"] = "ok"
     except Exception as e:

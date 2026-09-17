@@ -70,6 +70,17 @@ To run the benchmark suite:
 python eval_rag.py
 ```
 
+For reproducible machine-readable results:
+
+```bash
+python eval_rag.py --top-k 5 --json-out reports/rag-baseline.json
+```
+
+The report includes Hit Rate, MRR, Precision@K, symbol recall, latency, and a
+dataset hash. The `POST /api/v1/review/impact` endpoint exposes deterministic
+PR risk and dependency-impact analysis without invoking an LLM. The normal PR
+webhook response includes the same `impact` object.
+
 ---
 
 ## ✨ Key Features & Engineering Highlights
@@ -86,6 +97,8 @@ python eval_rag.py
   * Precision querying like `@auth.py where is token validation handled?` automatically filters candidate retrieval pools.
 * **Automated GitHub PR Review CI/CD Action**:
   * Integrates with `.github/workflows/codesage-pr-review.yml` to automatically review pull requests and comment on code diffs.
+* **Diff-Aware PR Impact Analysis**:
+  * Extracts changed files and symbols, estimates risk, detects security-sensitive additions, identifies indexed dependents, and suggests regression tests before the LLM review runs.
 * **Production Resilience**:
   * Model startup pre-warming, multi-tenant IP rate-limiting (SlowAPI), path-traversal sanitization, and streaming keepalive for reverse proxies.
 
@@ -110,6 +123,62 @@ LLM_PROVIDER=gemini
 GEMINI_API_KEY=your_free_key_from_aistudio.google.com
 ```
 
+For private, quota-free local inference, install [Ollama](https://ollama.com),
+pull a coding model, and use local embeddings:
+
+```bash
+ollama pull qwen2.5-coder:14b
+```
+
+```env
+LLM_PROVIDER=ollama
+OLLAMA_CHAT_MODEL=qwen2.5-coder:14b
+OLLAMA_BASE_URL=http://localhost:11434
+```
+
+`deepseek-coder-v2` can be selected in `OLLAMA_CHAT_MODEL` when that model is
+available on the Ollama host. Local models have no hosted request quota, but
+throughput is limited by the machine's RAM/VRAM and model context window.
+
+Whole-repository review defaults to the faster review path:
+
+```env
+REVIEW_MODE=fast
+REVIEW_MAX_FULL_FILES=8
+REVIEW_CONCURRENCY=2
+```
+
+`fast` runs deterministic code inspection plus one model call per prioritized
+file, while lower-priority files receive static triage. Use
+`REVIEW_MODE=agentic` only when you want the deeper multi-turn tool loop and can
+accept the extra latency.
+
+DeepSeek can also be used without installing a local model:
+
+```env
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your_deepseek_api_key
+DEEPSEEK_CHAT_MODEL=deepseek-flash
+```
+
+DeepSeek chat uses its OpenAI-compatible API. Code embeddings remain local via
+MiniLM, so changing to DeepSeek requires re-indexing only if the embedding
+provider changes.
+
+### Prompt + Tools + RAG + Optional LoRA
+
+The runtime path is intentionally split into two layers:
+
+```text
+DeepSeek API -> Prompt + Tools + Hybrid RAG -> response
+                    failure -> Ollama local fallback
+```
+
+CodeSage also includes an optional LoRA/QLoRA training scaffold under
+`training/`. Fine-tuning is used to teach review style, structured output, and
+tool-use behavior; repository facts remain in RAG. Ollama serves the resulting
+local adapter/model but does not perform the training itself.
+
 ### 3. Run Backend
 
 ```bash
@@ -123,6 +192,10 @@ cd ../frontend
 npm install
 npm run dev
 ```
+
+When the backend has `API_KEY` configured, expose the same value to the browser
+build as `VITE_API_KEY`. Because browser-delivered keys are not secrets, deploy
+the frontend and backend behind the same trusted access boundary for production.
 
 ---
 

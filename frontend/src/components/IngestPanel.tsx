@@ -17,8 +17,7 @@ import {
   Trash2, Database, ChevronDown,
 } from "lucide-react";
 import { IngestionProgress, IndexedFile, IndexedRepo } from "../types";
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+import { apiFetch } from "../api";
 
 interface IngestPanelProps {
   indexedFiles: IndexedFile[];
@@ -54,7 +53,7 @@ export function IngestPanel({
     setProgress({ step: "cloning", message: "Starting ingestion..." });
 
     try {
-      const response = await fetch(`${API_BASE}/api/v1/ingest/github`, {
+      const response = await apiFetch("/api/v1/ingest/github", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repo_url: repoUrl, branch: branch.trim() }),
@@ -68,15 +67,17 @@ export function IngestPanel({
 
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
+      let buffer = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const text = decoder.decode(value, { stream: true });
-        const lines = text.split("\n\n").filter(Boolean);
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
 
-        for (const line of lines) {
+        for (const line of frames) {
           if (line.startsWith("data: ")) {
             try {
               const event = JSON.parse(line.slice(6)) as IngestionProgress;
@@ -111,7 +112,7 @@ export function IngestPanel({
     }
 
     try {
-      const response = await fetch(`${API_BASE}/api/v1/ingest/files`, {
+      const response = await apiFetch("/api/v1/ingest/files", {
         method: "POST",
         body: formData,
       });
@@ -146,10 +147,10 @@ export function IngestPanel({
     setIsClearing(true);
     try {
       const url = repoToClear
-        ? `${API_BASE}/api/v1/ingest/clear?repo_url=${encodeURIComponent(repoToClear)}`
-        : `${API_BASE}/api/v1/ingest/clear`;
+        ? `/api/v1/ingest/clear?repo_url=${encodeURIComponent(repoToClear)}`
+        : "/api/v1/ingest/clear";
 
-      const response = await fetch(url, { method: "DELETE" });
+      const response = await apiFetch(url, { method: "DELETE" });
       if (!response.ok) {
         const err = await response.json().catch(() => ({}));
         setProgress({ step: "error", message: err.detail ?? `Clear failed (${response.status}).` });

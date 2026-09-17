@@ -17,10 +17,11 @@ import tempfile
 from typing import Literal
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
+from app.api.deps import require_api_key
 from app.limiter import limiter
 from app.services.write_agent import stream_code_write
 
@@ -28,12 +29,14 @@ router = APIRouter(prefix="/write", tags=["write"])
 
 
 def _get_allowed_roots() -> list[Path]:
-    """Same allowed-roots logic as review.py — prevents path traversal on context files."""
+    """Same allowed-roots logic as review.py — prevents path traversal on context files.
+    Includes /tmp resolved form for macOS where mkdtemp() uses /private/tmp."""
     from app.core.config import get_settings
     s = get_settings()
     return [
         Path(s.chroma_persist_directory).resolve(),
         Path(tempfile.gettempdir()).resolve(),
+        Path("/tmp").resolve(),   # macOS: /tmp → /private/tmp (mkdtemp uses this)
     ]
 
 
@@ -69,8 +72,11 @@ class WriteGenerateRequest(BaseModel):
         allowed_roots = _get_allowed_roots()
         validated = []
         for v in sources:
+            if "::" in v and (v.startswith("https://") or v.startswith("git@")):
+                validated.append(v)
+                continue
             resolved = Path(v).resolve()
-            if not any(str(resolved).startswith(str(root)) for root in allowed_roots):
+            if not any(resolved == root or root in resolved.parents for root in allowed_roots):
                 raise ValueError(
                     f"Context file path '{v}' is outside the allowed directory."
                 )
@@ -80,7 +86,7 @@ class WriteGenerateRequest(BaseModel):
 
 @router.post("/generate")
 @limiter.limit("10/minute")
-async def generate_code(request: Request, body: WriteGenerateRequest):
+async def generate_code(request: Request, body: WriteGenerateRequest, _: None = Depends(require_api_key)):
     """
     Generate, edit, or test code using the indexed codebase as context.
     Returns a streaming response of status markers + code tokens.
@@ -99,7 +105,7 @@ async def generate_code(request: Request, body: WriteGenerateRequest):
 
 
 @router.get("/file-content")
-async def get_file_content(source: str = Query(..., description="Absolute source path from indexed files list")):
+async def get_file_content(source: str = Query(..., description="Absolute source path from indexed files list"), _: None = Depends(require_api_key)):
     """
     Return the raw content of an indexed file, reconstructed from its ChromaDB chunks.
 
@@ -117,7 +123,10 @@ async def get_file_content(source: str = Query(..., description="Absolute source
     # Validate path against allowed roots (path traversal guard)
     resolved = Path(source).resolve()
     allowed_roots = _get_allowed_roots()
-    if not any(str(resolved).startswith(str(root)) for root in allowed_roots):
+    is_indexed_source_id = "::" in source and (source.startswith("https://") or source.startswith("git@"))
+    if not is_indexed_source_id and not any(
+        resolved == root or root in resolved.parents for root in allowed_roots
+    ):
         raise HTTPException(
             status_code=403,
             detail="File path is outside the allowed directory.",
@@ -136,11 +145,8 @@ async def get_file_content(source: str = Query(..., description="Absolute source
         if not docs:
             raise HTTPException(status_code=404, detail=f"No indexed content found for: {source}")
 
-        sorted_chunks = sorted(
-            zip(metas, docs),
-            key=lambda pair: pair[0].get("chunk_index", 0),
-        )
-        content = "\n".join(chunk[1] for chunk in sorted_chunks)
+        from app.services.chunk_reconstruction import reconstruct_chunks
+        content = reconstruct_chunks(zip(metas, docs))
         file_name = metas[0].get("file_name", source.split("/")[-1])
         language = metas[0].get("language", "")
         return {"content": content, "file_name": file_name, "language": language}

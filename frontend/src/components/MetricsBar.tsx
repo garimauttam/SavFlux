@@ -13,8 +13,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { Activity, Zap, RefreshCw } from "lucide-react";
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+import { apiFetch } from "../api";
 
 interface Metrics {
   prompt_tokens: number;
@@ -40,7 +39,7 @@ export function MetricsBar() {
 
   const fetchMetrics = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/v1/metrics`);
+      const res = await apiFetch("/api/v1/metrics");
       if (res.ok) {
         const data = await res.json();
         setMetrics(data);
@@ -59,7 +58,7 @@ export function MetricsBar() {
 
   const handleReset = async () => {
     try {
-      await fetch(`${API_BASE}/api/v1/metrics`, { method: "DELETE" });
+      await apiFetch("/api/v1/metrics", { method: "DELETE" });
       fetchMetrics();
     } catch {}
   };
