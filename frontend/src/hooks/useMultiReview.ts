@@ -11,17 +11,25 @@
 
 import { useState, useCallback } from "react";
 import { IndexedFile } from "../types";
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
+import { apiFetch } from "../api";
 
 export interface ReviewSection {
+  id: string;
   fileName: string;
   content: string;
+  status: "pending" | "scanning" | "reviewing" | "writing" | "complete" | "skipped" | "error";
+  statusMessage?: string;
 }
 
 export interface AgentStep {
-  tool: string;
+  tool?: string;
   message: string;
+  step?: string;
+  file?: string;
+  id?: string;
+  index?: number;
+  total?: number;
+  mode?: string;
 }
 
 export interface MultiReviewState {
@@ -29,7 +37,18 @@ export interface MultiReviewState {
   sections: ReviewSection[];    // one per file + optional summary
   agentSteps: AgentStep[];
   currentStep: string | null;
+  currentFile: string | null;
+  totalFiles: number;
+  currentMode: string | null;
   error: string | null;
+  // Server-reported coverage (authoritative — from backend routing, not text scanning)
+  serverLlmCount?: number;     // exact LLM-reviewed count as reported by the backend
+  serverStaticCount?: number;  // exact static-only count as reported by the backend
+  serverCoveragePct?: number;  // exact LLM coverage % as reported by the backend
+  // Derived accuracy fields (not part of useState, computed from sections)
+  reviewAccuracy?: number;      // 0–100: % of file sections with real LLM review
+  llmReviewedCount?: number;    // absolute count of LLM-reviewed files
+  totalFileCount?: number;      // authoritative total (excludes summary section)
 }
 
 export function useMultiReview() {
@@ -38,14 +57,32 @@ export function useMultiReview() {
     sections: [],
     agentSteps: [],
     currentStep: null,
+    currentFile: null,
+    totalFiles: 0,
+    currentMode: null,
     error: null,
   });
 
   const reviewFiles = useCallback(async (files: IndexedFile[]) => {
-    setState({ isReviewing: true, sections: [], agentSteps: [], currentStep: "Starting multi-file review...", error: null });
+    setState({
+      isReviewing: true,
+      sections: files.map((file) => ({
+        id: file.source,
+        fileName: file.file_name,
+        content: "",
+        status: "pending",
+        statusMessage: "Waiting in review queue...",
+      })),
+      agentSteps: [],
+      currentStep: "Starting multi-file review...",
+      currentFile: null,
+      totalFiles: files.length,
+      currentMode: null,
+      error: null,
+    });
 
     try {
-      const response = await fetch(`${API_BASE}/api/v1/review/multi`, {
+      const response = await apiFetch("/api/v1/review/multi", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -58,14 +95,63 @@ export function useMultiReview() {
       });
 
       if (!response.ok) {
-        const err = await response.json().catch(() => ({ detail: `Server error ${response.status}` }));
-        throw new Error(err.detail ?? `Server error ${response.status}`);
+        const err = await response.json().catch(() => ({}));
+        const detail = Array.isArray(err.detail)
+          ? err.detail.map((item: { msg?: string }) => item.msg ?? "Validation error").join("; ")
+          : err.detail;
+        throw new Error(detail ?? `Server error ${response.status}`);
       }
 
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let currentSectionName = "";
+      let currentSectionId = "";
+
+      const parseSectionPayload = (raw: string): { id: string; fileName: string } => {
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object") {
+            const fileName = typeof parsed.file_name === "string" ? parsed.file_name : raw;
+            const id = typeof parsed.id === "string" ? parsed.id : fileName;
+            return { id, fileName };
+          }
+        } catch {}
+        return { id: raw, fileName: raw };
+      };
+
+      const appendToSection = (sectionId: string, text: string) => {
+        setState((prev) => ({
+          ...prev,
+          sections: prev.sections.map((s) =>
+            s.id === sectionId ? { ...s, content: s.content + text } : s
+          ),
+        }));
+      };
+
+      const sectionStatusFromMeta = (
+        meta: { step?: string; tool?: string; mode?: string },
+        message: string,
+      ): ReviewSection["status"] => {
+        if (meta.step === "complete" || meta.step === "summary_complete") return "complete";
+        if (meta.step === "writing") return "writing";
+        if (meta.step === "summary") return "writing";
+        if (meta.tool || message.toLowerCase().includes("reviewing")) return "reviewing";
+        if (message.toLowerCase().includes("scanning")) return "scanning";
+        return "reviewing";
+      };
+
+      const updateSectionStatus = (
+        sectionId: string,
+        status: ReviewSection["status"],
+        statusMessage?: string,
+      ) => {
+        setState((prev) => ({
+          ...prev,
+          sections: prev.sections.map((s) =>
+            s.id === sectionId ? { ...s, status, statusMessage } : s
+          ),
+        }));
+      };
 
       while (true) {
         const { done, value } = await reader.read();
@@ -83,15 +169,16 @@ export function useMultiReview() {
             const errMsg = buffer.slice(eStart + 9, eEnd).trim();
             buffer = buffer.slice(eEnd + 13 + 1); // consume the marker
             const displayMsg = `\n\n> ⚠️ **Error:** ${errMsg || "Server error — response may be incomplete."}`;
-            if (currentSectionName) {
+            if (currentSectionId) {
               setState((prev) => ({
                 ...prev,
                 sections: prev.sections.map((s) =>
-                  s.fileName === currentSectionName
+                  s.id === currentSectionId
                     ? { ...s, content: s.content + displayMsg }
                     : s
                 ),
               }));
+              updateSectionStatus(currentSectionId, "error", errMsg);
             }
           }
         }
@@ -108,24 +195,22 @@ export function useMultiReview() {
             if (sStart !== -1 && sEnd !== -1 && sEnd > sStart) {
               // Flush any buffered text to the current section first
               const textBefore = buffer.slice(0, sStart);
-              if (textBefore.trim() && currentSectionName) {
-                setState((prev) => ({
-                  ...prev,
-                  sections: prev.sections.map((s) =>
-                    s.fileName === currentSectionName
-                      ? { ...s, content: s.content + textBefore }
-                      : s
-                  ),
-                }));
+              if (textBefore.trim() && currentSectionId) {
+                appendToSection(currentSectionId, textBefore);
               }
 
-              const newSectionName = buffer.slice(sStart + 17, sEnd); // strip __SECTION_START__
+              const sectionPayload = parseSectionPayload(buffer.slice(sStart + 17, sEnd)); // strip __SECTION_START__
               buffer = buffer.slice(sEnd + 15 + 1); // strip __SECTION_END__\n
-              currentSectionName = newSectionName;
+              currentSectionId = sectionPayload.id;
 
               setState((prev) => ({
                 ...prev,
-                sections: [...prev.sections, { fileName: newSectionName, content: "" }],
+                sections: prev.sections.some((section) => section.id === sectionPayload.id)
+                  ? prev.sections
+                  : [
+                    ...prev.sections,
+                    { id: sectionPayload.id, fileName: sectionPayload.fileName, content: "", status: "pending" },
+                  ],
               }));
               changed = true;
               continue;
@@ -139,15 +224,8 @@ export function useMultiReview() {
             if (start !== -1 && end !== -1) {
               // Flush text before this marker to current section
               const textBefore = buffer.slice(0, start);
-              if (textBefore && currentSectionName) {
-                setState((prev) => ({
-                  ...prev,
-                  sections: prev.sections.map((s) =>
-                    s.fileName === currentSectionName
-                      ? { ...s, content: s.content + textBefore }
-                      : s
-                  ),
-                }));
+              if (textBefore && currentSectionId) {
+                appendToSection(currentSectionId, textBefore);
               }
 
               const statusText = buffer.slice(start + 10, end);
@@ -157,17 +235,28 @@ export function useMultiReview() {
               const message = jsonMatch
                 ? statusText.slice(0, statusText.lastIndexOf(jsonMatch[0])).trim()
                 : statusText.trim();
-              let meta: { step?: string; tool?: string } = {};
+              let meta: { step?: string; tool?: string; file?: string; id?: string; index?: number; total?: number; mode?: string; llm?: number; static?: number; pct?: number } = {};
               if (jsonMatch) {
                 try { meta = JSON.parse(jsonMatch[1]); } catch {}
+              }
+              const statusId = meta.id ?? currentSectionId;
+              if (statusId) {
+                updateSectionStatus(statusId, sectionStatusFromMeta(meta, message), message);
               }
 
               setState((prev) => ({
                 ...prev,
                 currentStep: message,
-                agentSteps: meta.tool
-                  ? [...prev.agentSteps, { tool: meta.tool, message }]
-                  : prev.agentSteps,
+                currentFile: meta.file ?? prev.currentFile,
+                totalFiles: meta.total ?? prev.totalFiles,
+                currentMode: meta.mode ?? prev.currentMode,
+                agentSteps: [...prev.agentSteps, { ...meta, message }].slice(-80),
+                // Capture server-side coverage counts from the "coverage" step token
+                ...(meta.step === "coverage" && {
+                  serverLlmCount: meta.llm,
+                  serverStaticCount: meta.static,
+                  serverCoveragePct: meta.pct,
+                }),
               }));
               changed = true;
             }
@@ -178,26 +267,32 @@ export function useMultiReview() {
         if (
           !buffer.includes("__SECTION_START__") &&
           !buffer.includes("__STATUS__") &&
-          currentSectionName
+          currentSectionId
         ) {
           const partialMatch = buffer.match(/_{1,2}(?:S(?:E(?:C(?:T(?:I(?:O(?:N)?)?)?)?)?|T(?:A(?:T(?:U(?:S)?)?)?)?)?)?$/);
           const splitIdx = partialMatch ? (partialMatch.index ?? buffer.length) : buffer.length;
           const text = buffer.slice(0, splitIdx);
           buffer = buffer.slice(splitIdx);
           if (text) {
-            setState((prev) => ({
-              ...prev,
-              sections: prev.sections.map((s) =>
-                s.fileName === currentSectionName
-                  ? { ...s, content: s.content + text }
-                  : s
-              ),
-            }));
+            appendToSection(currentSectionId, text);
           }
         }
       }
 
-      setState((prev) => ({ ...prev, isReviewing: false, currentStep: null }));
+      setState((prev) => ({
+        ...prev,
+        isReviewing: false,
+        currentStep: null,
+        sections: prev.sections.map((section) => {
+          if (section.status === "complete" || section.status === "error") return section;
+          if (section.content.trim()) return { ...section, status: "complete" };
+          return {
+            ...section,
+            status: "skipped",
+            statusMessage: "No review output was received for this file.",
+          };
+        }),
+      }));
     } catch (err) {
       setState((prev) => ({
         ...prev,
@@ -208,8 +303,66 @@ export function useMultiReview() {
   }, []);
 
   const reset = useCallback(() => {
-    setState({ isReviewing: false, sections: [], agentSteps: [], currentStep: null, error: null });
+    setState({
+      isReviewing: false,
+      sections: [],
+      agentSteps: [],
+      currentStep: null,
+      currentFile: null,
+      totalFiles: 0,
+      currentMode: null,
+      error: null,
+    });
   }, []);
 
-  return { ...state, reviewFiles, reset };
+  // Derive completedFiles and totalFileCount from sections — always accurate regardless of
+  // React batching, and always excludes the __repo_summary__ section.
+  // A section is "done" once it has a terminal status (complete, error, or skipped).
+  const fileSections = state.sections.filter((s) => s.id !== "__repo_summary__");
+
+  // Use fileSections.length as the authoritative total — avoids relying on state.totalFiles
+  // which could lag behind or include the summary section, causing counters like 62/61.
+  const totalFileCount = fileSections.length || state.totalFiles;
+
+  const completedFiles = fileSections.filter(
+    (s) => s.status === "complete" || s.status === "error" || s.status === "skipped"
+  ).length;
+
+  // Review coverage: how many file sections received a real LLM review vs. deterministic-only.
+  // Deterministic (static analysis) sections contain the footer marker injected by _static_triage().
+  // LLM-reviewed sections contain structured headings like "## Security" or "## Performance" but
+  // NOT the deterministic-only footer.
+  const isDeterministicOnly = (content: string) =>
+    content.includes("deterministic static analysis") ||
+    content.includes("Deterministic Score") ||
+    // Static triage footer — matches the string injected by _static_triage() in multi_review_agent.py
+    content.includes("Static analysis (outside LLM review budget");
+
+  const llmReviewedCount = fileSections.filter(
+    (s) =>
+      (s.status === "complete" || s.status === "error") &&
+      s.content.length > 0 &&
+      !isDeterministicOnly(s.content)
+  ).length;
+
+  // reviewCoverage: 0–100% of file sections that got a real LLM review.
+  const reviewCoverage =
+    totalFileCount > 0
+      ? Math.round((llmReviewedCount / totalFileCount) * 100)
+      : 0;
+
+  // Prefer server-reported counts (from routing, authoritative) over client-derived counts
+  // (from content text-scanning, which is less reliable).
+  const accuracyPct   = state.serverCoveragePct ?? reviewCoverage;
+  const llmCount      = state.serverLlmCount    ?? llmReviewedCount;
+
+  return {
+    ...state,
+    completedFiles,
+    totalFileCount,
+    reviewAccuracy: accuracyPct,
+    llmReviewedCount: llmCount,
+    reviewFiles,
+    reset,
+  };
 }
