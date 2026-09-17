@@ -23,6 +23,7 @@ WHY 40+ QUERIES?
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -36,7 +37,7 @@ from typing import List, Dict, Any, Optional
 from langchain_core.documents import Document
 from app.services.hybrid_retriever import BM25Index, reciprocal_rank_fusion
 from app.services.reranker import rerank
-from app.services.query_enhancer import extract_file_scope
+from app.services.query_enhancer import extract_file_scope, local_query_variants
 
 
 # ── Benchmark Dataset ─────────────────────────────────────────────────────────
@@ -57,14 +58,14 @@ BENCHMARK_DATASET: List[Dict[str, Any]] = [
         "expected_symbols": ["lru_cache", "get_chat_llm"],
     },
     {
-        "query": "What embedding model is used for the Gemini provider and why?",
+        "query": "What embedding model is used for local providers and why?",
         "ground_truth_file": "llm_factory.py",
         "expected_symbols": ["HuggingFaceEmbeddings", "all-MiniLM-L6-v2"],
     },
     {
-        "query": "How does the system switch between OpenAI and Gemini without changing service code?",
+        "query": "How does the system switch between OpenAI, DeepSeek, and Ollama without changing service code?",
         "ground_truth_file": "llm_factory.py",
-        "expected_symbols": ["llm_provider", "get_chat_llm", "gemini"],
+        "expected_symbols": ["llm_provider", "get_chat_llm", "ollama"],
     },
 
     # ── Retrieval & RAG Pipeline ──────────────────────────────────────────────
@@ -96,7 +97,7 @@ BENCHMARK_DATASET: List[Dict[str, Any]] = [
     {
         "query": "How is query expansion and file scope (@filename) extraction handled?",
         "ground_truth_file": "query_enhancer.py",
-        "expected_symbols": ["extract_file_scope", "expand_query"],
+        "expected_symbols": ["extract_file_scope", "local_query_variants"],
     },
     {
         "query": "How is chat history compacted before being added to the prompt?",
@@ -138,9 +139,9 @@ BENCHMARK_DATASET: List[Dict[str, Any]] = [
         "expected_symbols": ["_make_tools", "file_content", "closure"],
     },
     {
-        "query": "How does the Gemini provider path differ from OpenAI in the review agent?",
+        "query": "How does the fast review mode differ from the agentic ReAct mode?",
         "ground_truth_file": "review_agent.py",
-        "expected_symbols": ["llm_provider", "gemini", "gemini_prompt"],
+        "expected_symbols": ["stream_fast_code_review", "FAST_REVIEW_SYSTEM_PROMPT", "asyncio"],
     },
     {
         "query": "What STATUS stream markers are used to show agent progress in the UI?",
@@ -162,7 +163,7 @@ BENCHMARK_DATASET: List[Dict[str, Any]] = [
     {
         "query": "What file types are excluded from indexing?",
         "ground_truth_file": "ingestion_service.py",
-        "expected_symbols": ["EXCLUDED_EXTENSIONS", "EXCLUDED_DIRS"],
+        "expected_symbols": ["ALLOWED_EXTENSIONS", "SKIP_DIRS"],
     },
     {
         "query": "How are indexed repos tracked so the UI can show repo-level stats?",
@@ -196,7 +197,7 @@ BENCHMARK_DATASET: List[Dict[str, Any]] = [
     {
         "query": "How does configs.json override the default model settings?",
         "ground_truth_file": "config.py",
-        "expected_symbols": ["configs.json", "gemini_chat_model", "top_k_results"],
+        "expected_symbols": ["configs.json", "ollama_chat_model", "top_k_results"],
     },
     {
         "query": "What CORS origins are whitelisted and why is allow_origins=['*'] avoided?",
@@ -315,6 +316,7 @@ async def evaluate_pipeline(
     symbol_hits = 0
     total_expected_symbols = 0
     latencies: List[float] = []
+    precision_values: List[float] = []
 
     query_results = []
 
@@ -327,8 +329,12 @@ async def evaluate_pipeline(
 
         t0 = time.monotonic()
 
-        # Lexical BM25 candidates (dense retrieval not available without ChromaDB index)
-        bm25_candidates = bm25.search(query=query, top_k=top_k * 3, file_filter=file_scope)
+        # Evaluate the same cheap query-variant strategy used by production RAG.
+        candidate_lists = [
+            bm25.search(query=variant, top_k=top_k * 3, file_filter=file_scope)
+            for variant in local_query_variants(query)
+        ]
+        bm25_candidates = reciprocal_rank_fusion(candidate_lists, top_n=top_k * 3)
 
         # Cross-encoder reranking
         ranked_docs = await rerank(query, bm25_candidates, top_n=top_k)
@@ -350,6 +356,14 @@ async def evaluate_pipeline(
             reciprocal_ranks.append(1.0 / rank)
         else:
             reciprocal_ranks.append(0.0)
+
+        relevant_count = sum(
+            1
+            for doc in ranked_docs
+            if target_file.lower() in doc.metadata.get("file_name", "").lower()
+            or target_file.lower() in doc.metadata.get("source", "").lower()
+        )
+        precision_values.append(relevant_count / len(ranked_docs) if ranked_docs else 0.0)
 
         # ── Symbol Coverage ───────────────────────────────────────────────────
         retrieved_text = " ".join(doc.page_content for doc in ranked_docs)
@@ -379,16 +393,29 @@ async def evaluate_pipeline(
     sym_recall   = symbol_hits / total_expected_symbols if total_expected_symbols else 0.0
     avg_latency  = sum(latencies) / len(latencies) if latencies else 0.0
 
-    return {
+    result = {
         "metrics": {
             "total_queries": total_queries,
             "hit_rate_at_k": round(hit_rate * 100, 2),
             "mean_reciprocal_rank_mrr": round(mrr, 3),
             "symbol_recall_pct": round(sym_recall * 100, 2),
             "avg_latency_ms": round(avg_latency, 1),
+            "precision_at_k_pct": round(
+                (sum(precision_values) / len(precision_values) if precision_values else 0.0) * 100,
+                2,
+            ),
         },
         "query_breakdown": query_results,
     }
+    result["evaluation"] = {
+        "top_k": top_k,
+        "dataset_queries": total_queries,
+        "dataset_sha256": hashlib.sha256(
+            json.dumps(dataset, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "retrieval": "BM25 + local query variants + RRF + cross-encoder reranking",
+    }
+    return result
 
 
 def load_corpus(backend_dir: Path) -> List[Document]:
@@ -419,6 +446,7 @@ def print_report(result: Dict[str, Any]) -> None:
     print(f"  Hit Rate @ K         : {m['hit_rate_at_k']}%")
     print(f"  Mean Reciprocal Rank : {m['mean_reciprocal_rank_mrr']}")
     print(f"  Symbol Recall        : {m['symbol_recall_pct']}%")
+    print(f"  Precision @ K        : {m['precision_at_k_pct']}%")
     print(f"  Avg latency          : {m['avg_latency_ms']} ms/query")
     print("=" * 60)
     # Grade bands
