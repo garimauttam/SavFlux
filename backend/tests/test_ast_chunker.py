@@ -95,6 +95,18 @@ def process():
     assert "import os" in module_chunks[0].page_content
 
 
+def test_module_code_after_definition_is_preserved():
+    """Module constants after a function remain available for retrieval."""
+    source = '''def process():
+    return 1
+
+LATE_CONSTANT = "kept"
+'''
+    docs = chunk_python_file(source=source, **BASE_META)
+    module = next(d for d in docs if d.metadata["symbol_name"] == "<module>")
+    assert "LATE_CONSTANT" in module.page_content
+
+
 def test_content_hash_propagated():
     """content_hash from input is present in all chunk metadata."""
     source = '''

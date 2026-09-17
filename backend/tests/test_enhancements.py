@@ -7,8 +7,8 @@ test_enhancements.py — Unit and integration tests for new RAG enhancements:
 
 import pytest
 from langchain_core.documents import Document
-from app.services.hybrid_retriever import BM25Index, reciprocal_rank_fusion
-from app.services.query_enhancer import extract_file_scope, compact_chat_history
+from app.services.hybrid_retriever import BM25Index, reciprocal_rank_fusion, diversify_documents
+from app.services.query_enhancer import extract_file_scope, compact_chat_history, local_query_variants
 
 
 def test_file_scope_extraction():
@@ -50,3 +50,21 @@ def test_compact_chat_history():
     compacted = compact_chat_history(history, max_turns=4)
     assert "User: How do I start the server?" in compacted
     assert "CodeSage: Run uvicorn" in compacted
+
+
+def test_local_query_variants_extract_identifiers_and_synonyms():
+    variants = local_query_variants("How is JWT authentication configured?")
+    assert variants[0].startswith("How is JWT")
+    assert any("JWT" in variant for variant in variants)
+    assert any("authorization" in variant for variant in variants)
+
+
+def test_diversify_documents_limits_one_source():
+    docs = [
+        Document(page_content="a", metadata={"source": "a.py"}),
+        Document(page_content="b", metadata={"source": "a.py"}),
+        Document(page_content="c", metadata={"source": "a.py"}),
+        Document(page_content="d", metadata={"source": "b.py"}),
+    ]
+    selected = diversify_documents(docs, top_n=3, max_per_source=2)
+    assert [doc.metadata["source"] for doc in selected] == ["a.py", "a.py", "b.py"]

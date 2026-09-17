@@ -35,6 +35,19 @@ def test_review_file_rejects_path_traversal(client):
     assert "detail" in body
 
 
+def test_review_file_rejects_path_prefix_bypass(client):
+    """A sibling path sharing the /tmp prefix must not pass validation."""
+    response = client.post(
+        "/api/v1/review/file",
+        json={
+            "file_path": "/tmp-attacker/secret.py",
+            "file_name": "secret.py",
+            "language": "python",
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_review_paste_empty_code_returns_400(client):
     """
     Empty code paste returns 400 with a clear error message.
@@ -72,16 +85,17 @@ def test_review_paste_valid_code_streams(client):
     We don't check the exact content (that's the LLM's job) —
     we check that the response starts and contains our STATUS marker format.
 
-    WHY MOCK stream_code_review?
-    We're testing the API contract (does it stream? does it set the right headers?),
-    not the review quality. Calling the real function requires an OpenAI key.
+    WHY MOCK stream_fast_code_review?
+    /review/paste now uses fast mode by default (1 LLM call, same as multi-file).
+    We patch stream_fast_code_review — the function actually called — not the
+    agentic stream_code_review which is only used when REVIEW_MODE=agentic.
     """
     async def fake_stream(*args, **kwargs):
-        yield '__STATUS__Analyzing `test.py`...{"step": "starting"}__STATUS_END__\n'
-        yield "## File Overview\nThis is a test file.\n"
+        yield '__STATUS__Scanning `test.py`...{"step": "starting", "mode": "fast"}__STATUS_END__\n'
+        yield "## 🐛 Bugs & Risks\nNone found.\n"
 
     with patch(
-        "app.api.review.stream_code_review",
+        "app.api.review.stream_fast_code_review",
         side_effect=fake_stream,
     ):
         response = client.post(
@@ -94,4 +108,4 @@ def test_review_paste_valid_code_streams(client):
     assert "text/plain" in response.headers.get("content-type", "")
     body = response.text
     assert "__STATUS__" in body
-    assert "File Overview" in body
+    assert "Bugs & Risks" in body

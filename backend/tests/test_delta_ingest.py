@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 from langchain_core.documents import Document
 
-from app.services.ingestion_service import _load_and_split
+from app.services.ingestion_service import _load_and_split, normalize_repo_url
 
 
 def _make_doc(content: str, source: str, repo_url: str = "https://github.com/test/repo") -> Document:
@@ -37,6 +37,14 @@ def test_content_hash_is_deterministic():
     h2 = hashlib.sha256(code.encode()).hexdigest()[:16]
     assert h1 == h2
     assert len(h1) == 16
+
+
+def test_normalize_repo_url_collapses_common_github_variants():
+    expected = "https://github.com/test/repo"
+    assert normalize_repo_url("https://github.com/test/repo") == expected
+    assert normalize_repo_url("https://github.com/test/repo/") == expected
+    assert normalize_repo_url("https://github.com/test/repo.git") == expected
+    assert normalize_repo_url("git@github.com:test/repo.git") == expected
 
 
 def test_content_hash_differs_on_content_change():
