@@ -45,7 +45,7 @@ flowchart TD
 
     subgraph Agentic Code Review Loop
         I --> J[Context Assembly]
-        J --> K[Gemini 1.5 Flash / GPT-4o]
+        J --> K[DeepSeek / Ollama / GPT-4o]
         K <--> L[ReAct Inspection Tools: AST/Complexity/Regex]
         K --> M[Real-time SSE Stream + Citations]
         K --> N[GitHub PR Automated Action Comment]
@@ -88,9 +88,9 @@ webhook response includes the same `impact` object.
 * **3-Stage Hybrid Retrieval**:
   * Dense Vector Search via `all-MiniLM-L6-v2` + Lexical BM25 search with camelCase/snake_case code tokenization.
   * Fused using **Reciprocal Rank Fusion (RRF, $k=60$)** and re-ranked using a local **Cross-Encoder (`ms-marco-MiniLM-L-6-v2`)**.
-* **Zero-Cost Free Provider Option**:
-  * Runs 100% free with `LLM_PROVIDER=gemini` (Google Gemini 1.5 Flash) and local CPU embeddings.
-  * Instant single-variable swap to `LLM_PROVIDER=openai` (GPT-4o).
+* **Zero-Cost Local Provider Option**:
+  * Runs 100% free with `LLM_PROVIDER=ollama` (local Ollama) and local CPU MiniLM embeddings — no API key needed.
+  * Instant single-variable swap to `LLM_PROVIDER=deepseek` (hosted) or `LLM_PROVIDER=openai` (GPT-4o).
 * **Autonomous ReAct Code Review Agent**:
   * Closure-bound AST investigation tools (`get_function_list`, `count_complexity_indicators`, `search_pattern`) to inspect code before generating actionable security and complexity reviews.
 * **File-Scoped Tag Queries (`@file`)**:
@@ -119,8 +119,8 @@ pip install -r requirements.txt
 
 Copy `.env.example` to `.env`:
 ```env
-LLM_PROVIDER=gemini
-GEMINI_API_KEY=your_free_key_from_aistudio.google.com
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your_key_from_platform.deepseek.com
 ```
 
 For private, quota-free local inference, install [Ollama](https://ollama.com),

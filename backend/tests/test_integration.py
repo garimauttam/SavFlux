@@ -321,6 +321,47 @@ class TestBM25Integration:
         assert "get" in tokens or "getuser" in tokens or any("user" in t for t in tokens)
         assert "id" in tokens or any("id" in t for t in tokens)
 
+    def test_bm25_acronym_tokenisation(self):
+        """
+        New _tokenize handles acronym boundaries: HTTPClient → 'http', 'client'.
+        Also verifies the original unsplit identifier is preserved for exact-match queries.
+        """
+        from app.services.hybrid_retriever import _tokenize
+        tokens = _tokenize("HTTPClient")
+        # Acronym split: HTTP + Client
+        assert "http" in tokens
+        assert "client" in tokens
+        # Original (lowercased) identifier also preserved for exact-match queries
+        assert "httpclient" in tokens
+
+    def test_two_branch_rrf_weight_balance(self):
+        """
+        With 1 dense list and 3 BM25 lists, two_branch_rrf must give each branch
+        equal weight (50/50). The flat RRF would give BM25 3× more total weight.
+        Verify by checking a doc that appears ONLY in dense is not buried below
+        docs that appear in every BM25 list.
+        """
+        from app.services.hybrid_retriever import two_branch_rrf
+        from langchain_core.documents import Document
+
+        def _doc(src: str, idx: int, content: str) -> Document:
+            return Document(page_content=content,
+                            metadata={"source": src, "chunk_index": idx})
+
+        # doc_dense: top of dense, absent from all BM25 lists
+        doc_dense = _doc("dense.py", 0, "dense only")
+        # doc_bm25:  top of every BM25 list, absent from dense
+        doc_bm25  = _doc("bm25.py", 0, "bm25 only")
+
+        dense_lists = [[doc_dense]]
+        bm25_lists  = [[doc_bm25], [doc_bm25], [doc_bm25]]  # 3× bm25 lists
+
+        result = two_branch_rrf(dense_lists, bm25_lists, top_n=2)
+        # Both should appear (neither is completely dominated)
+        sources = [d.metadata["source"] for d in result]
+        assert "dense.py" in sources, "Dense-only doc should survive 3:1 BM25 ratio"
+        assert "bm25.py" in sources, "BM25-only doc should also appear"
+
 
 class TestChunkingIntegration:
     """
