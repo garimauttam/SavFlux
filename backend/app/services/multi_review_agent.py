@@ -36,7 +36,6 @@ import asyncio
 import json
 import logging
 import re
-from functools import lru_cache
 from typing import AsyncGenerator
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -194,18 +193,35 @@ def _triage_score(file_info: dict) -> int:
 
 
 # ── Available Ollama models cache ─────────────────────────────────────────────
+# TTL-based cache: re-query Ollama at most once every 5 minutes.
+# lru_cache(forever) meant a newly-pulled model never appeared until restart.
+# 5 minutes is short enough that `ollama pull qwen2.5-coder:7b` takes effect
+# in the next batch review without hammering the Ollama API on every file.
 
-@lru_cache(maxsize=1)
+import time as _time
+
+_ollama_model_cache: tuple[frozenset[str], float] | None = None
+_OLLAMA_MODEL_TTL = 300  # seconds
+
+
 def _available_ollama_models() -> frozenset[str]:
     """
     Return the set of model names currently available in the local Ollama instance.
 
-    Cached with lru_cache — called once per server process so we don't hammer
-    the Ollama API on every file in a batch review.
-
+    Results are cached for _OLLAMA_MODEL_TTL seconds (default 5 min).
     Returns an empty frozenset if Ollama is unreachable (safe fallback —
     callers treat an absent model as "use the full provider instead").
+
+    WHY TTL INSTEAD OF lru_cache?
+    lru_cache lives forever — a model pulled mid-session is invisible until
+    the process restarts. A 5-minute TTL makes newly-pulled models available
+    in the next batch review without any extra Ollama API pressure.
     """
+    global _ollama_model_cache
+    now = _time.monotonic()
+    if _ollama_model_cache is not None and now - _ollama_model_cache[1] < _OLLAMA_MODEL_TTL:
+        return _ollama_model_cache[0]
+
     try:
         import httpx
         settings = get_settings()
@@ -214,10 +230,13 @@ def _available_ollama_models() -> frozenset[str]:
         models = {m["name"] for m in resp.json().get("models", [])}
         # Also add base names without the tag (e.g. "qwen2.5-coder" matches "qwen2.5-coder:7b")
         base_names = {m.split(":")[0] for m in models}
-        return frozenset(models | base_names)
+        result = frozenset(models | base_names)
     except Exception as exc:
         logger.debug("Could not fetch Ollama model list (non-fatal): %s", exc)
-        return frozenset()
+        result = frozenset()
+
+    _ollama_model_cache = (result, now)
+    return result
 
 
 def _model_available(model_name: str) -> bool:
@@ -322,23 +341,28 @@ def _static_triage(file_info: dict) -> str:
     ]
 
     # ── Complexity ─────────────────────────────────────────────────────────────
-    bare_excepts  = sum(1 for l in lines if l.strip() == "except:")
+    # bare_excepts and nested_loops are Python-only metrics (indentation-based).
+    # For brace-delimited languages (JS, Go, Java, Rust) these counters are
+    # meaningless — they always produce 0 regardless of actual nesting depth.
+    is_python = language in ("py", "python", "")
+    bare_excepts  = sum(1 for l in lines if l.strip() == "except:") if is_python else 0
     long_lines    = sum(1 for l in lines if len(l) > 120)
     todos         = sum(1 for l in lines if re.search(r"\b(TODO|FIXME|HACK)\b", l, re.I))
     magic_numbers = sum(1 for l in lines if re.search(r"(?<![=\w])\b[0-9]{2,}\b(?!\s*[=\w])", l.strip()))
     nested_loops  = 0
-    loop_stack: list[int] = []
-    for line in lines:
-        if not line.strip():
-            continue
-        indent  = len(line) - len(line.lstrip())
-        stripped = line.strip()
-        while loop_stack and indent <= loop_stack[-1]:
-            loop_stack.pop()
-        if re.match(r"^(for|while)\b", stripped):
-            if loop_stack:
-                nested_loops += 1
-            loop_stack.append(indent)
+    if is_python:
+        loop_stack: list[int] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            indent  = len(line) - len(line.lstrip())
+            stripped = line.strip()
+            while loop_stack and indent <= loop_stack[-1]:
+                loop_stack.pop()
+            if re.match(r"^(for|while)\b", stripped):
+                if loop_stack:
+                    nested_loops += 1
+                loop_stack.append(indent)
 
     # ── Security ───────────────────────────────────────────────────────────────
     security: list[str] = []
@@ -471,7 +495,7 @@ def _deterministic_repo_summary(
 
     provider_note = ""
     if reason:
-        if "402" in reason or "insufficient balance" in reason.lower():
+        if re.search(r"\b402\b", reason) or "insufficient balance" in reason.lower() or "payment required" in reason.lower():
             provider_note = (
                 "\n\n> ⚠️ **LLM unavailable** — Insufficient Balance (402). "
                 "Recharge your DeepSeek key or run `ollama pull deepseek-r1:14b` for local reviews."

@@ -108,6 +108,12 @@ def route_query_intent(query: str) -> QueryIntent:
     Falls back to "general" (no filter) when no keywords match, so retrieval
     is never broken by misclassification.
 
+    WHY COUNT-BASED INSTEAD OF FIRST-MATCH?
+    A query like "how does the API handle auth token validation?" contains keywords
+    for both "security" (auth, token) and "api" (API, endpoint). First-match returns
+    "security" due to dict iteration order. Count-based scoring picks the intent
+    with the most keyword hits — a better proxy for the user's actual intent.
+
     Examples:
       "where is JWT validated?" → "security"
       "how are tests structured?" → "tests"
@@ -116,10 +122,12 @@ def route_query_intent(query: str) -> QueryIntent:
       "explain the chunking logic" → "general"
     """
     lower = query.lower()
-    for intent, keywords in _INTENT_KEYWORDS.items():
-        if any(kw in lower for kw in keywords):
-            return intent  # type: ignore[return-value]
-    return "general"
+    scores: dict[str, int] = {
+        intent: sum(1 for kw in keywords if kw in lower)
+        for intent, keywords in _INTENT_KEYWORDS.items()
+    }
+    best = max(scores, key=lambda k: scores[k])
+    return best if scores[best] > 0 else "general"  # type: ignore[return-value]
 
 
 def get_intent_filter(intent: QueryIntent) -> dict:

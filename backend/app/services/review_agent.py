@@ -52,8 +52,20 @@ async def _strip_think_tags(
 
     States:
       "before"   — haven't seen <think> yet; yield tokens normally
-      "thinking" — inside a <think> block; suppress tokens, emit __THINKING__ once
+      "thinking" — inside a <think> block; suppress all content
       "after"    — past </think>; yield tokens normally
+
+    Edge cases handled:
+      - Unterminated <think> at end of stream: flush buffered content (not discard)
+      - </think> without <think>: strip the tag, continue yielding normally
+      - Multiple <think>…</think> blocks: each is stripped independently
+
+    WHY THE INNER while LOOP?
+    A single token may contain multiple state transitions, e.g.:
+      "<think>reasoning</think>answer<think>more</think>done"
+    Without re-processing the buffer after each state change, state transitions
+    triggered late in the if-chain (e.g. "after"→"thinking") would not be
+    handled until the NEXT token. The inner loop re-processes until stable.
     """
     state = "before"
     buffer = ""
@@ -62,44 +74,63 @@ async def _strip_think_tags(
     async for token in token_stream:
         buffer += token
 
-        if state == "before":
-            # Check if we're entering a think block
-            if "<think>" in buffer:
-                # Yield any content before the tag
-                pre = buffer[: buffer.index("<think>")]
-                if pre.strip():
-                    yield pre
-                buffer = buffer[buffer.index("<think>") + len("<think>"):]
-                state = "thinking"
-                if not thinking_announced:
-                    yield f"__STATUS__Reasoning...{json.dumps({'step': 'thinking'})}__STATUS_END__\n"
-                    thinking_announced = True
-            else:
-                # Safe to yield once buffer is long enough that <think> can't split
+        # Re-process buffer until no further state change occurs in one pass.
+        changed = True
+        while changed:
+            changed = False
+
+            if state == "before":
+                # Strip orphaned </think> (no opening tag)
+                if "</think>" in buffer and "<think>" not in buffer:
+                    buffer = buffer.replace("</think>", "")
+                    changed = True
+                    continue
+                if "<think>" in buffer:
+                    pre = buffer[: buffer.index("<think>")]
+                    if pre.strip():
+                        yield pre
+                    buffer = buffer[buffer.index("<think>") + len("<think>"):]
+                    state = "thinking"
+                    if not thinking_announced:
+                        yield f"__STATUS__Reasoning...{json.dumps({'step': 'thinking'})}__STATUS_END__\n"
+                        thinking_announced = True
+                    changed = True
+                    continue
+                # No <think> — safe to yield once buffer can't split a tag
                 if len(buffer) > 8:
                     yield buffer[:-7]
                     buffer = buffer[-7:]
 
-        if state == "thinking":
-            # Look for closing tag
-            if "</think>" in buffer:
-                # Drop everything up to and including </think>
-                buffer = buffer[buffer.index("</think>") + len("</think>"):]
-                state = "after"
-                # Emit status: done thinking, now writing
-                yield f"__STATUS__Writing review...{json.dumps({'step': 'writing', 'mode': 'fast'})}__STATUS_END__\n"
-            else:
-                # Still inside think block — discard
-                buffer = buffer[-8:] if len(buffer) > 8 else buffer
+            elif state == "thinking":
+                if "</think>" in buffer:
+                    # Discard all content before (and including) </think>
+                    buffer = buffer[buffer.index("</think>") + len("</think>"):]
+                    state = "after"
+                    yield f"__STATUS__Writing review...{json.dumps({'step': 'writing', 'mode': 'fast'})}__STATUS_END__\n"
+                    changed = True
+                    continue
+                # else: still inside think block.
+                # Keep the entire buffer — don't tail-trim. Tokens are small (<100 chars)
+                # so memory growth is negligible, and we need the full content preserved
+                # in case the stream ends without a closing </think> (unterminated block).
 
-        if state == "after":
-            # Yield everything we have accumulated
-            if buffer:
-                yield buffer
-                buffer = ""
+            elif state == "after":
+                # Handle a second <think> block (some models reason in multiple steps)
+                if "<think>" in buffer:
+                    pre = buffer[: buffer.index("<think>")]
+                    if pre:
+                        yield pre
+                    buffer = buffer[buffer.index("<think>") + len("<think>"):]
+                    state = "thinking"
+                    changed = True
+                    continue
+                elif buffer:
+                    yield buffer
+                    buffer = ""
 
-    # Flush remainder
-    if buffer and state != "thinking":
+    # Flush remainder — always yield, even if we never saw </think>.
+    # Unterminated think block: yield whatever the model buffered — still useful.
+    if buffer:
         yield buffer
 
 settings = get_settings()
@@ -110,7 +141,7 @@ settings = get_settings()
 # The LLM never receives the full content as an argument — it only receives
 # small, focused tool outputs. This halves token usage vs. passing content each call.
 
-def _make_tools(file_content: str):
+def _make_tools(file_content: str, language: str = ""):
     @tool
     def search_pattern(pattern: str) -> str:
         """Search for a regex pattern in the code. Returns matching lines with numbers."""
@@ -150,37 +181,86 @@ def _make_tools(file_content: str):
     def count_complexity_indicators() -> str:
         """Return complexity metrics: nested loops, bare excepts, long lines, TODOs."""
         lines = file_content.split("\n")
-        metrics: dict[str, int] = {
+        lang = language.lower().lstrip(".")
+        is_python = lang in ("py", "python", "")
+
+        metrics: dict[str, object] = {
             "total_lines": len(lines),
-            "nested_loops": 0,
-            "bare_excepts": 0,
+            "nested_loops": 0 if is_python else "N/A (indent-based detection only works for Python)",
+            "bare_excepts": 0 if is_python else "N/A (Python-only metric)",
             "long_lines": 0,
             "todo_comments": 0,
             "magic_numbers": 0,
         }
+
         loop_stack: list[int] = []
         for line in lines:
             if not line.strip():
                 continue
-            indent = len(line) - len(line.lstrip())
             stripped = line.strip()
-            while loop_stack and indent <= loop_stack[-1]:
-                loop_stack.pop()
-            if re.match(r"^(for|while)\b", stripped):
-                if loop_stack:
-                    metrics["nested_loops"] += 1
-                loop_stack.append(indent)
-            if stripped == "except:":
-                metrics["bare_excepts"] += 1
+
+            if is_python:
+                indent = len(line) - len(line.lstrip())
+                while loop_stack and indent <= loop_stack[-1]:
+                    loop_stack.pop()
+                if re.match(r"^(for|while)\b", stripped):
+                    if loop_stack:
+                        metrics["nested_loops"] = int(metrics["nested_loops"]) + 1  # type: ignore[arg-type]
+                    loop_stack.append(indent)
+                # Match "except:" and "except SomeException:" and "except SomeException as e:"
+                if re.match(r"^except\s*(\w[\w.]*(\s+as\s+\w+)?)?\s*:", stripped):
+                    # Only flag bare "except:" and "except Exception" without re-raise
+                    if stripped == "except:" or re.match(r"^except\s+Exception\s*(\s+as\s+\w+)?\s*:", stripped):
+                        metrics["bare_excepts"] = int(metrics["bare_excepts"]) + 1  # type: ignore[arg-type]
+
             if len(line) > 120:
-                metrics["long_lines"] += 1
+                metrics["long_lines"] = int(metrics["long_lines"]) + 1  # type: ignore[arg-type]
             if re.search(r"\b(TODO|FIXME|HACK)\b", line, re.IGNORECASE):
-                metrics["todo_comments"] += 1
+                metrics["todo_comments"] = int(metrics["todo_comments"]) + 1  # type: ignore[arg-type]
             if re.search(r"(?<![=\w])\b[0-9]{2,}\b(?!\s*[=\w])", stripped):
-                metrics["magic_numbers"] += 1
+                metrics["magic_numbers"] = int(metrics["magic_numbers"]) + 1  # type: ignore[arg-type]
+
         return json.dumps(metrics, indent=2)
 
     return [search_pattern, get_function_list, count_complexity_indicators]
+
+
+def _run_security_scan(file_content: str) -> str:
+    """
+    Categorized security pattern scan with word-boundary anchors.
+    Returns a structured report instead of a single mega-regex hit list.
+
+    WHY SEPARATE FROM search_pattern?
+    The LangChain tool `search_pattern` is for the LLM to call with arbitrary patterns.
+    This function is for the deterministic fast-review pre-pass. Using word boundaries
+    and category separation eliminates false positives like:
+      - `token` matching `tokenize`
+      - `SELECT` matching `selectedFile`
+      - `DELETE` matching `deleteUser`
+    """
+    categories = {
+        "hardcoded_secrets": r'(?i)\b(api_?key|password|secret|private_?key)\s*=\s*["\'][^"\']{4,}["\']',
+        "shell_exec":        r'\b(subprocess\.(run|call|Popen|check_output)|os\.system|os\.popen)\s*\(',
+        "dangerous_eval":    r'\b(eval|exec)\s*\(',
+        "sql_injection":     r'\b(SELECT|INSERT|UPDATE|DELETE|DROP|UNION)\b.*(%s|\{|\+|format\s*\(|f")',
+        "deserialization":   r'\b(pickle\.loads?|yaml\.load\s*\(|marshal\.loads?)\s*\(',
+        "path_traversal":    r'(?i)(\.\.\/|\.\.\\|os\.path\.join.*request|open\s*\(.*request)',
+    }
+    lines = file_content.split("\n")
+    report_parts = []
+    for category, pattern in categories.items():
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            continue
+        hits = [
+            f"  Line {i}: {line.rstrip()[:100]}"
+            for i, line in enumerate(lines, 1)
+            if compiled.search(line)
+        ]
+        if hits:
+            report_parts.append(f"[{category}] ({len(hits)} hit(s)):\n" + "\n".join(hits[:5]))
+    return "\n\n".join(report_parts) if report_parts else "No security pattern hits found."
 
 
 # ── System prompts ─────────────────────────────────────────────────────────────
@@ -261,7 +341,7 @@ async def stream_code_review(
     increment_request("review")
     llm           = get_review_llm(model_override, streaming=False)
     streaming_llm = get_review_llm(model_override, streaming=True)
-    tools    = _make_tools(file_content)
+    tools    = _make_tools(file_content, language)
     tool_map = {t.name: t for t in tools}
 
     preview = file_content[:8000]
@@ -287,10 +367,9 @@ async def stream_code_review(
     start_time = time.monotonic()
 
     try:
-        for _ in range(max_iters):
+        for iteration in range(max_iters):
             if time.monotonic() - start_time > max_secs:
-                yield "\n\n*Review timed out — partial investigation complete.*"
-                return
+                break  # fall through to forced final generation
             response = await llm_with_tools.with_config(callbacks=[get_token_callback()]).ainvoke(messages)
             messages.append(response)
             if response.tool_calls:
@@ -300,6 +379,7 @@ async def stream_code_review(
                     result = await asyncio.to_thread(fn.invoke, tc["args"]) if fn else f"Unknown tool: {tc['name']}"
                     messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
             else:
+                # LLM chose not to call tools — write the review now
                 yield f"__STATUS__Writing review...{json.dumps({'step': 'writing'})}__STATUS_END__\n"
                 messages.append(HumanMessage(
                     content="Based on your investigation, write the full structured review."
@@ -312,10 +392,27 @@ async def stream_code_review(
                 async for token in _strip_think_tags(raw_stream):
                     yield token
                 return
+
+        # Reached max_iters or timed out — force a final generation pass
+        # using the tool results already accumulated in `messages`
+        yield f"__STATUS__Writing review (forced)...{json.dumps({'step': 'writing'})}__STATUS_END__\n"
+        messages.append(HumanMessage(
+            content=(
+                "Time or iteration limit reached. "
+                "Using the tool results gathered so far, write the structured review now. "
+                "Include all sections even if some data is incomplete."
+            )
+        ))
+        # Use unbound LLM (no tools) so it writes immediately without more tool calls
+        raw_stream = (
+            chunk.content
+            async for chunk in streaming_llm.with_config(callbacks=[get_token_callback()]).astream(messages)
+            if chunk.content
+        )
+        async for token in _strip_think_tags(raw_stream):
+            yield token
     except Exception as e:
         yield f"__ERROR__{str(e)[:200]}__ERROR_END__\n"
-
-    yield "\n\n*Review incomplete — max iterations reached.*"
 
 
 # ── Fast review (multi-file batch mode) ───────────────────────────────────────
@@ -340,7 +437,7 @@ async def stream_fast_code_review(
     """
     increment_request("review")
     streaming_llm = get_review_llm(model_override, streaming=True)
-    tools    = _make_tools(file_content)
+    tools    = _make_tools(file_content, language)
     tool_map = {t.name: t for t in tools}
 
     preview = file_content[:9000]
@@ -353,10 +450,7 @@ async def stream_fast_code_review(
         fn_list, complexity, security_hits = await asyncio.gather(
             asyncio.to_thread(tool_map["get_function_list"].invoke, {}),
             asyncio.to_thread(tool_map["count_complexity_indicators"].invoke, {}),
-            asyncio.to_thread(
-                tool_map["search_pattern"].invoke,
-                {"pattern": r"(api[_-]?key|password|secret|token|subprocess|os\.system|exec\(|eval\(|SELECT|INSERT|UPDATE|DELETE)"},
-            ),
+            asyncio.to_thread(_run_security_scan, file_content),
         )
 
         context_block = (
