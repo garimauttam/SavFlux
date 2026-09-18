@@ -185,7 +185,9 @@ def build_dependency_graph(repo_url: str | None = None) -> dict:
         src  = meta.get("source", "")
         fname = meta.get("file_name", "")
         lang  = meta.get("language", "")
-        idx   = meta.get("chunk_index", 0)
+        # Use None sentinel to distinguish "missing" (default 0 would incorrectly
+        # overwrite the first real chunk when chunk_index metadata is absent).
+        idx = meta.get("chunk_index")
         if not src:
             continue
 
@@ -193,12 +195,17 @@ def build_dependency_graph(repo_url: str | None = None) -> dict:
             file_data[src] = {
                 "file_name": fname,
                 "language":  lang,
+                # Only store this chunk as the import-bearing chunk if it's truly index 0.
+                # If chunk_index is absent (None), treat it as non-first so we don't
+                # accidentally overwrite a valid chunk_index=0 entry later.
                 "content":   doc if idx == 0 else "",
                 "chunk_count": 1,
             }
         else:
             file_data[src]["chunk_count"] += 1
-            # Keep the earliest chunk for import extraction
+            # Keep the earliest chunk (index 0) for import extraction.
+            # Only update if this chunk is explicitly tagged as index 0 — never
+            # let a chunk with missing/None chunk_index overwrite a known-good one.
             if idx == 0:
                 file_data[src]["content"] = doc
 

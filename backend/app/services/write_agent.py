@@ -28,6 +28,7 @@ on-topic context within the same token budget.
 """
 
 import json
+import logging
 from typing import AsyncGenerator, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -36,6 +37,7 @@ from app.core.config import get_settings
 from app.services.llm_factory import get_chat_llm
 from app.services.token_counter import get_token_callback, increment_request
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 WriteMode = Literal["generate", "edit", "tests"]
@@ -204,8 +206,16 @@ async def stream_code_write(
                         snippets.append(f"### {fname}\n```{lang}\n{content[:2000]}\n```")
                 context_text = "\n\n".join(snippets)
 
-        except Exception:
-            pass  # non-fatal — continue without context
+        except Exception as ctx_exc:
+            # Non-fatal — the write can proceed without style context.
+            # Emit a diagnostic so the user knows context was unavailable
+            # rather than silently receiving context-free generated code.
+            logger.warning("Context fetch failed (proceeding without style context): %s", ctx_exc)
+            yield (
+                f"__DIAGNOSTIC__⚠️ **Context unavailable**: Could not retrieve style context "
+                f"from the vector store ({str(ctx_exc)[:120]}). "
+                f"Generated code may not match your codebase style.__DIAGNOSTIC_END__\n"
+            )
 
     # ── Step 2: Build mode-specific prompt ────────────────────────────────────
     status_meta = json.dumps({"step": "generating"})

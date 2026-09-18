@@ -192,6 +192,6 @@ def _require_key(name: str, value: Any) -> None:
     """Raise early if a required API key is missing."""
     if not value:
         raise ValueError(
-            f"{name} is required when LLM_PROVIDER={settings.llm_provider}. "
+            f"{name} is required when LLM_PROVIDER={_settings().llm_provider}. "
             "Set it in your .env file."
         )
