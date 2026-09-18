@@ -3,14 +3,15 @@ retrieval_service.py — The "RA" in RAG (Retrieval-Augmented Generation).
 
 Flow for each question:
   1. Embed the user's question (same embedding model as ingestion!)
-  2. ChromaDB finds the top-K most similar chunks (cosine similarity)
-  3. Build a prompt: system instructions + retrieved code + user question
-  4. Stream GPT-4o's response token by token back to the client
+  2. ChromaDB MMR + BM25 lexical search over indexed chunks
+  3. Reciprocal Rank Fusion combines both result lists
+  4. Cross-encoder reranker scores the top candidates
+  5. Stream the LLM response token by token back to the client
 
 WHY STREAMING MATTERS:
 Without streaming, the user sees nothing for 10-30 seconds, then the whole
 answer appears. With streaming, they see the first token in ~300ms and the
-answer types out in real time. This is the difference between "broken" and "fast".
+answer types out in real time.
 """
 
 import asyncio
@@ -29,7 +30,7 @@ from app.core.config import get_settings
 from langchain_core.documents import Document
 from app.services.reranker import rerank
 from app.services.llm_factory import get_chat_llm, get_embedding_fn
-from app.services.hybrid_retriever import BM25Index, reciprocal_rank_fusion, diversify_documents
+from app.services.hybrid_retriever import BM25Index, reciprocal_rank_fusion, diversify_documents, two_branch_rrf
 from app.services.query_enhancer import (
     extract_file_scope, local_query_variants, compact_chat_history,
     route_query_intent, get_intent_filter,
@@ -73,6 +74,9 @@ def _diagnose_retrieval(
             "⚠️ **P10 — Empty index**: No documents have been ingested yet. "
             "Use the Ingest panel to index a repository first."
         )
+    # total_indexed == -1 means count() failed — skip P10 rather than false-positive
+    if total_indexed == -1:
+        return None
 
     if not candidates:
         if intent != "general":
@@ -177,6 +181,15 @@ def _get_dep_graph_hints(query: str, vectorstore) -> list[str]:
 # Module-level cached BM25 index and version tracker
 _bm25_index_cache: BM25Index | None = None
 _bm25_doc_count: int = -1
+_bm25_rebuild_lock: asyncio.Lock | None = None
+
+
+def _get_bm25_lock() -> asyncio.Lock:
+    """Lazy-initialized asyncio lock — can't create at module level before event loop starts."""
+    global _bm25_rebuild_lock
+    if _bm25_rebuild_lock is None:
+        _bm25_rebuild_lock = asyncio.Lock()
+    return _bm25_rebuild_lock
 
 
 def _bm25_cache_path() -> Path:
@@ -265,26 +278,20 @@ def _get_bm25_index(vectorstore: Chroma) -> BM25Index | None:
     Returns a BM25 index over all documents in ChromaDB.
 
     Cache hierarchy (fastest → slowest):
-      1. In-memory module-level cache — zero cost, same as before
-      2. Disk pickle (bm25_index.pkl in chroma_data/) — loaded once on cold start
-         and after restarts without new ingestion (~50ms for 10k docs)
-      3. Rebuild from ChromaDB — only when collection has changed since last save
+      1. In-memory module-level cache — zero cost, same process
+      2. Disk pickle (bm25_index.pkl in chroma_data/) — ~50ms on cold start
+      3. Rebuild from ChromaDB — only when collection has changed
 
-    WHY THIS MATTERS:
-    Before this change, the BM25 index was rebuilt from scratch on every server
-    restart. For a large repo (10k+ chunks) that's 5–10 seconds of blocking CPU
-    work on startup. With disk persistence, cold starts load in ~50ms.
-    The index is also valid across Railway deploys as long as the chroma_data/
-    volume is persisted (which it is — that's where ChromaDB itself lives).
+    WHY .count() NOT .get()?
+    .get(include=["documents",...]) fetches ALL document text on every request
+    just to call len() for the cache check. .count() is a single SQLite COUNT(*)
+    — O(1) vs O(N). The full .get() only runs on the rebuild branch.
     """
     global _bm25_index_cache, _bm25_doc_count
     try:
-        results = vectorstore._collection.get(include=["documents", "metadatas"])
-        docs_raw = results.get("documents") or []
-        metas_raw = results.get("metadatas") or []
-        current_count = len(docs_raw)
+        current_count: int = vectorstore._collection.count()
 
-        # 1. In-memory hit — most common path
+        # 1. In-memory hit — most common path, no document fetch needed
         if _bm25_index_cache is not None and current_count == _bm25_doc_count:
             return _bm25_index_cache
 
@@ -296,18 +303,19 @@ def _get_bm25_index(vectorstore: Chroma) -> BM25Index | None:
             return _bm25_index_cache
 
         # 3. Rebuild from ChromaDB (collection changed or no disk cache)
+        results = vectorstore._collection.get(include=["documents", "metadatas"])
+        docs_raw = results.get("documents") or []
+        metas_raw = results.get("metadatas") or []
         documents = [
             Document(page_content=content, metadata=meta or {})
             for content, meta in zip(docs_raw, metas_raw)
         ]
         _bm25_index_cache = BM25Index(documents)
         _bm25_doc_count = current_count
-
-        # Persist the freshly built index so the next restart skips the rebuild
         _save_bm25_to_disk(_bm25_index_cache, current_count)
-
         return _bm25_index_cache
-    except Exception:
+    except Exception as exc:
+        logger.warning("BM25 index build failed (lexical search disabled): %s", exc)
         return None
 
 
@@ -441,10 +449,12 @@ async def stream_answer(
     vectorstore = _get_vectorstore()
     CANDIDATE_COUNT = max(settings.top_k_results * 3, 10)
 
-    def _build_chroma_filter(repo_urls: list[str] | None, extra: dict) -> dict | None:
+    def _build_chroma_filter(
+        repo_urls: list[str] | None, extra: dict, file_name: str | None = None
+    ) -> dict | None:
         """
-        Merge repo_url filter with the intent filter into a single ChromaDB where clause.
-        ChromaDB requires all conditions in a single `where` dict — no post-merge supported.
+        Merge repo_url filter, intent filter, and optional file_name scope into a single
+        ChromaDB where clause. ChromaDB requires all conditions in one `where` dict.
         """
         parts: list[dict] = []
         if repo_urls:
@@ -452,6 +462,9 @@ async def stream_answer(
                 parts.append({"repo_url": repo_urls[0]})
             else:
                 parts.append({"repo_url": {"$in": repo_urls}})
+        if file_name:
+            # $contains matches partial file names (e.g. "auth" matches "auth.py")
+            parts.append({"file_name": {"$contains": file_name}})
         if extra:
             parts.append(extra)
         if not parts:
@@ -460,7 +473,7 @@ async def stream_answer(
             return parts[0]
         return {"$and": parts}
 
-    base_filter = _build_chroma_filter(_repo_filter_urls, intent_filter)
+    base_filter = _build_chroma_filter(_repo_filter_urls, intent_filter, file_scope)
 
     search_kwargs: dict = {
         "k": CANDIDATE_COUNT,
@@ -503,12 +516,15 @@ async def stream_answer(
         intent = "general"  # reset so diagnostics don't re-fire P05
 
     # Branch B: BM25 lexical keyword search + dep-graph hints
-    bm25_index = _get_bm25_index(vectorstore)
+    # Run in asyncio.to_thread: both are synchronous CPU work that would block the event loop.
+    # Lock prevents two concurrent requests from both hitting the rebuild branch simultaneously.
+    async with _get_bm25_lock():
+        bm25_index = await asyncio.to_thread(_get_bm25_index, vectorstore)
+
     yield _status("Running lexical BM25 + graph search...", "lexical-search")
     bm25_lists = []
     if bm25_index:
-        # Idea 5: add dep-graph neighbour file names as extra BM25 hint queries
-        graph_hints = _get_dep_graph_hints(search_query, vectorstore)
+        graph_hints = await asyncio.to_thread(_get_dep_graph_hints, search_query, vectorstore)
         bm25_queries = query_variants + graph_hints
         bm25_lists = [
             bm25_index.search(
@@ -519,14 +535,19 @@ async def stream_answer(
             )
             for query in bm25_queries
         ]
+    else:
+        yield f"__DIAGNOSTIC__⚠️ **P-BM25 — Lexical search unavailable**: BM25 index could not be built. Only semantic search is active.__DIAGNOSTIC_END__\n"
 
-    # Combine candidates using Reciprocal Rank Fusion (RRF)
-    ranked_lists = dense_lists + bm25_lists
-    fused_candidates = reciprocal_rank_fusion(
-        ranked_lists if any(bm25_lists) else dense_lists,
-        k=60,
-        top_n=CANDIDATE_COUNT * 2,
-    )
+    # Combine candidates using balanced two-branch RRF
+    if any(bm25_lists):
+        fused_candidates = two_branch_rrf(
+            dense_lists=dense_lists,
+            bm25_lists=bm25_lists,
+            k=60,
+            top_n=CANDIDATE_COUNT * 2,
+        )
+    else:
+        fused_candidates = reciprocal_rank_fusion(dense_lists, k=60, top_n=CANDIDATE_COUNT * 2)
 
     # If file scope was requested (@file), apply strict post-filtering
     if file_scope:
@@ -537,22 +558,31 @@ async def stream_answer(
         ]
         if scoped:
             fused_candidates = scoped
+        else:
+            yield (
+                f"__DIAGNOSTIC__⚠️ **@file scope `{file_scope}` matched no chunks**: "
+                f"No indexed chunks match this file name. "
+                f"The file may not be ingested yet, or try a shorter fragment.__DIAGNOSTIC_END__\n"
+            )
+            # Fall through with full unscoped results rather than returning nothing
 
     # ── Step 3: Cross-Encoder Re-ranking ─────────────────────────────────────
-    diverse_candidates = diversify_documents(
-        fused_candidates,
-        top_n=CANDIDATE_COUNT,
+    yield _status("Fusing and reranking evidence...", "reranking")
+    # Rerank over the full fused candidate pool — cross-encoder scores determine quality
+    reranked_docs = await rerank(search_query, fused_candidates, top_n=CANDIDATE_COUNT)
+    # Diversify AFTER reranking: keep highest-ranked chunk per source
+    relevant_docs = diversify_documents(
+        reranked_docs,
+        top_n=settings.top_k_results,
         max_per_source=3 if file_scope else 2,
     )
-    yield _status("Fusing and reranking evidence...", "reranking")
-    relevant_docs = await rerank(search_query, diverse_candidates, top_n=settings.top_k_results)
 
     # ── Idea 3 + 4: Corrective RAG threshold + diagnostics ───────────────────
     # Get total doc count for P10 diagnosis (empty index detection).
     try:
         total_indexed = vectorstore._collection.count()
     except Exception:
-        total_indexed = len(fused_candidates) + 1  # assume non-empty if count fails
+        total_indexed = -1  # unknown — P10 check skipped when count fails
 
     diagnostic = _diagnose_retrieval(
         candidates=fused_candidates,
@@ -657,7 +687,7 @@ async def stream_answer(
                 )
     except Exception as exc:
         err = str(exc)
-        if "402" in err or "insufficient balance" in err.lower():
+        if re.search(r"\b402\b", err) or "insufficient balance" in err.lower() or "payment required" in err.lower():
             # Try Ollama fallback on 402
             try:
                 from app.services.llm_factory import _build_chat_llm

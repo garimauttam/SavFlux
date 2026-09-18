@@ -10,7 +10,7 @@ WHY HYBRID SEARCH?
 """
 
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
@@ -32,13 +32,30 @@ def _normalize_repo_url(url: str) -> str:
 def _tokenize(text: str) -> List[str]:
     """
     Code-aware tokenizer for BM25.
-    Splits on camelCase, snake_case, and non-alphanumeric boundaries.
+    Splits on camelCase, snake_case, acronym boundaries, and non-alphanumerics.
+    Also emits the original unsplit identifier so exact-match queries still work.
     """
-    # Split camelCase: "getUserById" -> "get User By Id"
-    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
-    # Split non-alphanumerics
-    tokens = re.findall(r"[A-Za-z0-9_]+", s.lower())
-    return [t for t in tokens if len(t) > 1]
+    seen: Set[str] = set()
+    result: List[str] = []
+
+    def _emit(tok: str) -> None:
+        t = tok.lower()
+        if len(t) > 1 and t not in seen:
+            seen.add(t)
+            result.append(t)
+
+    for raw in re.findall(r"[A-Za-z][A-Za-z0-9]*", text):
+        _emit(raw)                                          # original (lowercased)
+        s = re.sub(r"([a-z])([A-Z])", r"\1 \2", raw)       # camelCase split
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)  # acronym boundary: HTTPClient
+        for part in s.split():
+            _emit(part)
+
+    # Also split snake_case segments directly (handles foo_bar when _ is a separator)
+    for tok in re.findall(r"[A-Za-z0-9]+", text.lower()):
+        _emit(tok)
+
+    return result
 
 
 class BM25Index:
@@ -116,8 +133,8 @@ def reciprocal_rank_fusion(
 
     for doc_list in ranked_lists:
         for rank, doc in enumerate(doc_list, start=1):
-            # Create a unique key based on source and chunk content snippet
-            doc_id = f"{doc.metadata.get('source', '')}::{doc.metadata.get('chunk_index', 0)}::{doc.page_content[:50]}"
+            # Create a unique key based on source and chunk index (no page_content to avoid whitespace mismatches)
+            doc_id = f"{doc.metadata.get('source', '')}::{doc.metadata.get('chunk_index', 0)}"
             if doc_id not in doc_lookup:
                 doc_lookup[doc_id] = doc
                 rrf_scores[doc_id] = 0.0
@@ -125,6 +142,60 @@ def reciprocal_rank_fusion(
 
     sorted_doc_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
     return [doc_lookup[doc_id] for doc_id in sorted_doc_ids[:top_n]]
+
+
+def two_branch_rrf(
+    dense_lists: List[List[Document]],
+    bm25_lists: List[List[Document]],
+    k: int = 60,
+    top_n: int = 15,
+    dense_weight: float = 0.5,
+    bm25_weight: float = 0.5,
+) -> List[Document]:
+    """
+    Balanced two-branch RRF: fuse within each branch first, then combine with weights.
+
+    WHY NOT flat reciprocal_rank_fusion(dense_lists + bm25_lists)?
+    With 1 dense list and N bm25 lists, the flat approach gives bm25 N× more
+    total weight. For 1 dense + 3 bm25 lists, lexical contributes 3× the score.
+    This function fuses within each branch first (one merged score per branch),
+    then combines with explicit 50/50 weights.
+    """
+    def _fuse_branch(lists: List[List[Document]]) -> Dict[str, float]:
+        scores: Dict[str, float] = {}
+        for doc_list in lists:
+            for rank, doc in enumerate(doc_list, start=1):
+                did = f"{doc.metadata.get('source', '')}::{doc.metadata.get('chunk_index', 0)}"
+                scores[did] = scores.get(did, 0.0) + 1.0 / (k + rank)
+        return scores
+
+    dense_scores = _fuse_branch(dense_lists)
+    bm25_scores = _fuse_branch(bm25_lists)
+
+    # Build lookup (dense takes precedence for the same chunk)
+    lookup: Dict[str, Document] = {}
+    for doc_list in bm25_lists:
+        for doc in doc_list:
+            did = f"{doc.metadata.get('source', '')}::{doc.metadata.get('chunk_index', 0)}"
+            lookup[did] = doc
+    for doc_list in dense_lists:
+        for doc in doc_list:
+            did = f"{doc.metadata.get('source', '')}::{doc.metadata.get('chunk_index', 0)}"
+            lookup[did] = doc
+
+    combined: Dict[str, float] = {}
+    for rank, (did, _) in enumerate(
+        sorted(dense_scores.items(), key=lambda x: x[1], reverse=True), start=1
+    ):
+        combined[did] = combined.get(did, 0.0) + dense_weight / (k + rank)
+
+    for rank, (did, _) in enumerate(
+        sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True), start=1
+    ):
+        combined[did] = combined.get(did, 0.0) + bm25_weight / (k + rank)
+
+    sorted_ids = sorted(combined.keys(), key=lambda x: combined[x], reverse=True)
+    return [lookup[did] for did in sorted_ids[:top_n] if did in lookup]
 
 
 def diversify_documents(
