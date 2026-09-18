@@ -88,10 +88,10 @@ class Settings(BaseSettings):
     review_mode: Literal["fast", "agentic"] = "fast"
     # review_max_full_files: max files that get a full LLM review per batch.
     # Remaining files get fast deterministic static analysis.
-    # Set to 61 to cover full-repo reviews (CodeSage itself has 61 indexed files).
+    # Set to 80 to cover full-repo reviews (CodeSage itself has ~79 indexable files).
     # Raise further for larger repos; the only cost is wall-clock time at
     # review_concurrency=3 concurrent LLM calls.
-    review_max_full_files: int = 61
+    review_max_full_files: int = 80
     review_concurrency: int = 3
 
     # --- LangSmith Observability ---

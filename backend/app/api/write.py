@@ -72,9 +72,14 @@ class WriteGenerateRequest(BaseModel):
         allowed_roots = _get_allowed_roots()
         validated = []
         for v in sources:
-            if "::" in v and (v.startswith("https://") or v.startswith("git@")):
-                validated.append(v)
-                continue
+            # Same stable-ID validation as ReviewFileRequest — both conditions checked
+            # independently to prevent "https://evil.com::../../etc/passwd" bypass.
+            if "::" in v:
+                prefix = v[: v.index("::")]
+                if prefix.startswith("https://") or prefix.startswith("git@"):
+                    validated.append(v)
+                    continue
+                # Malformed "::" value — fall through to path check
             resolved = Path(v).resolve()
             if not any(resolved == root or root in resolved.parents for root in allowed_roots):
                 raise ValueError(

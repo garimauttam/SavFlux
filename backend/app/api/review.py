@@ -89,10 +89,18 @@ class ReviewFileRequest(BaseModel):
         stored in ChromaDB at index time. On macOS /tmp is a symlink to /private/tmp;
         resolving it would break the ChromaDB metadata lookup in the fallback.
         """
-        # Stable repo source IDs are queried from ChromaDB and are not paths.
-        # They cannot escape the filesystem because they are never opened.
-        if "::" in v and (v.startswith("https://") or v.startswith("git@")):
-            return v
+        # Stable repo source IDs: "https://github.com/owner/repo::path/to/file"
+        # Validate BOTH conditions independently — a crafted payload like
+        # "https://evil.com::../../etc/passwd" must NOT bypass the path check.
+        # The "::" segment is a ChromaDB source ID, never opened as a filesystem path.
+        # Allow only if it's a well-formed source ID: starts with https:// or git@
+        # AND contains "::" as the separator (no slashes before the "::").
+        if "::" in v:
+            prefix = v[: v.index("::")]
+            if prefix.startswith("https://") or prefix.startswith("git@"):
+                # Valid stable source ID — not a filesystem path, safe to pass through.
+                return v
+            # Malformed: "::"-containing value that isn't a repo URL → fall through to path check
 
         resolved = Path(v).resolve()
         allowed_roots = _get_allowed_roots()
