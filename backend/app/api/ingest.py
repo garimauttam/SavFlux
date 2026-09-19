@@ -254,3 +254,38 @@ async def get_dependency_graph(repo_url: str | None = None, _: None = Depends(re
         return graph
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/blast-radius")
+async def get_blast_radius(
+    file: str = Query(..., description="File basename, id, or path suffix to analyze"),
+    repo_url: str | None = None,
+    max_depth: int = Query(0, ge=0, le=10, description="0 = full transitive closure"),
+    _: None = Depends(require_api_key),
+):
+    """
+    Blast radius for one file: every indexed file that directly or
+    transitively imports it, plus a deterministic risk score/level.
+
+    Response shape:
+      {"file": "...", "impact": {"impacted_files": [...], "risk_level": "low|medium|high", ...}}
+
+    GraphPanel calls this when a node is selected and highlights the
+    returned impacted_files in the force graph.
+    """
+    if not file.strip():
+        raise HTTPException(status_code=400, detail="file cannot be empty")
+    try:
+        from app.services.dep_graph import get_blast_radius as _blast
+        graph = await asyncio.to_thread(build_dependency_graph, repo_url)
+        impact = await asyncio.to_thread(_blast, graph, file.strip(), max_depth)
+        if not impact.get("matched_id"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"File not in dependency graph: {file.strip()}",
+            )
+        return {"file": file.strip(), "impact": impact}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
