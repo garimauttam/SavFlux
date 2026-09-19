@@ -9,7 +9,7 @@
  */
 
 import React, { useState, useEffect, useCallback } from "react";
-import { MessageSquare, Zap, Wand2, Network, Bot, Activity, Building2, BarChart3, Bookmark, Code2, Clock, Layers } from "lucide-react";
+import { MessageSquare, Zap, Wand2, Network, Bot, Activity, Building2, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree } from "lucide-react";
 import { IngestPanel } from "./components/IngestPanel";
 import { ChatWindow } from "./components/ChatWindow";
 import { ReviewPanel } from "./components/ReviewPanel";
@@ -23,6 +23,7 @@ import PromptLibrary from "./components/PromptLibrary";
 import SnippetVault from "./components/SnippetVault";
 import ActivityFeed from "./components/ActivityFeed";
 import BulkOpsPanel from "./components/BulkOpsPanel";
+import FileTreePanel from "./components/FileTreePanel";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { MetricsBar } from "./components/MetricsBar";
 import { ShareView } from "./components/ShareView";
@@ -42,7 +43,7 @@ function saveActiveRepo(url: string | null): void {
   } catch {}
 }
 
-type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk";
+type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer";
 
 function App() {
   // Share route — https://savflux.app/s/{id} (P1 #5.5)
@@ -97,6 +98,16 @@ function App() {
     fetchIndexedFiles();
   }, [fetchIndexedFiles]);
 
+  // P2 Explorer — open file in Review when tree item clicked
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const src = (e as CustomEvent).detail as string;
+      if (src) { setReviewTargetSource(src); setActiveTab("review"); }
+    };
+    window.addEventListener("savflux:open-file" as any, handler);
+    return () => window.removeEventListener("savflux:open-file" as any, handler);
+  }, []);
+
   // P2 Command Palette + Shortcuts (⌘K, /, ?, g + c/r/g/h/a)
   useEffect(() => {
     let gPressed = false;
@@ -131,7 +142,7 @@ function App() {
         return;
       }
       if (gPressed && !isInput) {
-        const map: Record<string, typeof activeTab> = { c: "chat", r: "review", w: "write", g: "graph", h: "health", o: "org", a: "agent", n: "analytics", p: "prompts", s: "snippets", y: "activity", b: "bulk" };
+        const map: Record<string, typeof activeTab> = { c: "chat", r: "review", w: "write", g: "graph", h: "health", o: "org", a: "agent", n: "analytics", p: "prompts", s: "snippets", y: "activity", b: "bulk", e: "explorer" };
         const tab = map[e.key.toLowerCase()];
         if (tab) {
           e.preventDefault();
@@ -159,6 +170,7 @@ function App() {
     { id: "snippets",  label: "Snippets",   Icon: Code2,        color: "text-violet-400" },
     { id: "activity",  label: "Activity",   Icon: Clock,        color: "text-teal-400"   },
     { id: "bulk",      label: "Bulk",       Icon: Layers,       color: "text-blue-400"   },
+    { id: "explorer",  label: "Explorer",   Icon: FolderTree,   color: "text-amber-400"  },
     { id: "agent",  label: "Agent",        Icon: Bot,           color: "text-pink-400"   },
   ];
 
@@ -245,6 +257,7 @@ function App() {
           {activeTab === "snippets" && <SnippetVault />}
           {activeTab === "activity" && <ActivityFeed />}
           {activeTab === "bulk" && <BulkOpsPanel onFilesUpdated={() => window.location.reload()} />}
+          {activeTab === "explorer" && <FileTreePanel onOpenFile={(src) => { window.dispatchEvent(new CustomEvent("savflux:open-file", { detail: src })); }} />}
         </div>
         <MetricsBar />
       </div>
