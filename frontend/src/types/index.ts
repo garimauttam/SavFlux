@@ -14,6 +14,14 @@ export interface SourceFile {
   file_name: string;
   source: string;    // full path on disk
   language: string;  // "py", "js", etc.
+  // Trust-ledger enrichment (optional — older __SOURCES__ payloads omit these)
+  trust_level?: "high" | "medium" | "low" | string;
+  trust_score?: number | string;
+  start_line?: number;
+  end_line?: number;
+  symbol_name?: string;
+  chunk_index?: number;
+  score?: number;
 }
 
 export interface IngestionProgress {
