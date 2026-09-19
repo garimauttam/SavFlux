@@ -374,3 +374,64 @@ async def review_pr_webhook(request: Request, body: PRWebhookRequest, _: None = 
         "impact": impact,
         "inline_comments": inline_comments_for_diff(body.diff[:100_000]),
     }
+
+
+class CreatePRRequest(BaseModel):
+    repo: str   # "owner/name" or github.com URL
+    head: str   # source branch
+    base: str = "main"
+    title: str = ""
+    body: str = ""
+    diff: str = ""  # optional unified diff — returned as a patch when offline
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) > 200:
+            raise ValueError("title too long (max 200 chars)")
+        return v or "SavFlux review fixes"
+
+
+@router.post("/create-pr")
+@limiter.limit("10/minute")
+async def create_pull_request(request: Request, body: CreatePRRequest,
+                              _: None = Depends(require_api_key)):
+    """
+    Create a GitHub PR — live via API when GITHUB_TOKEN is configured,
+    otherwise a deterministic manual plan ($0, offline-safe).
+
+    Live:   {status: "created", number, url}
+    Manual: {status: "manual", gh_command, patch?, reason}
+    """
+    from app.services.pr_service import (
+        parse_repo_ref, validate_branches, build_gh_command, create_pr_via_api,
+    )
+    import os
+    try:
+        repo_slug = parse_repo_ref(body.repo)
+        head, base = validate_branches(body.head, body.base)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    if os.getenv("GITHUB_TOKEN", "").strip():
+        try:
+            created = await create_pr_via_api(repo_slug, head, base, body.title, body.body)
+            return {"status": "created", "repo": repo_slug, **created}
+        except RuntimeError as e:
+            # Fall through to the manual plan with the API error attached
+            return {
+                "status": "manual",
+                "repo": repo_slug,
+                "reason": f"GitHub API failed ({e}); use the command below instead.",
+                "gh_command": build_gh_command(repo_slug, head, base, body.title, body.body),
+                "patch": body.diff[:100_000] or None,
+            }
+
+    return {
+        "status": "manual",
+        "repo": repo_slug,
+        "reason": "GITHUB_TOKEN not configured — run the command below (gh CLI) to open the PR.",
+        "gh_command": build_gh_command(repo_slug, head, base, body.title, body.body),
+        "patch": body.diff[:100_000] or None,
+    }

@@ -107,6 +107,33 @@ async def share_chat(request: Request, body: dict, _: None = Depends(require_api
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/prune")
+@limiter.limit("60/minute")
+async def prune_memory(request: Request, body: dict, _: None = Depends(require_api_key)):
+    """
+    Memory prune: drop the oldest chat turns overflowing a token budget.
+
+    The $0 equivalent of LangGraph's RemoveMessage — deterministic,
+    newest turns always kept. Body: {chat_history, max_tokens?, keep_last?}
+    """
+    history = body.get("chat_history")
+    if not isinstance(history, list):
+        raise HTTPException(status_code=400, detail="chat_history must be an array")
+    if len(history) > 200:
+        raise HTTPException(status_code=400, detail="Too many messages (max 200)")
+    try:
+        from app.services.query_enhancer import prune_chat_history
+        return prune_chat_history(
+            history,
+            max_tokens=int(body.get("max_tokens", 2000)),
+            keep_last=int(body.get("keep_last", 2)),
+        )
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="max_tokens and keep_last must be integers")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/indexed-files")
 async def get_files(_: None = Depends(require_api_key)):
     """
