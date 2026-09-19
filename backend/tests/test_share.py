@@ -17,9 +17,13 @@ def test_share_crud(_isolated_storage):
         create_share, get_share, list_shares, delete_share,
     )
     s = create_share("What does auth.py do?", "It verifies JWTs.",
-                     sources=[{"file_name": "auth.py"}], repo_url="https://github.com/x/y")
+                     sources=[{"file_name": "auth.py"}], repo_url="https://github.com/x/y",
+                     ledger={"sources": [{"file_name": "auth.py"}]},
+                     chat_history=[{"role": "user", "content": "hi"}])
     assert len(s["id"]) == 10
     assert s["url"] == f"/s/{s['id']}"
+    assert s["ledger"] == {"sources": [{"file_name": "auth.py"}]}
+    assert s["chat_history"] == [{"role": "user", "content": "hi"}]
 
     assert get_share(s["id"])["question"].startswith("What does")
     assert get_share("missing") is None

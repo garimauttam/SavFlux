@@ -82,6 +82,31 @@ async def chat_stream(request: Request, body: ChatRequest, _: None = Depends(req
     )
 
 
+@router.post("/share")
+@limiter.limit("30/minute")
+async def share_chat(request: Request, body: dict, _: None = Depends(require_api_key)):
+    """
+    Snapshot a Q&A pair as a shareable /s/{id} link.
+
+    MessageBubble POSTs {question, answer, sources, repo_url, ledger,
+    chat_history}. Delegates to share_service — same store as /share.
+    """
+    try:
+        from app.services.share_service import create_share
+        return create_share(
+            question=body.get("question", ""),
+            answer=body.get("answer", ""),
+            sources=body.get("sources"),
+            repo_url=body.get("repo_url"),
+            ledger=body.get("ledger"),
+            chat_history=body.get("chat_history"),
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/indexed-files")
 async def get_files(_: None = Depends(require_api_key)):
     """

@@ -57,6 +57,8 @@ def create_share(
     answer: str = "",
     sources: list[dict] | None = None,
     repo_url: str | None = None,
+    ledger: dict | None = None,
+    chat_history: list[dict] | None = None,
 ) -> dict[str, Any]:
     question = (question or "").strip()
     if not question:
@@ -72,6 +74,8 @@ def create_share(
         "answer": answer or "",
         "sources": [s for s in (sources or []) if isinstance(s, dict)][:20],
         "repo_url": repo_url,
+        "ledger": ledger if isinstance(ledger, dict) else None,
+        "chat_history": [m for m in (chat_history or []) if isinstance(m, dict)][:20],
         "created_at": time.time(),
         "url": f"/s/{share_id}",
     }
