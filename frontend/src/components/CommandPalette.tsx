@@ -12,10 +12,10 @@
  */
 
 import React, { useEffect, useMemo, useState } from "react";
-import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell } from "lucide-react";
+import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell, Terminal } from "lucide-react";
 import { IndexedFile, IndexedRepo } from "../types";
 
-type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff" | "notifications";
+type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff" | "notifications" | "slash";
 
 interface Props {
   open: boolean;
@@ -80,6 +80,7 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
       { id: "explorer", label: "Explorer", icon: FolderTree, keys: "g e" },
       { id: "diff", label: "Diff", icon: GitCompare, keys: "g d" },
       { id: "notifications", label: "Inbox", icon: Bell, keys: "g i" },
+      { id: "slash", label: "Slash", icon: Terminal, keys: "g /" },
       { id: "agent", label: "Agent", icon: Bot, keys: "g a" },
     ];
     tabDefs.forEach((t) => {
@@ -137,6 +138,7 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
       { label: "File explorer", sub: "g e — folder tree", icon: FolderTree, action: () => { onSetActiveTab("explorer"); onClose(); } },
       { label: "Diff viewer", sub: "g d — compare files", icon: GitCompare, action: () => { onSetActiveTab("diff"); onClose(); } },
       { label: "Notifications", sub: "g i — inbox", icon: Bell, action: () => { onSetActiveTab("notifications"); onClose(); } },
+      { label: "Slash commands", sub: "g / — quick actions", icon: Terminal, action: () => { onSetActiveTab("slash"); onClose(); } },
       { label: "Help — shortcuts", sub: "? to show help", icon: HelpCircle, action: () => { onClose(); document.dispatchEvent(new KeyboardEvent("keydown", { key: "?" })); } },
     ];
     actions.forEach((a) => {
@@ -251,6 +253,7 @@ export function ShortcutsHelp({ open, onClose }: { open: boolean; onClose: () =>
           <div className="flex justify-between"><span className="text-gray-400">Go Explorer</span><span className="font-mono text-gray-300">g e</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Diff</span><span className="font-mono text-gray-300">g d</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Inbox</span><span className="font-mono text-gray-300">g i</span></div>
+          <div className="flex justify-between"><span className="text-gray-400">Go Slash</span><span className="font-mono text-gray-300">g /</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Agent</span><span className="font-mono text-gray-300">g a</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Help</span><span className="font-mono text-gray-300">?</span></div>
         </div>

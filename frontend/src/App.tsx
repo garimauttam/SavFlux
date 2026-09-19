@@ -9,7 +9,7 @@
  */
 
 import React, { useState, useEffect, useCallback } from "react";
-import { MessageSquare, Zap, Wand2, Network, Bot, Activity, Building2, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell } from "lucide-react";
+import { MessageSquare, Zap, Wand2, Network, Bot, Activity, Building2, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell, Terminal } from "lucide-react";
 import { IngestPanel } from "./components/IngestPanel";
 import { ChatWindow } from "./components/ChatWindow";
 import { ReviewPanel } from "./components/ReviewPanel";
@@ -26,6 +26,7 @@ import BulkOpsPanel from "./components/BulkOpsPanel";
 import FileTreePanel from "./components/FileTreePanel";
 import DiffViewer from "./components/DiffViewer";
 import NotificationsPanel from "./components/NotificationsPanel";
+import SlashCommandsPanel from "./components/SlashCommandsPanel";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { MetricsBar } from "./components/MetricsBar";
 import { ShareView } from "./components/ShareView";
@@ -45,7 +46,7 @@ function saveActiveRepo(url: string | null): void {
   } catch {}
 }
 
-type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff" | "notifications";
+type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff" | "notifications" | "slash";
 
 function App() {
   // Share route — https://savflux.app/s/{id} (P1 #5.5)
@@ -147,7 +148,7 @@ function App() {
         return;
       }
       if (gPressed && !isInput) {
-        const map: Record<string, typeof activeTab> = { c: "chat", r: "review", w: "write", g: "graph", h: "health", o: "org", a: "agent", n: "analytics", p: "prompts", s: "snippets", y: "activity", b: "bulk", e: "explorer", d: "diff", i: "notifications" };
+        const map: Record<string, typeof activeTab> = { c: "chat", r: "review", w: "write", g: "graph", h: "health", o: "org", a: "agent", n: "analytics", p: "prompts", s: "snippets", y: "activity", b: "bulk", e: "explorer", d: "diff", i: "notifications", "/": "slash" };
         const tab = map[e.key.toLowerCase()];
         if (tab) {
           e.preventDefault();
@@ -178,6 +179,7 @@ function App() {
     { id: "explorer",  label: "Explorer",   Icon: FolderTree,   color: "text-amber-400"  },
     { id: "diff",      label: "Diff",       Icon: GitCompare,   color: "text-pink-400"   },
     { id: "notifications", label: "Inbox",  Icon: Bell,         color: "text-blue-400"   },
+    { id: "slash",       label: "Slash",    Icon: Terminal,     color: "text-emerald-400"},
     { id: "agent",  label: "Agent",        Icon: Bot,           color: "text-pink-400"   },
   ];
 
@@ -267,6 +269,7 @@ function App() {
           {activeTab === "explorer" && <FileTreePanel onOpenFile={(src) => { window.dispatchEvent(new CustomEvent("savflux:open-file", { detail: src })); }} />}
           {activeTab === "diff" && <DiffViewer />}
           {activeTab === "notifications" && <NotificationsPanel />}
+          {activeTab === "slash" && <SlashCommandsPanel onUse={(prompt)=>{ setActiveTab("chat"); window.dispatchEvent(new CustomEvent("savflux:use-prompt", {detail: prompt})); }} />}
         </div>
         <MetricsBar />
       </div>
