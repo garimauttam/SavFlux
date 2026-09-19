@@ -12,10 +12,10 @@
  */
 
 import React, { useEffect, useMemo, useState } from "react";
-import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2 } from "lucide-react";
+import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2, Clock } from "lucide-react";
 import { IndexedFile, IndexedRepo } from "../types";
 
-type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets";
+type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity";
 
 interface Props {
   open: boolean;
@@ -75,6 +75,7 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
       { id: "analytics", label: "Analytics", icon: BarChart3, keys: "g n" },
       { id: "prompts", label: "Prompts", icon: Bookmark, keys: "g p" },
       { id: "snippets", label: "Snippets", icon: Code2, keys: "g s" },
+      { id: "activity", label: "Activity", icon: Clock, keys: "g y" },
       { id: "agent", label: "Agent", icon: Bot, keys: "g a" },
     ];
     tabDefs.forEach((t) => {
@@ -127,6 +128,7 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
       { label: "Toggle theme", sub: "Dark / Light / System", icon: Search, action: () => { onClose(); document.dispatchEvent(new KeyboardEvent("keydown", { key: "t" })); } },
       { label: "Prompt library", sub: "g p — saved prompts & history", icon: Bookmark, action: () => { onSetActiveTab("prompts"); onClose(); } },
       { label: "Snippet vault", sub: "g s — saved code snippets", icon: Code2, action: () => { onSetActiveTab("snippets"); onClose(); } },
+      { label: "Activity feed", sub: "g y — unified timeline", icon: Clock, action: () => { onSetActiveTab("activity"); onClose(); } },
       { label: "Help — shortcuts", sub: "? to show help", icon: HelpCircle, action: () => { onClose(); document.dispatchEvent(new KeyboardEvent("keydown", { key: "?" })); } },
     ];
     actions.forEach((a) => {
@@ -236,6 +238,7 @@ export function ShortcutsHelp({ open, onClose }: { open: boolean; onClose: () =>
           <div className="flex justify-between"><span className="text-gray-400">Go Analytics</span><span className="font-mono text-gray-300">g n</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Prompts</span><span className="font-mono text-gray-300">g p</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Snippets</span><span className="font-mono text-gray-300">g s</span></div>
+          <div className="flex justify-between"><span className="text-gray-400">Go Activity</span><span className="font-mono text-gray-300">g y</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Agent</span><span className="font-mono text-gray-300">g a</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Help</span><span className="font-mono text-gray-300">?</span></div>
         </div>

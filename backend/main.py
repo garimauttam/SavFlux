@@ -43,7 +43,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.limiter import limiter
 
 from app.core.config import get_settings
-from app.api import ingest, chat, review, write, metrics, agent, prompts, snippets
+from app.api import ingest, chat, review, write, metrics, agent, prompts, snippets, activity
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +223,7 @@ app.include_router(metrics.router, prefix="/api/v1")
 app.include_router(agent.router, prefix="/api/v1")
 app.include_router(prompts.router, prefix="/api/v1")
 app.include_router(snippets.router, prefix="/api/v1")
+app.include_router(activity.router, prefix="/api/v1")
 
 
 @app.get("/health")
