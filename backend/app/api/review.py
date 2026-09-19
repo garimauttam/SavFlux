@@ -22,7 +22,7 @@ from app.api.deps import require_api_key
 from app.limiter import limiter
 from app.services.review_agent import stream_code_review, stream_fast_code_review
 from app.services.multi_review_agent import stream_multi_review
-from app.services.impact_analyzer import analyze_diff
+from app.services.impact_analyzer import analyze_diff, inline_comments_for_diff
 
 router = APIRouter(prefix="/review", tags=["review"])
 
@@ -164,6 +164,7 @@ async def analyze_pr_impact(
         "repo": body.repo,
         "pr_number": body.pr_number,
         "impact": _indexed_impact(body.repo, body.diff[:100_000]),
+        "inline_comments": inline_comments_for_diff(body.diff[:100_000]),
     }
 
 
@@ -371,4 +372,5 @@ async def review_pr_webhook(request: Request, body: PRWebhookRequest, _: None = 
         "pr_number": body.pr_number,
         "review": full_review,
         "impact": impact,
+        "inline_comments": inline_comments_for_diff(body.diff[:100_000]),
     }

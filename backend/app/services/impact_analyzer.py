@@ -86,3 +86,80 @@ def analyze_diff(diff: str, graph: dict | None = None) -> dict:
         "suggested_tests": suggested_tests,
         "graph_available": graph is not None,
     }
+
+
+# ── Inline PR comments ─────────────────────────────────────────────────────────
+# Line-level rules evaluated against ADDED lines only (context/removal lines
+# are not actionable for a reviewer). Each rule: (id, severity, message, regex).
+# Severity guides the UI chip colour: high=red, medium=amber, low=gray.
+_LINE_RULES = (
+    ("possible-secret", "high", "Possible hardcoded secret — move to env vars or a secret store.",
+     re.compile(r"(?i)(api[_-]?key|secret|passwd|password|token)\s*[:=]\s*['\"][^'\"]{3,}['\"]")),
+    ("eval-exec", "high", "Dynamic code execution (eval/exec) — high injection risk; use a safe alternative.",
+     re.compile(r"(?i)\b(eval|exec)\s*\(")),
+    ("shell-execution", "medium", "Shell execution from code — validate/escape all interpolated input.",
+     re.compile(r"(?i)(subprocess\.(run|Popen|call)|os\.system|child_process\.exec|shell\s*=\s*True)")),
+    ("unsafe-deserialization", "medium", "Unsafe deserialization — untrusted input can lead to RCE.",
+     re.compile(r"(?i)(pickle\.loads?|yaml\.load\s*\(|Function\s*\()")),
+    ("sql-concatenation", "medium", "Possible SQL string building — prefer parameterized queries.",
+     re.compile(r"(?i)(select|insert|update|delete)\b.*(\+|f['\"]|\.format\()")),
+    ("broad-except", "low", "Bare/broad except swallows errors — catch specific exceptions.",
+     re.compile(r"^\s*except\s*(Exception|BaseException)?\s*:\s*(pass\s*)?$")),
+    ("debug-print", "low", "Debug output left in code — remove print/console.log before merging.",
+     re.compile(r"^\s*(print\s*\(|console\.(log|debug|info)\s*\()")),
+    ("todo-fixme", "low", "TODO/FIXME added — fine for a draft, but track it before merging.",
+     re.compile(r"(?i)\b(TODO|FIXME|HACK|XXX)\b")),
+)
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_MAX_INLINE = 30
+
+
+def inline_comments_for_diff(diff: str, max_comments: int = _MAX_INLINE) -> list[dict]:
+    """Map added diff lines to new-file line numbers and lint each one.
+
+    Returns GitHub-style inline comments:
+      [{path, line, severity, rule, message, code}]
+    sorted by (path, line), capped at max_comments.
+    """
+    comments: list[dict] = []
+    path = ""
+    new_line = 0
+
+    for raw in (diff or "").splitlines():
+        if raw.startswith("+++ b/"):
+            path = raw[len("+++ b/"):]
+            continue
+        if raw.startswith("+++ ") or raw.startswith("--- "):
+            continue
+        if raw.startswith("diff --git"):
+            path = ""
+            continue
+        m = _HUNK_RE.match(raw)
+        if m:
+            new_line = int(m.group(1))
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            code = raw[1:]
+            for rule, severity, message, pattern in _LINE_RULES:
+                if pattern.search(code):
+                    comments.append({
+                        "path": path or "(unknown file)",
+                        "line": new_line,
+                        "severity": severity,
+                        "rule": rule,
+                        "message": message,
+                        "code": code.strip()[:200],
+                    })
+                    break  # one comment per line — highest-priority rule wins
+            new_line += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            continue  # removals don't advance the new-file line counter
+        else:
+            # Context line (or "\ No newline" marker — doesn't consume a line)
+            if raw.startswith("\\"):
+                continue
+            new_line += 1
+
+    comments.sort(key=lambda c: (c["path"], c["line"]))
+    return comments[: max(1, max_comments)]
