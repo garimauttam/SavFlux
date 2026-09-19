@@ -12,10 +12,10 @@
  */
 
 import React, { useEffect, useMemo, useState } from "react";
-import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree } from "lucide-react";
+import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare } from "lucide-react";
 import { IndexedFile, IndexedRepo } from "../types";
 
-type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer";
+type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff";
 
 interface Props {
   open: boolean;
@@ -78,6 +78,7 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
       { id: "activity", label: "Activity", icon: Clock, keys: "g y" },
       { id: "bulk", label: "Bulk", icon: Layers, keys: "g b" },
       { id: "explorer", label: "Explorer", icon: FolderTree, keys: "g e" },
+      { id: "diff", label: "Diff", icon: GitCompare, keys: "g d" },
       { id: "agent", label: "Agent", icon: Bot, keys: "g a" },
     ];
     tabDefs.forEach((t) => {
@@ -133,6 +134,7 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
       { label: "Activity feed", sub: "g y — unified timeline", icon: Clock, action: () => { onSetActiveTab("activity"); onClose(); } },
       { label: "Bulk operations", sub: "g b — file manager", icon: Layers, action: () => { onSetActiveTab("bulk"); onClose(); } },
       { label: "File explorer", sub: "g e — folder tree", icon: FolderTree, action: () => { onSetActiveTab("explorer"); onClose(); } },
+      { label: "Diff viewer", sub: "g d — compare files", icon: GitCompare, action: () => { onSetActiveTab("diff"); onClose(); } },
       { label: "Help — shortcuts", sub: "? to show help", icon: HelpCircle, action: () => { onClose(); document.dispatchEvent(new KeyboardEvent("keydown", { key: "?" })); } },
     ];
     actions.forEach((a) => {
@@ -245,6 +247,7 @@ export function ShortcutsHelp({ open, onClose }: { open: boolean; onClose: () =>
           <div className="flex justify-between"><span className="text-gray-400">Go Activity</span><span className="font-mono text-gray-300">g y</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Bulk</span><span className="font-mono text-gray-300">g b</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Explorer</span><span className="font-mono text-gray-300">g e</span></div>
+          <div className="flex justify-between"><span className="text-gray-400">Go Diff</span><span className="font-mono text-gray-300">g d</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Go Agent</span><span className="font-mono text-gray-300">g a</span></div>
           <div className="flex justify-between"><span className="text-gray-400">Help</span><span className="font-mono text-gray-300">?</span></div>
         </div>
