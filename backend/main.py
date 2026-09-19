@@ -43,7 +43,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.limiter import limiter
 
 from app.core.config import get_settings
-from app.api import ingest, chat, review, write, metrics, agent, prompts, analytics, share, trust, snippets, activity, bulk, file_tree, diff, notifications, slash
+from app.api import ingest, chat, review, write, metrics, agent, prompts, analytics, share, trust, history, snippets, activity, bulk, file_tree, diff, notifications, slash
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +225,7 @@ app.include_router(prompts.router, prefix="/api/v1")
 app.include_router(analytics.router, prefix="/api/v1")
 app.include_router(share.router, prefix="/api/v1")
 app.include_router(trust.router, prefix="/api/v1")
+app.include_router(history.router, prefix="/api/v1")
 app.include_router(snippets.router, prefix="/api/v1")
 app.include_router(activity.router, prefix="/api/v1")
 app.include_router(bulk.router, prefix="/api/v1")

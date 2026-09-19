@@ -430,6 +430,14 @@ async def ingest_github_repo(
         except Exception:
             pass
 
+        # Time machine: seed the bare mirror from this temp clone (local copy,
+        # no network). Powers per-file git log/blame without re-cloning.
+        try:
+            from app.services.history_service import seed_mirror_from_tmp
+            await asyncio.to_thread(seed_mirror_from_tmp, repo_url, tmp_dir)
+        except Exception:
+            pass
+
         return {
             "status": "success",
             "repo_url": repo_url,

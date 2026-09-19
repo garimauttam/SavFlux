@@ -34,6 +34,7 @@ import {
   Check,
   GitCompare,
   Code2,
+  History,
 } from "lucide-react";
 import { IndexedFile } from "../types";
 import { useCodeWriter } from "../hooks/useCodeWriter";
@@ -598,10 +599,19 @@ export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
                 {editFile && (
                   <div className="flex items-center gap-2 p-2 bg-blue-900/10 border border-blue-700/30 rounded-lg">
                     <FileCode className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <p className="text-xs text-blue-300 font-medium truncate">{editFile.file_name}</p>
                       <p className="text-[10px] text-gray-500">{editFile.language} · will be rewritten</p>
                     </div>
+                    {editFile.source.includes("::") && (
+                      <button
+                        onClick={() => window.dispatchEvent(new CustomEvent("savflux:open-history", { detail: editFile.source }))}
+                        title="View file history (timeline + blame)"
+                        className="flex shrink-0 items-center gap-1 rounded-lg border border-teal-600/40 bg-teal-500/10 px-2 py-1 text-[11px] text-teal-300 hover:bg-teal-500/20"
+                      >
+                        <History className="w-3 h-3" /> History
+                      </button>
+                    )}
                   </div>
                 )}
 

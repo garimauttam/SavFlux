@@ -207,3 +207,47 @@ def clear_activity(kind: str | None = None) -> int:
         # Don't delete ingest by default — just count
         pass
     return n
+
+
+def file_timeline(repo_url: str, file: str, limit: int = 30) -> dict[str, Any]:
+    """Per-file timeline for the Time Machine: index record + git history.
+
+    Merges the trust-ledger index entry (when this file's repo was indexed,
+    from which commit) with the git commit timeline for the file itself.
+    Git failures degrade to index-only data — never raise for missing history.
+    """
+    from app.services.history_service import split_source
+    url, rel = split_source(file)
+    url = url or (repo_url or "").strip()
+
+    index_record: dict[str, Any] | None = None
+    try:
+        from app.services.trust_service import _load as _trust_load
+        row = _trust_load().get("repos", {}).get(url, {})
+        if row:
+            index_record = {
+                "indexed_sha": row.get("indexed_sha"),
+                "indexed_at": row.get("indexed_at"),
+                "files_indexed": row.get("files_indexed", 0),
+            }
+    except Exception:
+        pass
+
+    commits: list[dict[str, Any]] = []
+    resolved_path = rel
+    try:
+        from app.services.history_service import file_timeline as _git_timeline
+        data = _git_timeline(url, rel, limit)
+        commits = data.get("commits", [])
+        resolved_path = data.get("path", rel)
+    except Exception:
+        pass
+
+    return {
+        "repo_url": url,
+        "file": file,
+        "path": resolved_path,
+        "index": index_record,
+        "commits": commits,
+        "total": len(commits),
+    }

@@ -33,6 +33,22 @@ async def get_activity(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/file")
+async def get_file_timeline(
+    file: str = Query(..., description="Indexed source id, rel path, or basename"),
+    repo_url: str | None = None,
+    limit: int = Query(30, ge=1, le=100),
+    _: None = Depends(require_api_key),
+):
+    """Per-file timeline: index record + git history (Time Machine)."""
+    try:
+        import asyncio
+        from app.services.activity_service import file_timeline
+        return await asyncio.to_thread(file_timeline, repo_url or "", file, limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("")
 async def clear_activity(
     kind: str | None = Query(None, description="Kind to clear, or omit for all"),
