@@ -10,8 +10,10 @@
  */
 
 import React, { useEffect, useRef, useState } from "react";
+import { apiFetch } from "../api";
 import { Send, Trash2, Loader2, Database } from "lucide-react";
 import { MessageBubble } from "./MessageBubble";
+import { ArchitectureDiagram } from "./ArchitectureDiagram";
 import { useChat } from "../hooks/useChat";
 
 interface ChatWindowProps {
@@ -23,11 +25,45 @@ interface ChatWindowProps {
 export function ChatWindow({ activeRepoUrl, hasIndexedFiles, activeRepoUrls }: ChatWindowProps) {
   const { messages, isLoading, error, sendMessage, clearChat } = useChat(activeRepoUrl, activeRepoUrls);
   const [input, setInput] = useState("");
+  const [slashOpen, setSlashOpen] = useState(false);
+  const [slashCmds, setSlashCmds] = useState<{command:string; description:string}[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // P2 Slash Commands — autocomplete when typing / at start
+  useEffect(() => {
+    const slash = input.trim().startsWith("/") ? input.trim().split(/\s+/)[0].slice(1) : "";
+    const shouldOpen = input.trim().startsWith("/");
+    if (!shouldOpen) { setSlashOpen(false); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const params = new URLSearchParams();
+        if (slash) params.set("q", slash);
+        params.set("limit", "8");
+        const res = await apiFetch(`/api/v1/slash/commands?${params.toString()}`);
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const cmds = (data.commands || []).map((c:any)=>({command:c.command, description:c.description}));
+        setSlashCmds(cmds);
+        setSlashOpen(cmds.length>0);
+      } catch { if (!cancelled) setSlashOpen(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [input]);
+
+  // P2 Prompt Library — fill input when prompt used from library/history/palette
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const text = (e as CustomEvent).detail as string;
+      if (text) setInput(text);
+    };
+    window.addEventListener("savflux:use-prompt" as any, handler);
+    return () => window.removeEventListener("savflux:use-prompt" as any, handler);
+  }, []);
 
   const handleSend = () => {
     if (!input.trim()) return;
@@ -39,6 +75,25 @@ export function ChatWindow({ activeRepoUrl, hasIndexedFiles, activeRepoUrls }: C
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  };
+
+  // ↑ to load last history when input empty (bonus UX, still $0)
+  const handleKeyDownWithHistory = (e: React.KeyboardEvent) => {
+    handleKeyDown(e);
+    if (e.key === "ArrowUp" && !input.trim()) {
+      e.preventDefault();
+      (async () => {
+        try {
+          const { apiFetch } = await import("../api");
+          const r = await apiFetch("/api/v1/prompts/history?limit=1");
+          if (r.ok) {
+            const j = await r.json();
+            const last = j.history?.[0]?.text;
+            if (last) setInput(last);
+          }
+        } catch {}
+      })();
     }
   };
 
@@ -95,7 +150,7 @@ export function ChatWindow({ activeRepoUrl, hasIndexedFiles, activeRepoUrls }: C
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4 bg-gray-950">
         {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full gap-6 text-center">
+          <div className="flex flex-col items-center gap-6 text-center py-6">
             <div>
               <h3 className="text-lg font-semibold text-white mb-1">
                 {hasIndexedFiles ? "What would you like to know?" : "No codebase indexed yet"}
@@ -106,6 +161,11 @@ export function ChatWindow({ activeRepoUrl, hasIndexedFiles, activeRepoUrls }: C
                   : "Paste a GitHub URL in the sidebar to get started"}
               </p>
             </div>
+
+            {/* Auto Architecture Diagram on Connect — calls get_indexed_files + ask_codebase → Mermaid */}
+            {hasIndexedFiles && (
+              <ArchitectureDiagram activeRepoUrl={activeRepoUrl} hasIndexedFiles={hasIndexedFiles} />
+            )}
 
             {/* Suggestions — only render when a repo is indexed */}
             {suggestions.length > 0 && (
@@ -123,7 +183,24 @@ export function ChatWindow({ activeRepoUrl, hasIndexedFiles, activeRepoUrls }: C
             )}
           </div>
         ) : (
-          messages.map((msg) => <MessageBubble key={msg.id} message={msg} />)
+          messages.map((msg, idx) => {
+            // For assistant bubbles, find the preceding user question for share snapshot
+            let prevQuestion: string | null = null;
+            if (msg.role === "assistant") {
+              for (let j = idx - 1; j >= 0; j--) {
+                if (messages[j].role === "user") { prevQuestion = messages[j].content; break; }
+              }
+            }
+            return (
+              <MessageBubble
+                key={msg.id}
+                message={msg}
+                activeRepoUrl={activeRepoUrl}
+                prevQuestion={prevQuestion}
+                chatHistory={messages.slice(Math.max(0, idx - 4), idx).map(m => ({ role: m.role, content: m.content }))}
+              />
+            );
+          })
         )}
 
         {error && (
@@ -136,12 +213,33 @@ export function ChatWindow({ activeRepoUrl, hasIndexedFiles, activeRepoUrls }: C
       </div>
 
       {/* Input area */}
-      <div className="px-6 py-4 border-t border-gray-700 bg-gray-900">
+      <div className="px-6 py-4 border-t border-gray-700 bg-gray-900 relative">
         <div className="flex gap-3 items-end">
+          {slashOpen && slashCmds.length > 0 && (
+            <div className="absolute bottom-14 left-6 right-20 bg-gray-800 border border-gray-700 rounded-lg shadow-xl overflow-hidden z-10">
+              {slashCmds.map((c)=> (
+                <button
+                  key={c.command}
+                  onClick={async ()=>{
+                    const args = input.trim().slice(c.command.length).trim();
+                    try {
+                      const res = await apiFetch("/api/v1/slash/expand", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({command: c.command, args})});
+                      if (res.ok) { const data = await res.json(); setInput(data.prompt); }
+                      else setInput(c.command + " " + args);
+                    } catch { setInput(c.command + " " + args); }
+                    setSlashOpen(false);
+                  }}
+                  className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-700 flex justify-between"
+                >
+                  <span className="font-mono text-emerald-400">{c.command}</span><span className="text-gray-500 truncate ml-2">{c.description}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
+            onKeyDown={handleKeyDownWithHistory}
             placeholder={
               hasIndexedFiles
                 ? "Ask a question about the codebase... (Enter to send)"

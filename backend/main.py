@@ -13,6 +13,7 @@ It should NOT contain any business logic.
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 # Silence ChromaDB telemetry before any chromadb import.
@@ -42,7 +43,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.limiter import limiter
 
 from app.core.config import get_settings
-from app.api import ingest, chat, review, write, metrics
+from app.api import ingest, chat, review, write, metrics, agent, prompts, snippets, activity, bulk, file_tree, diff, notifications, slash
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +116,27 @@ async def lifespan(app: FastAPI):
     # Requests can arrive immediately and pay the warmup cost only if needed.
     warmup_tasks = [asyncio.create_task(warm_models()), asyncio.create_task(warm_bm25())]
 
+    # ── P1 #6 File watcher — background incremental re-index ─────────────────
+    try:
+        from app.services.watcher_service import start_watcher_background
+        watcher_task = asyncio.create_task(start_watcher_background())
+    except Exception:
+        watcher_task = None
+
     yield   # ← server is live and handling requests here
 
+    # Stop watcher
+    try:
+        from app.services.watcher_service import stop_watcher_background
+        await stop_watcher_background()
+    except Exception:
+        pass
+    if 'watcher_task' in locals() and watcher_task:
+        watcher_task.cancel()
+        try:
+            await watcher_task
+        except Exception:
+            pass
     for task in warmup_tasks:
         task.cancel()
     await asyncio.gather(*warmup_tasks, return_exceptions=True)
@@ -161,6 +181,23 @@ async def limit_request_size(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def analytics_middleware(request: Request, call_next):
+    """P2 Analytics Trends — record per-request latency for history sparklines (60s throttle, $0)."""
+    start = time.time()
+    response = await call_next(request)
+    try:
+        latency_ms = (time.time() - start) * 1000
+        # Skip health and analytics endpoints themselves to reduce noise
+        path = request.url.path
+        if path not in ("/health", "/api/v1/metrics/history"):
+            from app.services.analytics_service import record_latency
+            record_latency(path, latency_ms, response.status_code)
+    except Exception:
+        pass
+    return response
+
+
 # ── CORS ───────────────────────────────────────────────────────────────────────
 # CORS = Cross-Origin Resource Sharing.
 # Without this, the browser blocks requests from localhost:3000 (React dev server)
@@ -183,6 +220,15 @@ app.include_router(chat.router, prefix="/api/v1")
 app.include_router(review.router, prefix="/api/v1")
 app.include_router(write.router, prefix="/api/v1")
 app.include_router(metrics.router, prefix="/api/v1")
+app.include_router(agent.router, prefix="/api/v1")
+app.include_router(prompts.router, prefix="/api/v1")
+app.include_router(snippets.router, prefix="/api/v1")
+app.include_router(activity.router, prefix="/api/v1")
+app.include_router(bulk.router, prefix="/api/v1")
+app.include_router(file_tree.router, prefix="/api/v1")
+app.include_router(diff.router, prefix="/api/v1")
+app.include_router(notifications.router, prefix="/api/v1")
+app.include_router(slash.router, prefix="/api/v1")
 
 
 @app.get("/health")
@@ -190,16 +236,17 @@ async def health_check():
     """
     Deep health check — tests actual dependencies, not just "is the process alive".
 
-    Provider-aware: checks the configured LLM provider (OpenAI or Gemini) + ChromaDB.
+    Provider-aware: checks the configured LLM provider (Ollama or hosted
+    OpenAI-compatible endpoint) + ChromaDB.
     Railway uses this to decide whether to route traffic to the instance.
     Returns 503 if any check fails — so a misconfigured deploy is caught immediately.
     """
-    from app.services.llm_factory import get_provider_name
+    from app.services.llm_factory import get_hosted_display_name, get_provider_name
     checks: dict[str, str] = {}
     overall_ok = True
 
     # ── Check 1: LLM provider ─────────────────────────────────────────────────
-    # Supported providers: "openai" | "ollama" | "deepseek"  (see config.py Literal)
+    # Supported providers: "ollama" | "openai_compatible"  (see config.py Literal)
     if settings.llm_provider == "ollama":
         try:
             import httpx
@@ -213,27 +260,26 @@ async def health_check():
         except Exception as e:
             checks["llm"] = f"error: {str(e)[:120]}"
             overall_ok = False
-    elif settings.llm_provider == "deepseek":
+    elif settings.llm_provider == "openai_compatible":
+        # Generic OpenAI-style endpoint: Groq, OpenRouter, DeepSeek, Together,
+        # HuggingFace, GitHub Models, LM Studio, vLLM... The transport client is
+        # openai.AsyncOpenAI because they all speak the OpenAI HTTP API.
         try:
             import openai
             client = openai.AsyncOpenAI(
-                api_key=settings.deepseek_api_key,
-                base_url=settings.deepseek_base_url,
+                api_key=settings.compat_api_key,
+                base_url=settings.compat_base_url,
             )
             await client.models.list()
-            checks["llm"] = f"ok (DeepSeek — {settings.deepseek_chat_model})"
+            checks["llm"] = (
+                f"ok ({get_hosted_display_name()} — {settings.compat_chat_model})"
+            )
         except Exception as e:
             checks["llm"] = f"error: {str(e)[:120]}"
             overall_ok = False
     else:
-        try:
-            import openai
-            client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
-            await client.models.list()
-            checks["llm"] = f"ok (OpenAI — {settings.openai_chat_model})"
-        except Exception as e:
-            checks["llm"] = f"error: {str(e)[:120]}"
-            overall_ok = False
+        checks["llm"] = f"error: unknown LLM_PROVIDER={settings.llm_provider!r}"
+        overall_ok = False
 
     # ── Check 2: ChromaDB ─────────────────────────────────────────────────────
     try:

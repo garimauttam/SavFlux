@@ -26,11 +26,25 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { User, Bot, FileCode, Activity } from "lucide-react";
-import { Message } from "../types";
+import { useState } from "react";
+import { User, Bot, FileCode, Activity, ShieldCheck, ShieldAlert, Shield, ExternalLink, Share2, Copy, Check } from "lucide-react";
+// snippet save event dispatched via savflux:snippet-save
+import { apiFetch } from "../api";
+import { ExportButton } from "./ExportButton";
+import { VoiceButton } from "./VoiceButton";
+import { Message, SourceFile } from "../types";
+import { TrustLedgerDrawer } from "./TrustLedger";
 
 interface MessageBubbleProps {
   message: Message;
+  /** Active repo for ledger verification (passed from ChatWindow) */
+  activeRepoUrl?: string | null;
+  /** Previous user question — used for share snapshot */
+  prevQuestion?: string | null;
+  /** Chat history for fuller share context */
+  chatHistory?: { role: string; content: string }[] | null;
+  /** Optional: navigate to Review tab for a source file */
+  onOpenInReview?: (source: string) => void;
 }
 
 // ── Markdown component overrides ─────────────────────────────────────────────
@@ -162,8 +176,18 @@ const mdComponents: React.ComponentProps<typeof ReactMarkdown>["components"] = {
   ),
 };
 
-export function MessageBubble({ message }: MessageBubbleProps) {
+function trustChip(trust?: string) {
+  if (trust === "high") return { Icon: ShieldCheck, color: "text-emerald-400", bg: "bg-emerald-500/10", border: "border-emerald-500/25", label: "high" };
+  if (trust === "medium") return { Icon: ShieldAlert, color: "text-amber-400", bg: "bg-amber-500/10", border: "border-amber-500/25", label: "med" };
+  return { Icon: Shield, color: "text-gray-500", bg: "bg-gray-700/40", border: "border-gray-600", label: "low" };
+}
+
+export function MessageBubble({ message, activeRepoUrl, prevQuestion, chatHistory, onOpenInReview }: MessageBubbleProps) {
   const isUser = message.role === "user";
+  const [selected, setSelected] = useState<SourceFile | null>(null);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [sharing, setSharing] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   return (
     <div className={`flex gap-3 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
@@ -215,19 +239,127 @@ export function MessageBubble({ message }: MessageBubbleProps) {
           </div>
         )}
 
-        {/* Sources panel — shown after streaming completes */}
+        {/* Trust Ledger — clickable __SOURCES__ citations (P0 #4) */}
         {!isUser && message.sources && message.sources.length > 0 && !message.isStreaming && (
-          <div className="flex flex-wrap gap-1.5 px-1">
-            {message.sources.map((src, i) => (
-              <span
-                key={i}
-                title={src.source}
-                className="flex items-center gap-1 bg-gray-900 border border-gray-700 text-gray-400 text-xs px-2 py-0.5 rounded-full hover:border-purple-600 transition-colors cursor-default"
-              >
-                <FileCode className="w-3 h-3 text-purple-400 shrink-0" />
-                {src.file_name}
+          <div className="w-full max-w-full">
+            {/* Ledger header */}
+            <div className="flex items-center gap-1.5 px-1 mb-1.5">
+              <ShieldCheck className="w-3 h-3 text-emerald-400" />
+              <span className="text-xs font-semibold text-gray-300">Trust Ledger</span>
+              <span className="text-xs text-gray-500">
+                · {message.sources.length} source{message.sources.length > 1 ? "s" : ""} · click to verify
               </span>
-            ))}
+              <span className="ml-auto flex items-center gap-1 text-xs text-gray-600">
+                {(() => {
+                  const highs = message.sources!.filter((s) => s.trust_level === "high").length;
+                  const meds = message.sources!.filter((s) => s.trust_level === "medium").length;
+                  return (
+                    <>
+                      {highs > 0 && <span className="text-emerald-400">{highs} high</span>}
+                      {highs > 0 && meds > 0 && <span>·</span>}
+                      {meds > 0 && <span className="text-amber-400">{meds} med</span>}
+                      {(highs > 0 || meds > 0) && <span className="text-gray-500">· grounded</span>}
+                    </>
+                  );
+                })()}
+              </span>
+            </div>
+
+            {/* Clickable citation chips — line-precise (P0 #5.1) */}
+            <div className="flex flex-wrap gap-1.5 px-1">
+              {message.sources.map((src, i) => {
+                const t = trustChip(src.trust_level);
+                const TIcon = t.Icon;
+                const lineLabel = src.start_line ? `:${src.start_line}${src.end_line && src.end_line !== src.start_line ? `-${src.end_line}` : ""}` : "";
+                return (
+                  <button
+                    key={i}
+                    onClick={() => setSelected(src)}
+                    title={`${src.source}${lineLabel} — trust: ${src.trust_level ?? "low"} (${src.trust_score ?? "—"}) — click to verify`}
+                    className={`group flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border transition-all hover:scale-[1.02] cursor-pointer ${t.bg} ${t.border} ${t.color} hover:border-purple-500/50`}
+                  >
+                    <TIcon className="w-3 h-3 shrink-0" />
+                    <FileCode className="w-3 h-3 shrink-0 opacity-60" />
+                    <span className="font-medium max-w-[140px] truncate">
+                      {src.file_name}
+                      {lineLabel && <span className="font-mono text-[10px] opacity-70">{lineLabel}</span>}
+                    </span>
+                    {src.trust_score && <span className="text-[10px] opacity-60">·{src.trust_score}</span>}
+                    <ExternalLink className="w-3 h-3 opacity-0 group-hover:opacity-60 transition-opacity" />
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Ledger drawer */}
+            {selected && (
+              <TrustLedgerDrawer
+                source={selected}
+                onClose={() => setSelected(null)}
+                activeRepoUrl={activeRepoUrl}
+                onOpenInReview={onOpenInReview}
+              />
+            )}
+          </div>
+        )}
+
+        {/* Voice + Share + Export — always for assistant when not streaming (P1 #5.5 + P2 #8 + P2 Voice) */}
+        {!isUser && !message.isStreaming && (
+          <div className="flex items-center gap-2 px-1 mt-1 flex-wrap">
+            <VoiceButton text={message.content} isStreaming={message.isStreaming} />
+            <ExportButton question={prevQuestion || "Shared from SavFlux"} answer={message.content} sources={message.sources as any} repoUrl={activeRepoUrl} ledger={message.sources ? { sources: message.sources } : undefined} />
+            {!shareUrl ? (
+              <button
+                onClick={async () => {
+                  if (sharing) return;
+                  setSharing(true);
+                  try {
+                    const question = (prevQuestion || "").trim() || "Shared from SavFlux";
+                    const res = await apiFetch("/api/v1/chat/share", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        question,
+                        answer: message.content,
+                        sources: message.sources || [],
+                        repo_url: activeRepoUrl || undefined,
+                        ledger: message.sources ? { sources: message.sources } : undefined,
+                        chat_history: chatHistory || undefined,
+                      }),
+                    });
+                    const data = await res.json();
+                    if (!res.ok) throw new Error(data.detail || "Share failed");
+                    const url = data.url || `https://savflux.app/s/${data.id}`;
+                    setShareUrl(url);
+                    try { await navigator.clipboard.writeText(url); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch {}
+                  } catch (e) {
+                    // silent — user can retry
+                  } finally { setSharing(false); }
+                }}
+                disabled={sharing}
+                title="Create shareable link with ledger snapshot — https://savflux.app/s/{id}"
+                className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-gray-700/60 hover:bg-gray-700 border border-gray-600 hover:border-purple-500/40 text-gray-300 hover:text-white transition-colors disabled:opacity-50"
+              >
+                <Share2 className="w-3 h-3" />
+                {sharing ? "Sharing…" : "Share"}
+              </button>
+            ) : (
+              <div className="flex items-center gap-1.5 text-xs bg-emerald-900/30 border border-emerald-700/30 text-emerald-300 px-2.5 py-1 rounded-full">
+                <Check className="w-3 h-3" />
+                <span className="max-w-[180px] truncate">{shareUrl}</span>
+                <button
+                  onClick={async () => { try { await navigator.clipboard.writeText(shareUrl); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch {} }}
+                  className="ml-1 p-1 hover:bg-emerald-800/40 rounded"
+                  title="Copy link"
+                >
+                  {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                </button>
+                <a href={shareUrl} target="_blank" rel="noopener noreferrer" className="p-1 hover:bg-emerald-800/40 rounded" title="Open">
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+            )}
+            {shareUrl && <span className="text-xs text-gray-500">{copied ? "Copied!" : "Link copied"}</span>}
           </div>
         )}
       </div>
