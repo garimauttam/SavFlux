@@ -139,7 +139,9 @@ def resolve_path(mirror: Path, rel_path: str) -> str | None:
     if not rel:
         return None
     try:
-        proc = _git("--git-dir", str(mirror), "ls-files")
+        # ls-tree (not ls-files): bare mirrors have no index/working tree,
+        # so ls-files always returns empty. ls-tree reads the HEAD tree.
+        proc = _git("--git-dir", str(mirror), "ls-tree", "-r", "--name-only", "HEAD")
         if proc.returncode != 0:
             return None
         tracked = proc.stdout.splitlines()
@@ -203,7 +205,8 @@ def file_blame(repo_url: str, rel_path: str, rev: str = "HEAD") -> dict[str, Any
     resolved = resolve_path(mirror, rel_path)
     if not resolved:
         raise RuntimeError(f"File not found in repo history: {rel_path}")
-    proc = _git("--git-dir", str(mirror), "blame", "--line-number", "--porcelain",
+    # NOTE: no --line-number flag exists for blame; we number lines sequentially.
+    proc = _git("--git-dir", str(mirror), "blame", "--porcelain",
                 rev, "--", resolved)
     if proc.returncode != 0:
         raise RuntimeError("git blame failed for this file.")

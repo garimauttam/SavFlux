@@ -12,10 +12,10 @@
  */
 
 import React, { useEffect, useMemo, useState } from "react";
-import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell, Terminal } from "lucide-react";
+import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell, Terminal, History } from "lucide-react";
 import { IndexedFile, IndexedRepo } from "../types";
 
-type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff" | "notifications" | "slash";
+type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff" | "notifications" | "slash" | "history";
 
 interface Props {
   open: boolean;
@@ -82,6 +82,7 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
       { id: "notifications", label: "Inbox", icon: Bell, keys: "g i" },
       { id: "slash", label: "Slash", icon: Terminal, keys: "g /" },
       { id: "agent", label: "Agent", icon: Bot, keys: "g a" },
+      { id: "history", label: "History", icon: History, keys: "g t" },
     ];
     tabDefs.forEach((t) => {
       const score = q ? fuzzyScore(q, `${t.label} ${t.id} ${t.keys}`) : 10;
