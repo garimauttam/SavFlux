@@ -43,7 +43,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.limiter import limiter
 
 from app.core.config import get_settings
-from app.api import ingest, chat, review, write, metrics, agent, prompts, snippets, activity, bulk, file_tree, diff, notifications, slash
+from app.api import ingest, chat, review, write, metrics, agent, prompts, analytics, snippets, activity, bulk, file_tree, diff, notifications, slash
 
 logger = logging.getLogger(__name__)
 
