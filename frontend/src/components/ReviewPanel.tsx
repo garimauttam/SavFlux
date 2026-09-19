@@ -5,6 +5,7 @@
  *   "From repo"  — folder-tree checkbox picker; 1 file = single review,
  *                  2+ files = multi-file review with combined summary
  *   "Paste code" — paste raw code, always single review
+ *   "PR Diff"    — unified diff → impact + inline comments (+ optional AI review)
  *
  * The Single / Multi distinction is invisible to the user — they just
  * pick files and click Run. The panel routes internally.
@@ -37,8 +38,10 @@ import {
   ListTree,
   Clock3,
   CheckCircle2,
+  GitPullRequest,
 } from "lucide-react";
 import { IndexedFile } from "../types";
+import { PRReviewPanel } from "./PRReviewPanel";
 import { useReview } from "../hooks/useReview";
 import { useMultiReview, ReviewSection } from "../hooks/useMultiReview";
 
@@ -639,7 +642,7 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
   const multi  = useMultiReview();
 
   // Input tab: "file" (from repo tree) or "paste"
-  const [tab, setTab] = useState<"file" | "paste">("file");
+  const [tab, setTab] = useState<"file" | "paste" | "pr">("file");
 
   // File selection
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -812,6 +815,11 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
       </div>
 
       {/* ── Body ── */}
+      {tab === "pr" ? (
+        <div className="flex flex-1 overflow-hidden">
+          <PRReviewPanel />
+        </div>
+      ) : (
       <div className="flex flex-1 overflow-hidden">
 
         {/* Left: input panel */}
@@ -819,7 +827,7 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
 
           {/* Tabs: From repo | Paste code */}
           <div className="flex border-b border-gray-700">
-            {(["file", "paste"] as const).map((t) => (
+            {(["file", "paste", "pr"] as const).map((t) => (
               <button
                 key={t}
                 onClick={() => { setTab(t); single.reset(); multi.reset(); }}
@@ -831,9 +839,11 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
               >
                 {t === "file"
                   ? <Files className="w-3.5 h-3.5" />
-                  : <ClipboardPaste className="w-3.5 h-3.5" />
+                  : t === "paste"
+                    ? <ClipboardPaste className="w-3.5 h-3.5" />
+                    : <GitPullRequest className="w-3.5 h-3.5" />
                 }
-                {t === "file" ? "From repo" : "Paste code"}
+                {t === "file" ? "From repo" : t === "paste" ? "Paste code" : "PR Diff"}
               </button>
             ))}
           </div>
@@ -1077,6 +1087,7 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
           <div ref={outputEndRef} />
         </div>
       </div>
+      )}
     </div>
   );
 }

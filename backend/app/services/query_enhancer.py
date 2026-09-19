@@ -193,3 +193,49 @@ def compact_chat_history(chat_history: list[dict], max_turns: int = 6) -> str:
             content = content[:HISTORY_TRUNCATE] + "…[truncated]"
         history_str += f"{role}: {content}\n"
     return history_str
+
+
+# ── Memory pruning ($0 RemoveMessage equivalent) ──────────────────────────────
+# LangGraph's RemoveMessage drops messages from agent state; this is the same
+# idea with zero deps: drop the oldest turns that overflow a token budget.
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate (chars/4) — standard heuristic, no tokenizer needed."""
+    return max(1, len(text or "") // 4)
+
+
+def prune_chat_history(
+    chat_history: list[dict],
+    max_tokens: int = 2000,
+    keep_last: int = 2,
+) -> dict:
+    """Drop oldest turns until the history fits max_tokens.
+
+    The newest `keep_last` turns are always kept (recency wins). Returns
+    {messages, dropped, tokens_before, tokens_after}.
+    """
+    messages = [m for m in (chat_history or []) if isinstance(m, dict)]
+    max_tokens = max(100, int(max_tokens or 2000))
+    keep_last = max(1, int(keep_last or 2))
+
+    def cost(m: dict) -> int:
+        return estimate_tokens(str(m.get("content", "")))
+
+    tokens_before = sum(cost(m) for m in messages)
+    if tokens_before <= max_tokens or len(messages) <= keep_last:
+        return {"messages": messages, "dropped": 0,
+                "tokens_before": tokens_before, "tokens_after": tokens_before}
+
+    # Walk from newest, keeping turns until the budget (or keep_last) is met.
+    kept: list[dict] = []
+    budget = max_tokens
+    for m in reversed(messages):
+        c = cost(m)
+        if len(kept) < keep_last or c <= budget:
+            kept.append(m)
+            budget -= c
+        # else: drop — too old and over budget
+    kept.reverse()
+    tokens_after = sum(cost(m) for m in kept)
+    return {"messages": kept, "dropped": len(messages) - len(kept),
+            "tokens_before": tokens_before, "tokens_after": tokens_after}

@@ -14,6 +14,7 @@ import { apiFetch } from "../api";
 import { Send, Trash2, Loader2, Database } from "lucide-react";
 import { MessageBubble } from "./MessageBubble";
 import { ArchitectureDiagram } from "./ArchitectureDiagram";
+import { VoiceControls } from "./VoiceControls";
 import { useChat } from "../hooks/useChat";
 
 interface ChatWindowProps {
@@ -254,6 +255,10 @@ export function ChatWindow({ activeRepoUrl, hasIndexedFiles, activeRepoUrls }: C
               el.style.height = "auto";
               el.style.height = `${el.scrollHeight}px`;
             }}
+          />
+          <VoiceControls
+            onTranscript={(t) => setInput((prev) => (prev.trim() ? prev.trim() + " " + t : t))}
+            disabled={!hasIndexedFiles}
           />
           <button
             onClick={handleSend}

@@ -253,3 +253,111 @@ def build_dependency_graph(repo_url: str | None = None) -> dict:
             "dependencies": len(edges),
         },
     }
+
+
+def _match_node_id(graph: dict, file: str) -> str | None:
+    """Resolve a user-supplied file ref to a graph node id.
+
+    Accepts a full indexed id, a basename label (what GraphPanel sends),
+    or a repo-relative path suffix. Mirrors the frontend byLabel logic so
+    blast highlighting always lines up with the clicked node.
+    """
+    file = (file or "").strip()
+    if not file:
+        return None
+    nodes = graph.get("nodes", [])
+    ids = [n.get("id", "") for n in nodes]
+    if file in ids:
+        return file
+    basename = file.rsplit("/", 1)[-1]
+    for n in nodes:
+        if n.get("label") == basename:
+            return n.get("id")
+    for node_id in ids:
+        if node_id.endswith(file) or file.endswith(node_id):
+            return node_id
+    lowered = basename.lower()
+    for n in nodes:
+        label = (n.get("label") or "").lower()
+        if label == lowered or label.rsplit(".", 1)[0] == lowered.rsplit(".", 1)[0]:
+            return n.get("id")
+    return None
+
+
+def get_blast_radius(graph: dict | None, file: str, max_depth: int = 0) -> dict:
+    """Transitive dependents of `file`: everything that would be affected by a change.
+
+    Edge direction in the graph is importer → imported (A imports B means
+    edge A→B), so the blast radius is a reverse traversal: every node that
+    can reach `file` by following edges backwards.
+
+    max_depth: 0 = unbounded (full transitive closure); N = at most N hops.
+
+    Returns {file, matched_id, impacted_files, direct_dependents, depth,
+             risk_score, risk_level, risk_reasons} — the shape GraphPanel
+    and the deterministic agent consume.
+    """
+    graph = graph or {}
+    matched = _match_node_id(graph, file)
+    if not matched:
+        return {
+            "file": file,
+            "matched_id": None,
+            "impacted_files": [],
+            "direct_dependents": [],
+            "depth": 0,
+            "risk_score": 0,
+            "risk_level": "low",
+            "risk_reasons": ["file is not in the indexed dependency graph"],
+            "graph_available": bool(graph.get("nodes")),
+        }
+
+    # Reverse adjacency: imported → [importers]
+    importers: dict[str, list[str]] = {}
+    for edge in graph.get("edges", []):
+        src = edge.get("source", "")
+        tgt = edge.get("target", "")
+        if src and tgt and src != tgt:
+            importers.setdefault(tgt, []).append(src)
+
+    direct = sorted(set(importers.get(matched, [])))
+
+    # Reverse BFS from the changed file
+    impacted: set[str] = set()
+    frontier = [matched]
+    depth = 0
+    max_depth = max(0, int(max_depth or 0))
+    while frontier and (max_depth == 0 or depth < max_depth):
+        depth += 1
+        nxt: list[str] = []
+        for node in frontier:
+            for imp in importers.get(node, []):
+                if imp != matched and imp not in impacted:
+                    impacted.add(imp)
+                    nxt.append(imp)
+        frontier = nxt
+
+    # Risk: fan-in breadth + transitive depth + sensitive-file bonus
+    risk_score = min(10, len(direct) + len(impacted) // 2 + (depth - 1 if depth else 0))
+    reasons: list[str] = []
+    if direct:
+        reasons.append(f"{len(direct)} direct importer(s)")
+    if len(impacted) > len(direct):
+        reasons.append(f"{len(impacted) - len(direct)} transitive dependent(s)")
+    lowered = matched.lower()
+    if any(k in lowered for k in ("auth", "security", "permission", "credential", "crypto", "payment")):
+        risk_score = min(10, risk_score + 2)
+        reasons.append("security-sensitive file")
+    risk_level = "high" if risk_score >= 7 else "medium" if risk_score >= 4 else "low"
+
+    return {
+        "file": file,
+        "matched_id": matched,
+        "impacted_files": sorted(impacted),
+        "direct_dependents": direct,
+        "depth": depth,
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "risk_reasons": reasons or ["no indexed dependents"],
+        "graph_available": True,
+    }
