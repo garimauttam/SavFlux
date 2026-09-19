@@ -420,6 +420,16 @@ async def ingest_github_repo(
                 "message": f"✅ Indexed {chunks_added} chunks from {len(files) - files_skipped} files{skip_note}.",
             })
 
+        # Trust ledger: record the exact upstream commit this index was
+        # built from, so answers can be verified against a known revision.
+        # Best-effort — verification must never break ingestion.
+        try:
+            head_sha = git.Repo(tmp_dir).head.commit.hexsha
+            from app.services.trust_service import record_index
+            record_index(repo_url, head_sha, files_indexed=len(files) - files_skipped)
+        except Exception:
+            pass
+
         return {
             "status": "success",
             "repo_url": repo_url,
