@@ -179,7 +179,20 @@ const mdComponents: React.ComponentProps<typeof ReactMarkdown>["components"] = {
 function trustChip(trust?: string) {
   if (trust === "high") return { Icon: ShieldCheck, color: "text-emerald-400", bg: "bg-emerald-500/10", border: "border-emerald-500/25", label: "high" };
   if (trust === "medium") return { Icon: ShieldAlert, color: "text-amber-400", bg: "bg-amber-500/10", border: "border-amber-500/25", label: "med" };
-  return { Icon: Shield, color: "text-gray-500", bg: "bg-gray-700/40", border: "border-gray-600", label: "low" };
+  if (trust === "low") return { Icon: Shield, color: "text-gray-500", bg: "bg-gray-700/40", border: "border-gray-600", label: "low" };
+  // "unrated" / missing — the reranker never scored this chunk. Render it
+  // distinctly from "low" so the UI never implies evidence was assessed and
+  // found weak when it was simply not assessed.
+  return { Icon: Shield, color: "text-sky-300/70", bg: "bg-sky-500/5", border: "border-sky-500/20", label: "unrated" };
+}
+
+/** Renders `:42-58` for a span, `:42` for a single line, "" when unknown. */
+function lineSuffix(src: SourceFile): string {
+  if (typeof src.start_line !== "number") return "";
+  if (typeof src.end_line === "number" && src.end_line !== src.start_line) {
+    return `:${src.start_line}-${src.end_line}`;
+  }
+  return `:${src.start_line}`;
 }
 
 export function MessageBubble({ message, activeRepoUrl, prevQuestion, chatHistory, onOpenInReview }: MessageBubbleProps) {
@@ -270,12 +283,14 @@ export function MessageBubble({ message, activeRepoUrl, prevQuestion, chatHistor
               {message.sources.map((src, i) => {
                 const t = trustChip(src.trust_level);
                 const TIcon = t.Icon;
-                const lineLabel = src.start_line ? `:${src.start_line}${src.end_line && src.end_line !== src.start_line ? `-${src.end_line}` : ""}` : "";
+                const lineLabel = lineSuffix(src);
+                const scoreLabel =
+                  typeof src.trust_score === "number" ? src.trust_score : "not scored";
                 return (
                   <button
                     key={i}
                     onClick={() => setSelected(src)}
-                    title={`${src.source}${lineLabel} — trust: ${src.trust_level ?? "low"} (${src.trust_score ?? "—"}) — click to verify`}
+                    title={`${src.source}${lineLabel} — trust: ${t.label} (${scoreLabel}) — click to verify`}
                     className={`group flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border transition-all hover:scale-[1.02] cursor-pointer ${t.bg} ${t.border} ${t.color} hover:border-purple-500/50`}
                   >
                     <TIcon className="w-3 h-3 shrink-0" />
@@ -284,7 +299,12 @@ export function MessageBubble({ message, activeRepoUrl, prevQuestion, chatHistor
                       {src.file_name}
                       {lineLabel && <span className="font-mono text-[10px] opacity-70">{lineLabel}</span>}
                     </span>
-                    {src.trust_score && <span className="text-[10px] opacity-60">·{src.trust_score}</span>}
+                    {/* Explicit typeof check, not `src.trust_score && ...`:
+                        a score of exactly 0 is falsy, so the short-circuit form
+                        renders the literal "0" into the chip instead of the span. */}
+                    {typeof src.trust_score === "number" && (
+                      <span className="text-[10px] opacity-60">·{src.trust_score}</span>
+                    )}
                     <ExternalLink className="w-3 h-3 opacity-0 group-hover:opacity-60 transition-opacity" />
                   </button>
                 );

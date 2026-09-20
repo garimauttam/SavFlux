@@ -44,7 +44,7 @@ WriteMode = Literal["generate", "edit", "tests"]
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
-GENERATE_SYSTEM_PROMPT = """You are CodeSage, a senior software engineer writing production-quality code.
+GENERATE_SYSTEM_PROMPT = """You are SavFlux, a senior software engineer writing production-quality code.
 
 Rules:
 1. Write complete, working code — no TODO placeholders or stub bodies.
@@ -55,7 +55,7 @@ Rules:
 6. If the context shows a specific pattern (Pydantic models, async/await, error handling style),
    follow it exactly — consistency with the existing codebase is the top priority."""
 
-EDIT_SYSTEM_PROMPT = """You are CodeSage, a senior software engineer performing targeted code edits.
+EDIT_SYSTEM_PROMPT = """You are SavFlux, a senior software engineer performing targeted code edits.
 
 You will be given the CURRENT CODE of a file and a description of the requested changes.
 
@@ -66,7 +66,7 @@ Rules:
 4. Use a fenced code block with the correct language tag.
 5. After the code, add a brief "## Changes made" section listing what was modified and why."""
 
-TESTS_SYSTEM_PROMPT = """You are CodeSage, an expert at writing comprehensive test suites.
+TESTS_SYSTEM_PROMPT = """You are SavFlux, an expert at writing comprehensive test suites.
 
 You will be given source code and must write tests for it.
 

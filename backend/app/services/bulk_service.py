@@ -137,8 +137,18 @@ def get_bulk_stats() -> dict[str, Any]:
         for f in files:
             lang = f.get("language") or "text"
             by_lang[lang] = by_lang.get(lang, 0) + 1
-            repo = f.get("repo_url") or f.get("source", "").split("::")[0] if "::" in f.get("source", "") else "unknown"
-            by_repo[repo] = by_repo.get(repo, 0) + 1
+            # Resolve the owning repo with an explicit precedence chain.
+            #
+            # WHY NOT THE ONE-LINER `a or b if cond else c`?
+            # Python parses that as `(a or b) if cond else c`, so a file with a
+            # perfectly good repo_url but a source id lacking "::" was bucketed
+            # as "unknown". Writing the fallback out makes the precedence
+            # (metadata → stable source id prefix → unknown) unambiguous.
+            source = f.get("source", "") or ""
+            repo = f.get("repo_url") or ""
+            if not repo and "::" in source:
+                repo = source.split("::")[0]
+            by_repo[repo or "unknown"] = by_repo.get(repo or "unknown", 0) + 1
         return {"total_files": len(files), "by_language": by_lang, "by_repo": by_repo, "files": files[:200]}
     except Exception as e:
         return {"total_files": 0, "by_language": {}, "by_repo": {}, "files": [], "error": str(e)[:200]}

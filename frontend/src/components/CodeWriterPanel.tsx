@@ -684,7 +684,7 @@ export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
                 </div>
 
                 <div className="text-[11px] text-gray-600 leading-relaxed">
-                  💡 CodeSage reads your existing test files (if any) and generates tests that match the same framework and style.
+                  💡 SavFlux reads your existing test files (if any) and generates tests that match the same framework and style.
                 </div>
               </>
             )}
@@ -737,7 +737,7 @@ export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
                   ? "Describe what you want to build. Optionally select context files so the LLM mirrors your existing style."
                   : mode === "edit"
                   ? "Pick an indexed file and describe the changes. The LLM receives the full file and returns a rewritten version."
-                  : "Pick an indexed file. CodeSage reads your repo's existing tests to match the framework and style."
+                  : "Pick an indexed file. SavFlux reads your repo's existing tests to match the framework and style."
                 }
               </p>
             </div>

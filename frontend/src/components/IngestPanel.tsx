@@ -183,7 +183,7 @@ export function IngestPanel({
       <div className="p-4 border-b border-gray-700">
         <h1 className="text-xl font-bold text-white flex items-center gap-2">
           <FileCode className="w-6 h-6 text-purple-400" />
-          CodeSage
+          SavFlux
         </h1>
         <p className="text-xs text-gray-400 mt-1">AI-powered codebase assistant</p>
       </div>

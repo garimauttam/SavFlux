@@ -21,9 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
 
-settings = get_settings()
 
 def _safe_load_json(path: Path, default: Any) -> Any:
     try:
@@ -45,12 +43,18 @@ def _safe_read_jsonl(path: Path, limit: int = 20) -> list[dict]:
 def get_activity(limit: int = 50, kind: str | None = None) -> list[dict[str, Any]]:
     limit = max(1, min(limit, 200))
     kind = (kind or "").strip().lower() or None
-    base = Path(settings.chroma_persist_directory)
     items: list[dict[str, Any]] = []
 
-    # Prompts history + saved prompts
-    prompt_path = base / "prompt_library.json"
-    prompt_data = _safe_load_json(prompt_path, {"prompts": [], "history": []})
+    # Prompts history + saved prompts.
+    #
+    # WHY ASK prompt_service FOR THE PATH instead of rebuilding
+    # `data_dir() / "prompt_library.json"` here?
+    # The filename is prompt_service's private detail. Duplicating it meant the
+    # two modules could drift (and made the path impossible to redirect in
+    # tests, which patch `_library_path`). Delegating keeps exactly one
+    # definition of "where do prompts live".
+    from app.services.prompt_service import _library_path
+    prompt_data = _safe_load_json(_library_path(), {"prompts": [], "history": []})
     for h in prompt_data.get("history", [])[-50:]:
         items.append({
             "id": f"prompt-hist-{h.get('id')}",
@@ -72,9 +76,9 @@ def get_activity(limit: int = 50, kind: str | None = None) -> list[dict[str, Any
             "meta": {"tags": p.get("tags", []), "use_count": p.get("use_count", 0)},
         })
 
-    # Snippets
-    snippet_path = base / "snippet_vault.json"
-    snippet_data = _safe_load_json(snippet_path, {"snippets": []})
+    # Snippets — path owned by snippet_service (see note above).
+    from app.services.snippet_service import _snippet_path
+    snippet_data = _safe_load_json(_snippet_path(), {"snippets": []})
     for s in snippet_data.get("snippets", [])[-50:]:
         items.append({
             "id": f"snippet-{s.get('id')}",
@@ -112,9 +116,9 @@ def get_activity(limit: int = 50, kind: str | None = None) -> list[dict[str, Any
     except Exception:
         pass
 
-    # Analytics snapshots (as activity)
-    analytics_path = base / "analytics_history.jsonl"
-    for snap in _safe_read_jsonl(analytics_path, limit=20):
+    # Analytics snapshots (as activity) — path owned by analytics_service.
+    from app.services.analytics_service import _history_path
+    for snap in _safe_read_jsonl(_history_path(), limit=20):
         items.append({
             "id": f"analytics-{snap.get('ts')}",
             "kind": "analytics",
@@ -125,13 +129,17 @@ def get_activity(limit: int = 50, kind: str | None = None) -> list[dict[str, Any
             "meta": snap,
         })
 
-    # Ingested repos (from repos file if exists, else via service)
+    # Ingested repos.
+    #
+    # Uses the *sync* entry point: get_activity() is called from a worker thread
+    # (via asyncio.to_thread in the route), where an event loop is already
+    # running on the main thread. The previous `asyncio.run(...)` call raised
+    # RuntimeError in that context and the error was swallowed, so indexed repos
+    # never showed up in the feed outside of tests.
     try:
-        # Try to get repos via ingestion service's list
-        import asyncio
-        from app.services.ingestion_service import get_indexed_repos  # type: ignore
+        from app.services.ingestion_service import get_indexed_repos_sync
         try:
-            repos = asyncio.run(get_indexed_repos())  # type: ignore
+            repos = get_indexed_repos_sync()
         except Exception:
             repos = []
         for r in repos[-20:]:
@@ -162,11 +170,13 @@ def get_activity(limit: int = 50, kind: str | None = None) -> list[dict[str, Any
     return items[:limit]
 
 def clear_activity(kind: str | None = None) -> int:
-    """Clear activity by kind (or all if kind is None). Returns deleted count."""
-    # For now, clear by delegating to underlying services where possible
+    """Clear activity by kind (or all if kind is None). Returns deleted count.
+
+    Every branch delegates to the service that owns the data, so clearing stays
+    correct even when a service changes where or how it persists.
+    """
     n = 0
     kind = (kind or "").strip().lower() or None
-    base = Path(settings.chroma_persist_directory)
     if kind is None or kind == "prompt_history":
         try:
             from app.services.prompt_service import clear_history

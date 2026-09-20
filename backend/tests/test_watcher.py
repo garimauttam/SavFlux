@@ -9,13 +9,9 @@ SHA_B = "b" * 40
 
 
 @pytest.fixture()
-def _isolated(tmp_path, monkeypatch):
-    import app.services.watcher_service as ws
-    import app.services.trust_service as ts
-    import app.services.notification_service as ns
-    for mod in (ws, ts, ns):
-        monkeypatch.setattr(mod.settings, "chroma_persist_directory", str(tmp_path))
-    return tmp_path
+def _isolated(isolated_data_dir):
+    """Watcher + trust-ledger + notification state all land in one tmp dir."""
+    return isolated_data_dir
 
 
 def test_poll_emits_event_once_per_sha(_isolated, monkeypatch):

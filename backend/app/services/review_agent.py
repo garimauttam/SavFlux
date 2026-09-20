@@ -30,6 +30,8 @@ from langchain_core.tools import tool
 from app.core.config import get_settings
 from app.services.llm_factory import get_chat_llm, get_review_llm
 from app.services.token_counter import get_token_callback, increment_request
+from app.services.code_analysis import analyze_file
+from app.services.code_analysis.analyzer import build_llm_facts
 
 
 # ── DeepSeek-R1 <think> tag stripper ─────────────────────────────────────────
@@ -266,7 +268,7 @@ def _run_security_scan(file_content: str) -> str:
 # ── System prompts ─────────────────────────────────────────────────────────────
 
 REVIEW_SYSTEM_PROMPT = """\
-You are CodeSage, a senior software engineer performing a thorough code review.
+You are SavFlux, a senior software engineer performing a thorough code review.
 
 You have access to these tools:
 - get_function_list: understand the file's structure
@@ -291,15 +293,27 @@ Be specific. Cite line numbers. Show fixed code in code blocks.\
 """
 
 FAST_REVIEW_SYSTEM_PROMPT = """\
-You are CodeSage, a senior software engineer performing a structured code review.
+You are SavFlux, a senior software engineer performing a structured code review.
 
-You have been given the file content, a function/class list, complexity metrics,
-and security pattern matches. Use ONLY this supplied data — never invent bugs,
-line numbers, or behaviours not directly visible in the evidence.
+You are given the file content plus a "Verified static analysis" block produced
+by a parser that analysed this exact file. Use ONLY this supplied data — never
+invent bugs, line numbers, or behaviours not visible in the evidence.
+
+HOW TO USE THE VERIFIED BLOCK:
+- Items under "VERIFIED ISSUES" were proven by parsing the code, including
+  dataflow across lines. Treat them as established fact. Report every one of
+  them, and spend your effort on the part a parser cannot do: what breaks in
+  production, which caller is exposed, and what to change first.
+- Items under "POSSIBLE ISSUES" are heuristics. Check each against the source
+  before repeating it. If the code shows it is a false alarm, drop it silently.
+- The parser finds pattern-level defects. You find the ones that need reading
+  comprehension: wrong logic, a race, a misused API, an unhandled edge case,
+  a contract the caller cannot satisfy. That is where your value is.
 
 GROUNDING RULES:
-- Cite exact line numbers from the "Structure" list. Do not guess line numbers.
-- Only flag a bug or security issue if it is present in the supplied code or pattern hits.
+- Cite exact line numbers. The verified block gives them; do not guess others.
+- Never restate a verified finding as uncertain, and never present a heuristic
+  as proven.
 - If a section has nothing to report, write "None found." — do not fabricate findings.
 - If a potential problem cannot be confirmed from the snippet alone, say "Possibly…"
   and state what additional context is needed to confirm it.
@@ -309,10 +323,10 @@ OUTPUT FORMAT — always use these exact headings:
 (Concrete logic errors, crashes, wrong behaviour — cite line numbers from the Structure list)
 
 ## 🔒 Security
-(Hardcoded secrets, injection risks, unsafe deserialization — only report pattern hits shown above)
+(Every VERIFIED security finding, with its impact. Add heuristic ones only after confirming them.)
 
 ## ⚠️ Maintainability
-(Bare excepts, nested loops, magic numbers, missing error handling — from the complexity metrics)
+(Complexity hotspots named in the verified block, plus design problems you can see)
 
 ## 🔗 Cross-file Issues
 (Use the Repo Context block. If no cross-file issues are evident, write "None found.")
@@ -446,12 +460,12 @@ async def stream_fast_code_review(
     yield f"__STATUS__Scanning `{file_name}`...{json.dumps({'step': 'starting', 'mode': 'fast'})}__STATUS_END__\n"
 
     try:
-        # Run all three tools in parallel — they are pure CPU, no I/O, no LLM calls.
-        fn_list, complexity, security_hits = await asyncio.gather(
-            asyncio.to_thread(tool_map["get_function_list"].invoke, {}),
-            asyncio.to_thread(tool_map["count_complexity_indicators"].invoke, {}),
-            asyncio.to_thread(_run_security_scan, file_content),
-        )
+        # One AST parse replaces three overlapping regex tools. The analyzer
+        # returns proven findings with line numbers, so the model is handed
+        # facts to explain rather than patterns to re-derive — which is what
+        # closes most of the gap between a 7B local model and a hosted one.
+        analysis = await asyncio.to_thread(analyze_file, file_content, file_name, language)
+        verified_facts = build_llm_facts(analysis)
 
         context_block = (
             f"\n### Cross-file Repo Context\n{repo_context}\n"
@@ -466,9 +480,7 @@ async def stream_fast_code_review(
                 f"Review `{file_name}` ({language}).\n\n"
                 f"### Code\n```{language}\n{preview}\n```{trunc}\n"
                 f"{context_block}"
-                f"### Structure\n{fn_list}\n\n"
-                f"### Complexity\n{complexity}\n\n"
-                f"### Security / runtime pattern hits\n{security_hits}\n\n"
+                f"### Verified static analysis\n{verified_facts}\n\n"
                 "Return these sections:\n"
                 "## 🐛 Bugs & Risks\n"
                 "## 🔒 Security\n"

@@ -9,7 +9,7 @@ Measures core retrieval and response generation metrics without needing expensiv
 5. Symbol Coverage: Did retrieved chunks contain the expected function/class names?
 
 Usage:
-  python eval_rag.py                     # runs full benchmark against self (CodeSage backend code)
+  python eval_rag.py                     # runs full benchmark against self (SavFlux backend code)
   python eval_rag.py --eval-file file.json  # load external JSON benchmark dataset
   python eval_rag.py --top-k 10 --quiet    # machine-readable JSON output
 
@@ -440,7 +440,7 @@ def print_report(result: Dict[str, Any]) -> None:
     m = result["metrics"]
     print()
     print("=" * 60)
-    print("         CODESAGE RAG BENCHMARK REPORT")
+    print("         SAVFLUX RAG BENCHMARK REPORT")
     print("=" * 60)
     print(f"  Total queries        : {m['total_queries']}")
     print(f"  Hit Rate @ K         : {m['hit_rate_at_k']}%")
@@ -464,7 +464,7 @@ def print_report(result: Dict[str, Any]) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CodeSage RAG Benchmark")
+    parser = argparse.ArgumentParser(description="SavFlux RAG Benchmark")
     parser.add_argument("--eval-file", help="Path to external JSON benchmark file")
     parser.add_argument("--top-k", type=int, default=5, help="Top-K candidates to evaluate")
     parser.add_argument("--quiet", action="store_true", help="Only print JSON result (for CI)")
@@ -482,7 +482,7 @@ if __name__ == "__main__":
     corpus = load_corpus(backend_dir)
 
     if not args.quiet:
-        print(f"\n🔬 CodeSage RAG Benchmark")
+        print(f"\n🔬 SavFlux RAG Benchmark")
         print(f"   Corpus: {len(corpus)} files from backend/")
         print(f"   Queries: {len(dataset)}  |  top_k={args.top_k}")
         print()

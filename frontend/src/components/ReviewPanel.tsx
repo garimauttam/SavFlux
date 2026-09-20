@@ -42,6 +42,7 @@ import {
 } from "lucide-react";
 import { IndexedFile } from "../types";
 import { PRReviewPanel } from "./PRReviewPanel";
+import { EvidenceViewer } from "./EvidenceViewer";
 import { useReview } from "../hooks/useReview";
 import { useMultiReview, ReviewSection } from "../hooks/useMultiReview";
 
@@ -49,6 +50,9 @@ interface ReviewPanelProps {
   indexedFiles: IndexedFile[];
   /** When set, pre-selects this file source on mount (used for graph→review navigation). */
   initialSelectedSource?: string | null;
+  /** Cited line span to open and highlight — set when navigation came from a
+   *  line-precise chat citation. Opens the evidence viewer automatically. */
+  initialTargetLines?: { start: number; end: number; ranges?: string } | null;
   /** Called after the initial selection has been applied, so the parent can clear it. */
   onInitialSourceConsumed?: () => void;
 }
@@ -637,7 +641,12 @@ function FolderTreeNode({
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
-export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSourceConsumed }: ReviewPanelProps) {
+export function ReviewPanel({
+  indexedFiles,
+  initialSelectedSource,
+  initialTargetLines,
+  onInitialSourceConsumed,
+}: ReviewPanelProps) {
   const single = useReview();
   const multi  = useMultiReview();
 
@@ -657,16 +666,43 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
   const outputRef = useRef<HTMLDivElement | null>(null);
   const outputEndRef = useRef<HTMLDivElement | null>(null);
 
-  // ── Graph → Review navigation: pre-select the source the user double-clicked
+  // File + span currently shown in the evidence viewer (null = viewer closed).
+  const [evidence, setEvidence] = useState<
+    {
+      source: string;
+      fileName?: string;
+      startLine?: number;
+      endLine?: number;
+      lineRanges?: string;
+    } | null
+  >(null);
+
+  // ── Graph / citation → Review navigation ──────────────────────────────────
+  // Pre-selects the incoming file. When the navigation carried a cited line
+  // span (i.e. the user clicked a citation), also open the evidence viewer at
+  // those lines so the claim can be verified in one click.
   useEffect(() => {
-    if (initialSelectedSource && indexedFiles.some((f) => f.source === initialSelectedSource)) {
-      setSelected(new Set([initialSelectedSource]));
-      setTab("file");
-      onInitialSourceConsumed?.();
-    }
-  // Run once when initialSelectedSource arrives — indexedFiles and callbacks are stable
+    if (!initialSelectedSource) return;
+    const match = indexedFiles.find((f) => f.source === initialSelectedSource);
+    if (!match) return;
+
+    setSelected(new Set([initialSelectedSource]));
+    setTab("file");
+    setEvidence(
+      initialTargetLines
+        ? {
+            source: initialSelectedSource,
+            fileName: match.file_name,
+            startLine: initialTargetLines.start,
+            endLine: initialTargetLines.end,
+            lineRanges: initialTargetLines.ranges,
+          }
+        : null,
+    );
+    onInitialSourceConsumed?.();
+  // Run when a new navigation target arrives — indexedFiles and callbacks are stable
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialSelectedSource]);
+  }, [initialSelectedSource, initialTargetLines]);
 
   // ── Build folder tree ─────────────────────────────────────────────────────
   const tree = useMemo(() => buildTree(indexedFiles), [indexedFiles]);
@@ -723,10 +759,10 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
         return aSummary === bSummary ? 0 : aSummary ? -1 : 1;
       });
       const content = orderedSections.map((s) => `## ${s.fileName}\n\n${s.content}`).join("\n\n---\n\n");
-      triggerDownload(content, "codesage-multi-review.md");
+      triggerDownload(content, "savflux-multi-review.md");
     } else if (single.review) {
       const name = indexedFiles.find((f) => selected.has(f.source))?.file_name ?? pasteName ?? "review";
-      triggerDownload(single.review, `codesage-review-${name}.md`);
+      triggerDownload(single.review, `savflux-review-${name}.md`);
     }
   };
 
@@ -954,8 +990,24 @@ export function ReviewPanel({ indexedFiles, initialSelectedSource, onInitialSour
         {/* ── Right: output ── */}
         <div ref={outputRef} className="flex-1 overflow-y-auto bg-gray-950 flex flex-col">
 
+          {/* Cited evidence — opened by clicking a line-precise chat citation.
+              Rendered above the review output so the span the reader came to
+              verify is the first thing they see. */}
+          {evidence && (
+            <div className="h-80 shrink-0 border-b border-gray-800 p-3">
+              <EvidenceViewer
+                source={evidence.source}
+                fileName={evidence.fileName}
+                startLine={evidence.startLine}
+                endLine={evidence.endLine}
+                lineRanges={evidence.lineRanges}
+                onClose={() => setEvidence(null)}
+              />
+            </div>
+          )}
+
           {/* Empty state */}
-          {!hasOutput && !isActive && !activeError && (
+          {!hasOutput && !isActive && !activeError && !evidence && (
             <div className="flex-1 flex flex-col items-center justify-center text-center p-8 gap-4">
               <div className="w-14 h-14 rounded-2xl bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center">
                 <Zap className="w-7 h-7 text-yellow-400" />

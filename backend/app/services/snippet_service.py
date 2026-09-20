@@ -19,18 +19,13 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
+from app.core.paths import data_file
 
-settings = get_settings()
 _LOCK = threading.Lock()
 
 def _snippet_path() -> Path:
-    p = Path(settings.chroma_persist_directory) / "snippet_vault.json"
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    return p
+    """Resolved lazily so a changed data dir takes effect immediately."""
+    return data_file("snippet_vault.json")
 
 def _load() -> dict[str, Any]:
     path = _snippet_path()

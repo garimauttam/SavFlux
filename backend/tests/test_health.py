@@ -80,3 +80,58 @@ def test_health_returns_503_when_openai_fails(client):
     # Provider-neutral key — was "openai" before the LLM_PROVIDER refactor
     assert "error" in body["checks"]["llm"]
     assert body["checks"]["chromadb"] == "ok"
+
+
+def test_health_covers_every_configured_provider(client):
+    """
+    Regression guard: /health must understand every value LLM_PROVIDER accepts.
+
+    The endpoint previously branched on a provider literal ("openai_compatible")
+    that config.py does not define. Every real provider therefore fell through to
+    the `else` arm, which read settings fields that do not exist — raising
+    AttributeError and returning 500 instead of 200/503. A deployment health
+    check that always 500s means Railway/Render never routes traffic at all.
+
+    This test walks the Literal in Settings so adding a provider without wiring
+    it into /health fails here rather than in production.
+    """
+    import typing
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.core.config import Settings
+
+    providers = typing.get_args(Settings.model_fields["llm_provider"].annotation)
+    assert providers, "llm_provider is expected to be a Literal of provider names"
+
+    mock_openai_client = MagicMock()
+    mock_openai_client.models.list = AsyncMock(return_value=[])
+    mock_chroma_client = MagicMock()
+    mock_chroma_client.heartbeat.return_value = True
+
+    for provider in providers:
+        provider_settings = Settings(
+            llm_provider=provider,
+            openai_api_key="sk-test",
+            deepseek_api_key="sk-test",
+        )
+        mock_ollama_response = MagicMock()
+        mock_ollama_response.raise_for_status.return_value = None
+        mock_httpx = MagicMock()
+        mock_httpx.__aenter__ = AsyncMock(return_value=mock_httpx)
+        mock_httpx.__aexit__ = AsyncMock(return_value=False)
+        mock_httpx.get = AsyncMock(return_value=mock_ollama_response)
+
+        with patch("main.settings", provider_settings), \
+             patch("app.core.config.get_settings", return_value=provider_settings), \
+             patch("openai.AsyncOpenAI", return_value=mock_openai_client), \
+             patch("httpx.AsyncClient", return_value=mock_httpx), \
+             patch("chromadb.PersistentClient", return_value=mock_chroma_client):
+            response = client.get("/health")
+
+        assert response.status_code == 200, (
+            f"provider {provider!r} is not handled by /health: {response.text}"
+        )
+        body = response.json()
+        assert body["checks"]["llm"].startswith("ok"), provider
+        # The label must name the vendor, never leak a raw base URL / API key.
+        assert "://" not in body["checks"]["llm"], provider

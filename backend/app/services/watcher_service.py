@@ -23,10 +23,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
+from app.core.paths import data_file
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 _LOCK = threading.Lock()
 
 _task: asyncio.Task | None = None
@@ -41,12 +40,8 @@ def poll_interval() -> int:
 
 
 def _state_path() -> Path:
-    p = Path(settings.chroma_persist_directory) / "watcher_state.json"
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    return p
+    """Resolved lazily so a changed data dir takes effect immediately."""
+    return data_file("watcher_state.json")
 
 
 def _load_state() -> dict[str, Any]:

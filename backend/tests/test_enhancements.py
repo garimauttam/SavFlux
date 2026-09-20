@@ -55,7 +55,7 @@ def test_compact_chat_history():
     ]
     compacted = compact_chat_history(history, max_turns=4)
     assert "User: How do I start the server?" in compacted
-    assert "CodeSage: Run uvicorn" in compacted
+    assert "SavFlux: Run uvicorn" in compacted
 
 
 def test_local_query_variants_extract_identifiers_and_synonyms():

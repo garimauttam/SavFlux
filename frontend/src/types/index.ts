@@ -10,17 +10,29 @@ export interface Message {
   isStreaming?: boolean;   // true while the answer is being typed out
 }
 
+/** Trust level for a citation, derived from the cross-encoder relevance score.
+ *  "unrated" means reranking was skipped or unavailable — the chunk was never
+ *  judged, which is NOT the same as being judged and found weak. */
+export type TrustLevel = "high" | "medium" | "low" | "unrated";
+
 export interface SourceFile {
   file_name: string;
-  source: string;    // full path on disk
+  source: string;    // stable source id, e.g. "https://github.com/o/r::src/auth.py"
   language: string;  // "py", "js", etc.
   // Trust-ledger enrichment (optional — older __SOURCES__ payloads omit these)
-  trust_level?: "high" | "medium" | "low" | string;
-  trust_score?: number | string;
+  trust_level?: TrustLevel | string;
+  /** Cross-encoder score. null when the chunk was never reranked. */
+  trust_score?: number | string | null;
+  /** 1-indexed inclusive span of the cited evidence in the original file. */
   start_line?: number;
   end_line?: number;
+  /** Exact cited regions as "1-30,88-92" when the evidence is discontinuous
+   *  (e.g. a module chunk covering imports plus scattered constants). */
+  line_ranges?: string;
   symbol_name?: string;
   chunk_index?: number;
+  /** How many retrieved chunks from this file backed the answer. */
+  chunk_count?: number;
   score?: number;
 }
 

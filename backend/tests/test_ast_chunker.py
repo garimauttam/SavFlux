@@ -84,7 +84,7 @@ def test_module_level_code_captured():
 import sys
 
 MAX_SIZE = 100
-DEFAULT_NAME = "codesage"
+DEFAULT_NAME = "savflux"
 
 def process():
     return MAX_SIZE
@@ -179,3 +179,220 @@ def simple():
         assert doc.metadata["source"] == "/repo/test.py"
         assert doc.metadata["file_name"] == "test.py"
         assert doc.metadata["repo_url"] == "https://github.com/test/repo"
+
+
+# ── Line-precise citation spans ───────────────────────────────────────────────
+# Every chunk carries start_line/end_line so the UI can cite "auth.py:42-58"
+# and scroll to the exact evidence. These tests verify the numbers by slicing
+# the ORIGINAL source with them — a span that does not round-trip is useless.
+
+def _slice(source: str, doc) -> str:
+    """Extract the lines a chunk claims to cover from the original source."""
+    lines = source.splitlines()
+    return "\n".join(lines[doc.metadata["start_line"] - 1 : doc.metadata["end_line"]])
+
+
+def test_every_chunk_carries_a_valid_span():
+    source = (
+        "import os\n"
+        "\n"
+        "CONSTANT = 1\n"
+        "\n"
+        "def alpha():\n"
+        "    return 1\n"
+        "\n"
+        "class Beta:\n"
+        "    def gamma(self):\n"
+        "        return 2\n"
+    )
+    docs = chunk_python_file(source=source, **BASE_META)
+    total_lines = len(source.splitlines())
+
+    assert docs
+    for doc in docs:
+        start = doc.metadata["start_line"]
+        end = doc.metadata["end_line"]
+        assert isinstance(start, int) and isinstance(end, int)
+        assert 1 <= start <= end <= total_lines, f"{doc.metadata['symbol_name']} {start}-{end}"
+
+
+def test_span_round_trips_to_the_symbol_it_cites():
+    """Slicing the original file with a chunk's span must yield that symbol."""
+    source = (
+        "import os\n"
+        "\n"
+        "def alpha():\n"
+        "    return 'a'\n"
+        "\n"
+        "def beta():\n"
+        "    return 'b'\n"
+        "\n"
+        "def gamma():\n"
+        "    return 'c'\n"
+    )
+    docs = chunk_python_file(source=source, **BASE_META)
+
+    for name, expected in (("alpha", "'a'"), ("beta", "'b'"), ("gamma", "'c'")):
+        doc = next(d for d in docs if d.metadata["symbol_name"] == name)
+        cited = _slice(source, doc)
+        assert f"def {name}()" in cited, f"{name} span does not cover its own def"
+        assert expected in cited
+        # Critically: the span must not bleed into a neighbouring function.
+        others = {"alpha", "beta", "gamma"} - {name}
+        for other in others:
+            assert f"def {other}()" not in cited, f"{name} span leaks into {other}"
+
+
+def test_decorated_function_span_includes_its_decorators():
+    """A reader citing a route handler expects the @app.get line included."""
+    source = (
+        "import app\n"
+        "\n"
+        "@app.get('/health')\n"
+        "@require_auth\n"
+        "def handler():\n"
+        "    return {}\n"
+    )
+    docs = chunk_python_file(source=source, **BASE_META)
+    doc = next(d for d in docs if d.metadata["symbol_name"] == "handler")
+
+    cited = _slice(source, doc)
+    assert "@app.get('/health')" in cited
+    assert "@require_auth" in cited
+    # And the span must agree with the text actually indexed, or the citation
+    # would point somewhere other than what the LLM was shown.
+    assert cited.strip() == doc.page_content.strip()
+
+
+def test_method_spans_are_rebased_onto_the_original_file():
+    """Methods of an oversized class must cite real file lines, not 1-N."""
+    filler = "\n".join(f"        x{i} = {i}" for i in range(120))
+    source = (
+        "import os\n"
+        "\n"
+        "class Huge:\n"
+        '    """A class too large for a single chunk."""\n'
+        "    def first(self):\n"
+        f"{filler}\n"
+        "        return 'first'\n"
+        "\n"
+        "    def second(self):\n"
+        f"{filler}\n"
+        "        return 'second'\n"
+    )
+    docs = chunk_python_file(source=source, **BASE_META)
+    methods = [d for d in docs if d.metadata.get("symbol_type") == "method"]
+    assert methods, "expected the oversized class to be split by method"
+
+    for doc in methods:
+        name = doc.metadata["symbol_name"].split(".")[-1]
+        cited = _slice(source, doc)
+        assert f"def {name}(self)" in cited, (
+            f"{doc.metadata['symbol_name']} cites lines "
+            f"{doc.metadata['start_line']}-{doc.metadata['end_line']}, "
+            "which do not contain its definition"
+        )
+
+    # `second` starts well past line 1 — proves the rebase actually happened.
+    second = next(d for d in methods if d.metadata["symbol_name"].endswith(".second"))
+    assert second.metadata["start_line"] > 100
+
+
+def test_windowed_function_chunks_have_distinct_spans():
+    """A function split into windows must not have every window cite the same lines."""
+    body = "\n".join(f"    value_{i} = compute({i})" for i in range(400))
+    source = f"def enormous():\n{body}\n    return value_0\n"
+
+    docs = chunk_python_file(source=source, **BASE_META)
+    windows = [d for d in docs if d.metadata["symbol_name"] == "enormous"]
+    assert len(windows) > 1, "expected the oversized function to be window-split"
+
+    spans = [(d.metadata["start_line"], d.metadata["end_line"]) for d in windows]
+    assert len(set(spans)) == len(spans), "windows share identical spans"
+    # Windows advance monotonically through the file.
+    assert spans == sorted(spans)
+    total_lines = len(source.splitlines())
+    for start, end in spans:
+        assert 1 <= start <= end <= total_lines
+
+
+def test_decorator_lines_are_indexed_somewhere():
+    """
+    Regression: decorator lines must appear in the indexed text.
+
+    `node.lineno` points at the `def`, so slicing from it dropped decorators
+    from the symbol chunk. The module-level pass separately treats decorator
+    lines as "inside a definition" and skips them. Together, decorator lines
+    landed in NO chunk and vanished from the index — searching for a route
+    path like "/api/v1/users" returned nothing, and the LLM could not tell a
+    route handler from a plain function.
+    """
+    source = (
+        "import app\n"
+        "\n"
+        '@app.get("/api/v1/users/{user_id}")\n'
+        "def read_user(user_id: int):\n"
+        "    return db.get(user_id)\n"
+        "\n"
+        "@celery.task(name='billing.charge')\n"
+        "class ChargeTask:\n"
+        "    pass\n"
+    )
+    docs = chunk_python_file(source=source, **BASE_META)
+    indexed = "\n".join(d.page_content for d in docs)
+
+    assert "/api/v1/users/{user_id}" in indexed, "route path is not searchable"
+    assert "billing.charge" in indexed, "task name is not searchable"
+    assert "@app.get" in indexed
+    assert "@celery.task" in indexed
+
+
+# ── Discontinuous module spans ────────────────────────────────────────────────
+
+def test_module_chunk_records_exact_ranges_not_just_the_hull():
+    """
+    Module-level code is gathered from scattered regions, so a single span
+    covers the whole file. Highlighting all of it to point at the imports is
+    useless as evidence, so the chunk also carries the precise ranges.
+    """
+    from app.services.ast_chunker import parse_line_ranges
+
+    source = (
+        "import os\n"          # 1
+        "import sys\n"         # 2
+        "\n"                   # 3
+        "def alpha():\n"       # 4
+        "    return 1\n"       # 5
+        "\n"                   # 6
+        "TIMEOUT = 30\n"       # 7
+        "\n"                   # 8
+        "def beta():\n"        # 9
+        "    return 2\n"       # 10
+    )
+    docs = chunk_python_file(source=source, **BASE_META)
+    module = next(d for d in docs if d.metadata["symbol_name"] == "<module>")
+
+    ranges = parse_line_ranges(module.metadata["line_ranges"])
+    covered = {n for start, end in ranges for n in range(start, end + 1)}
+
+    # The imports and the module constant are in; the function bodies are not.
+    assert {1, 2, 7} <= covered
+    assert 5 not in covered, "alpha's body must not be attributed to the module chunk"
+    assert 10 not in covered, "beta's body must not be attributed to the module chunk"
+
+    # The hull still exists for consumers that only understand a single span.
+    assert module.metadata["start_line"] == 1
+    assert module.metadata["end_line"] >= 7
+
+
+def test_line_range_encoding_round_trips():
+    from app.services.ast_chunker import _encode_line_ranges, parse_line_ranges
+
+    assert _encode_line_ranges([]) == ""
+    assert _encode_line_ranges([5]) == "5"
+    assert _encode_line_ranges([1, 2, 3]) == "1-3"
+    assert _encode_line_ranges([1, 2, 3, 8, 9, 20]) == "1-3,8-9,20"
+    assert parse_line_ranges("1-3,8-9,20") == [(1, 3), (8, 9), (20, 20)]
+    # Malformed segments are skipped rather than raising.
+    assert parse_line_ranges("1-3,garbage,7") == [(1, 3), (7, 7)]
+    assert parse_line_ranges("") == []

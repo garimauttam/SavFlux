@@ -16,16 +16,12 @@ import pytest
 
 
 @pytest.fixture()
-def _isolated_storage(tmp_path, monkeypatch):
-    """Point prompt/analytics stores at a temp dir."""
-    import app.services.prompt_service as ps
-    import app.services.analytics_service as ans
+def _isolated_storage(isolated_data_dir, monkeypatch):
+    """Prompt + analytics stores redirected to a tmp dir (see conftest)."""
     import app.services.token_counter as tc
 
-    monkeypatch.setattr(ps.settings, "chroma_persist_directory", str(tmp_path))
-    monkeypatch.setattr(ans.settings, "chroma_persist_directory", str(tmp_path))
     monkeypatch.setattr(tc, "get_totals", lambda: {"total_tokens": 10, "llm_calls": 2})
-    return tmp_path
+    return isolated_data_dir
 
 
 def test_prompt_crud_and_use(_isolated_storage):
@@ -60,12 +56,14 @@ def test_prompt_validation(_isolated_storage):
         create_prompt("x" * 4001)
 
 
-def test_prompt_activity_contract(_isolated_storage, tmp_path):
-    """activity_service reads prompt_library.json directly — keep the schema."""
-    from app.services.prompt_service import create_prompt, record_history
+def test_prompt_activity_contract(_isolated_storage):
+    """activity_service reads the prompt library file — keep the schema stable."""
+    from app.services.prompt_service import create_prompt, record_history, _library_path
     create_prompt("Summarise this diff", kind="review")
     record_history("ad hoc question", kind="chat")
-    data = json.loads((tmp_path / "prompt_library.json").read_text())
+    # Ask the owning service where its file lives rather than rebuilding the
+    # path here — that is the same contract activity_service now relies on.
+    data = json.loads(_library_path().read_text())
     assert set(data.keys()) == {"prompts", "history"}
     assert isinstance(data["prompts"][0]["created_at"], float)
     assert isinstance(data["history"][0]["ts"], float)

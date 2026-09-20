@@ -210,7 +210,34 @@ def _load_and_split(
 
         # Enrich metadata — this is what shows up in the "Sources" panel in the UI
         # Without metadata, you'd get answers but no way to cite where they came from
+        #
+        # start_line/end_line give non-Python files the same line-precise citations
+        # the AST chunker produces for Python. RecursiveCharacterTextSplitter does
+        # not report offsets, so we locate each chunk by scanning forward through
+        # the source. `search_cursor` makes this a single linear pass over the file
+        # rather than a rescan from position 0 per chunk (O(n) not O(n·chunks)), and
+        # it also stops a repeated block — a common `import` line, a duplicated
+        # config stanza — from matching an earlier occurrence and citing the wrong
+        # region of the file.
+        search_cursor = 0
         for i, chunk in enumerate(chunks):
+            start_line: int | None = None
+            end_line: int | None = None
+            if source_text:
+                offset = source_text.find(chunk.page_content, search_cursor)
+                if offset == -1:
+                    # Splitters may strip surrounding whitespace, so an exact match
+                    # can fail. Retry on the stripped form before giving up.
+                    stripped = chunk.page_content.strip()
+                    offset = source_text.find(stripped, search_cursor) if stripped else -1
+                if offset != -1:
+                    start_line = source_text.count("\n", 0, offset) + 1
+                    last_char = min(offset + len(chunk.page_content), len(source_text)) - 1
+                    end_line = max(start_line, source_text.count("\n", 0, last_char) + 1)
+                    # Advance past this chunk, but never past the next chunk's start:
+                    # overlapping windows legitimately revisit earlier characters.
+                    search_cursor = offset + max(1, len(chunk.page_content) - settings.chunk_overlap)
+
             chunk.metadata.update({
                 "source": source_id,            # stable ID for cloned repos
                 "physical_path": str(fpath),    # temporary path, if still available
@@ -220,6 +247,11 @@ def _load_and_split(
                 "chunk_index": i,
                 "content_hash": content_hash,   # for incremental delta re-indexing
             })
+            # Only attach when resolved — ChromaDB rejects None metadata values,
+            # and a missing span is better than a wrong one.
+            if start_line is not None and end_line is not None:
+                chunk.metadata["start_line"] = start_line
+                chunk.metadata["end_line"] = end_line
 
         documents.extend(chunks)
 
@@ -605,18 +637,28 @@ def _get_raw_collection():
     return client.get_or_create_collection(settings.chroma_collection_name)
 
 
-async def get_indexed_repos() -> list[dict]:
+def get_indexed_repos_sync() -> list[dict]:
     """
-    Returns all unique repo URLs currently in the vector store, with chunk counts.
-    Used by the frontend's active-repo selector.
+    Blocking core of :func:`get_indexed_repos`.
+
+    WHY A SEPARATE SYNC ENTRY POINT?
+    Synchronous callers (e.g. activity_service, which is itself invoked from a
+    worker thread) previously reached for `asyncio.run(get_indexed_repos())`.
+    That raises `RuntimeError: asyncio.run() cannot be called from a running
+    event loop` whenever the caller is already inside one — which is always true
+    under uvicorn. The failure was swallowed by a bare `except`, so indexed
+    repositories silently never appeared in the activity feed in production.
+
+    Exposing the blocking implementation lets sync callers use it directly and
+    async callers wrap it in `asyncio.to_thread` — nobody needs a nested loop.
     """
-    collection = await asyncio.to_thread(_get_raw_collection)
+    collection = _get_raw_collection()
     results = collection.get(include=["metadatas"])
     metadatas = results.get("metadatas") or []
 
     repo_counts: dict[str, int] = {}
     for m in metadatas:
-        url = normalize_repo_url(m.get("repo_url", ""))
+        url = normalize_repo_url((m or {}).get("repo_url", ""))
         if url:
             repo_counts[url] = repo_counts.get(url, 0) + 1
 
@@ -624,3 +666,14 @@ async def get_indexed_repos() -> list[dict]:
         {"repo_url": url, "chunk_count": count}
         for url, count in sorted(repo_counts.items())
     ]
+
+
+async def get_indexed_repos() -> list[dict]:
+    """
+    Returns all unique repo URLs currently in the vector store, with chunk counts.
+    Used by the frontend's active-repo selector.
+
+    Runs the blocking ChromaDB read in a worker thread so the event loop stays
+    free to serve other requests.
+    """
+    return await asyncio.to_thread(get_indexed_repos_sync)

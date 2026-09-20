@@ -42,6 +42,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.services.llm_factory import get_chat_llm
 from app.services.review_agent import stream_code_review, stream_fast_code_review
+from app.services.code_analysis import analyze_file
+from app.services.code_analysis.analyzer import render_findings_markdown
+from app.services.code_analysis.models import FileAnalysis
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -296,161 +299,69 @@ def _static_triage(file_info: dict) -> str:
     """
     Full deterministic review — not a placeholder.
 
-    Runs the same structural + security analysis as the LLM tools, formats the
-    results as a structured review with sections and a 1–10 score.
+    Delegates to the AST analyzer in `app.services.code_analysis`, which parses
+    the file rather than matching regexes against raw lines. The previous
+    implementation reported `execute("... WHERE id = ?", (uid,))` as dynamic SQL
+    while missing an f-string injection split across two lines; on a 17-case
+    labelled corpus it scored F1 0.67 against the analyzer's 1.00.
+
+    The output contract is unchanged — same section headings, same score line,
+    same footer sentinel — because the PR-comment renderer and the review UI
+    both parse these sections.
     """
-    content    = file_info.get("content", "")
-    file_name  = file_info.get("file_name", "")
-    language   = file_info.get("language", "")
-    lines      = content.splitlines()
-    total_lines = len(lines)
+    content   = file_info.get("content", "")
+    file_name = file_info.get("file_name", "")
+    language  = file_info.get("language", "")
 
-    def _is_comment(line: str) -> bool:
-        return line.strip().startswith(("#", "//", "*", "/*", "<!--"))
+    analysis = analyze_file(content, file_name, language)
 
-    def _is_placeholder(value: str) -> bool:
-        return bool(re.search(
-            r"(?i)(placeholder|dummy|example|sample|your[-_ ]|ci-placeholder|sk-ci"
-            r"|os\.getenv|getenv|settings\.|import\.meta\.env)",
-            value,
-        ))
+    security_findings = [f for f in analysis.sorted_findings() if f.cwe]
+    quality_findings  = [f for f in analysis.sorted_findings() if not f.cwe]
 
-    def _hits(pattern: str) -> list[tuple[int, str]]:
-        compiled = re.compile(pattern, re.IGNORECASE)
-        return [
-            (i, line.rstrip())
-            for i, line in enumerate(lines, 1)
-            if not _is_comment(line) and compiled.search(line)
-        ]
-
-    # ── Structure ──────────────────────────────────────────────────────────────
-    DEF_PATS = [
-        r"^\s*(async\s+def|def|class)\s+\w",
-        r"^\s*(export\s+)?(async\s+)?function\s+\w",
-        r"^\s*(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s*)?\(",
-        r"^\s*(export\s+)?(default\s+)?class\s+\w",
-        r"^\s*func\s+(\(\w+\s+\*?\w+\)\s+)?\w+\s*\(",
-        r"^\s*(public|private|protected|static|override|abstract).*\s+\w+\s*\(",
-        r"^\s*(pub(\(.*\))?\s+)?(async\s+)?fn\s+\w",
-    ]
-    def_compiled = [re.compile(p) for p in DEF_PATS]
-    definitions  = [
-        f"  L{i}: {line.strip()[:80]}"
-        for i, line in enumerate(lines, 1)
-        if any(p.search(line) for p in def_compiled)
-    ]
-
-    # ── Complexity ─────────────────────────────────────────────────────────────
-    # bare_excepts and nested_loops are Python-only metrics (indentation-based).
-    # For brace-delimited languages (JS, Go, Java, Rust) these counters are
-    # meaningless — they always produce 0 regardless of actual nesting depth.
-    is_python = language in ("py", "python", "")
-    bare_excepts  = sum(1 for l in lines if l.strip() == "except:") if is_python else 0
-    long_lines    = sum(1 for l in lines if len(l) > 120)
-    todos         = sum(1 for l in lines if re.search(r"\b(TODO|FIXME|HACK)\b", l, re.I))
-    magic_numbers = sum(1 for l in lines if re.search(r"(?<![=\w])\b[0-9]{2,}\b(?!\s*[=\w])", l.strip()))
-    nested_loops  = 0
-    if is_python:
-        loop_stack: list[int] = []
-        for line in lines:
-            if not line.strip():
-                continue
-            indent  = len(line) - len(line.lstrip())
-            stripped = line.strip()
-            while loop_stack and indent <= loop_stack[-1]:
-                loop_stack.pop()
-            if re.match(r"^(for|while)\b", stripped):
-                if loop_stack:
-                    nested_loops += 1
-                loop_stack.append(indent)
-
-    # ── Security ───────────────────────────────────────────────────────────────
-    security: list[str] = []
-    secret_hits = [
-        (i, line) for i, line in _hits(
-            r"(?i)\b(api[_-]?key|password|secret|token)\b\s*[:=]\s*['\"]?([^'\"\s,}]+)"
+    def _render(findings: list, empty_message: str) -> str:
+        if not findings:
+            return f"- ✅ {empty_message}"
+        scoped = FileAnalysis(
+            file_name=analysis.file_name,
+            language=analysis.language,
+            total_lines=analysis.total_lines,
+            findings=findings,
         )
-        if (m := re.search(
-            r"(?i)\b(api[_-]?key|password|secret|token)\b\s*[:=]\s*['\"]?([^'\"\s,}]+)", line
-        )) and not _is_placeholder(m.group(2))
-    ]
-    if secret_hits:
-        lnos = ", ".join(str(i) for i, _ in secret_hits[:6])
-        security.append(f"🔑 **Hardcoded credential** at line(s) {lnos} — move to env vars.")
-    shell_hits = _hits(
-        r"(?i)\b(os\.system|child_process\.exec)\s*\(|subprocess\.(run|call|popen)\s*\([^)]*shell\s*=\s*True"
-    )
-    if shell_hits:
-        lnos = ", ".join(str(i) for i, _ in shell_hits[:6])
-        security.append(f"💉 **Shell injection risk** at line(s) {lnos} — use shell=False + arg list.")
-    sql_hits = _hits(
-        r"(?i)(\b(execute|executemany)\s*\(\s*f?['\"].*?\b(select|insert|update|delete)\b"
-        r"|(f['\"]|['\"])[^'\"]*\b(select|insert|update|delete)\b[^'\"]*['\"]\s*([\+%]|\.format\s*\())"
-    )
-    if sql_hits:
-        lnos = ", ".join(str(i) for i, _ in sql_hits[:6])
-        security.append(f"🗄️ **Dynamic SQL** at line(s) {lnos} — use parameterised queries.")
-    eval_hits = _hits(r"\beval\s*\(|\bexec\s*\(")
-    if eval_hits:
-        lnos = ", ".join(str(i) for i, _ in eval_hits[:6])
-        security.append(f"⚠️ **eval()/exec()** at line(s) {lnos} — code injection risk.")
-    xss_hits = _hits(r"dangerouslySetInnerHTML")
-    if xss_hits:
-        lnos = ", ".join(str(i) for i, _ in xss_hits[:4])
-        security.append(f"🌐 **dangerouslySetInnerHTML** at line(s) {lnos} — sanitise first.")
+        return render_findings_markdown(scoped, max_findings=10)
 
-    # ── Quality ────────────────────────────────────────────────────────────────
-    quality: list[str] = []
-    if bare_excepts:
-        quality.append(f"🪤 **Bare `except:`** ({bare_excepts}×) — catch specific types.")
-    if nested_loops:
-        quality.append(f"🔄 **Nested loops** ({nested_loops}×) — extract inner logic.")
-    if long_lines:
-        quality.append(f"📏 **Lines >120 chars** ({long_lines}) — wrap or extract variables.")
-    if todos:
-        quality.append(f"📌 **TODO/FIXME/HACK** ({todos}) — track in issue tracker.")
-    if magic_numbers:
-        quality.append(f"🔢 **Magic numbers** (~{magic_numbers}) — use named constants.")
-    async_hits = _hits(r"\bawait\b")
-    try_hits   = _hits(r"^\s*try\s*[:{]")
-    if len(async_hits) > 3 and not try_hits:
-        quality.append("🛡️ **No try/except around async calls** — can crash the caller.")
+    # Structure: the analyzer already located every definition with its real
+    # extent, so this no longer depends on per-language regex guesswork.
+    if analysis.functions:
+        ranked = sorted(analysis.functions, key=lambda f: (-f.complexity, f.line))[:20]
+        def_lines = [
+            f"  L{fn.line}: {fn.name}  ({fn.length} lines, complexity {fn.complexity})"
+            for fn in ranked
+        ]
+        if len(analysis.functions) > 20:
+            def_lines.append(f"  … and {len(analysis.functions) - 20} more")
+        def_block = "\n".join(def_lines)
+    else:
+        def_block = "  No definitions found."
 
-    # ── Score ──────────────────────────────────────────────────────────────────
-    penalty   = len(security) * 2 + len(quality)
-    raw_score = max(1, min(10, 10 - penalty))
+    score = analysis.risk_score()
     score_note = (
-        "(small file — limited signal)" if total_lines < 30
-        else "(large file — complexity risk higher)" if total_lines > 600
+        "(small file — limited signal)" if analysis.total_lines < 30
+        else "(large file — complexity risk higher)" if analysis.total_lines > 600
         else ""
     )
-
-    # ── Assemble ───────────────────────────────────────────────────────────────
-    def_block = (
-        "\n".join(definitions[:20])
-        + (f"\n  … and {len(definitions) - 20} more" if len(definitions) > 20 else "")
-        if definitions else "  No definitions found."
-    )
-    sec_block = (
-        "\n".join(f"- {s}" for s in security)
-        if security else "- ✅ No high-signal security patterns."
-    )
-    qual_block = (
-        "\n".join(f"- {q}" for q in quality)
-        if quality else "- ✅ No significant quality issues."
-    )
+    parse_note = f"\n\n> ⚠️ Parse failed ({analysis.parse_error}) — fell back to pattern scanning." if analysis.parse_error else ""
 
     return (
         f"## 📁 File Overview\n"
-        f"`{file_name}` · {language.upper() or 'unknown'} · {total_lines} lines\n\n"
+        f"`{file_name}` · {(analysis.language or 'unknown').upper()} · {analysis.total_lines} lines "
+        f"({analysis.code_lines} code, {analysis.comment_lines} comment)\n\n"
         f"### Structure\n{def_block}\n\n"
         f"### Complexity\n"
-        f"  {total_lines} lines | {len(definitions)} definitions | "
-        f"nested loops: {nested_loops} | bare excepts: {bare_excepts} | "
-        f"long lines: {long_lines} | TODOs: {todos}\n\n"
-        f"## 🔒 Security\n{sec_block}\n\n"
-        f"## ⚠️ Code Quality\n{qual_block}\n\n"
-        f"## 📊 Score\n**{raw_score}/10** {score_note}\n\n"
+        f"  {len(analysis.functions)} definitions | max complexity: {analysis.max_complexity} "
+        f"| avg: {analysis.avg_complexity:.1f}\n\n"
+        f"## 🔒 Security\n{_render(security_findings, 'No security issues found by static analysis.')}\n\n"
+        f"## ⚠️ Code Quality\n{_render(quality_findings, 'No significant quality issues.')}\n\n"
+        f"## 📊 Score\n**{score}/10** {score_note}{parse_note}\n\n"
         f"> ℹ️ Static analysis (outside LLM review budget for this batch). "
         f"Increase `REVIEW_MAX_FULL_FILES` in your `.env` to include this file in LLM review."
     )
@@ -763,7 +674,7 @@ async def stream_multi_review(
                 "- 📊 Coverage note (how many files had full LLM review vs static analysis)"
             )
             summary_system = (
-                "You are CodeSage. You have reviewed multiple files in a repository "
+                "You are SavFlux. You have reviewed multiple files in a repository "
                 "with full cross-file dependency context. Write a concise overall "
                 "health assessment based on the per-file findings. "
                 "If some files only had static analysis, note this honestly in the Coverage section."
@@ -804,7 +715,7 @@ async def stream_multi_review(
                     agg_msgs = [
                         SystemMessage(
                             content=(
-                                "You are CodeSage aggregating multiple draft repo health assessments. "
+                                "You are SavFlux aggregating multiple draft repo health assessments. "
                                 "Synthesise them into a single, best-of-all final assessment. "
                                 "Resolve contradictions by taking the more conservative/security-conscious view. "
                                 "Do not say 'draft 1 said' — just write the final answer directly."

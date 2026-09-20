@@ -19,21 +19,16 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
+from app.core.paths import data_file
 
-settings = get_settings()
 _LOCK = threading.Lock()
 
 ALLOWED_KINDS = {"ingest", "review", "write", "chat", "system", "health", "watcher", "bulk", "prompt", "snippet", "activity", "file_tree", "diff", "explorer", "general"}
 ALLOWED_LEVELS = {"info", "success", "warning", "error"}
 
 def _notif_path() -> Path:
-    p = Path(settings.chroma_persist_directory) / "notifications.json"
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    return p
+    """Resolved lazily so a changed data dir takes effect immediately."""
+    return data_file("notifications.json")
 
 def _load() -> dict[str, Any]:
     path = _notif_path()

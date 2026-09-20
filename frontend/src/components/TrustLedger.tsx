@@ -12,6 +12,7 @@ import {
   ArrowUpRight, AlertTriangle,
 } from "lucide-react";
 import { SourceFile } from "../types";
+import { openFileAt } from "../lib/openFile";
 import { apiFetch } from "../api";
 
 interface TrustLedgerDrawerProps {
@@ -21,27 +22,42 @@ interface TrustLedgerDrawerProps {
   onOpenInReview?: (source: string) => void;
 }
 
-function explainTrust(src: SourceFile): { label: string; detail: string; level: "high" | "medium" | "low" } {
-  const level = (src.trust_level === "high" || src.trust_level === "medium") ? src.trust_level : "low";
-  if (level === "high") {
-    return {
-      level,
-      label: "High trust",
-      detail: "Top-ranked retrieval hit with strong lexical + semantic agreement. Safe to quote.",
-    };
+type TrustView = { label: string; detail: string; level: "high" | "medium" | "low" | "unrated" };
+
+function explainTrust(src: SourceFile): TrustView {
+  switch (src.trust_level) {
+    case "high":
+      return {
+        level: "high",
+        label: "High trust",
+        detail:
+          "The cross-encoder scored this chunk strongly against your question. Safe to quote.",
+      };
+    case "medium":
+      return {
+        level: "medium",
+        label: "Medium trust",
+        detail:
+          "Relevant, but the cross-encoder was less confident. Skim the cited lines before relying on it.",
+      };
+    case "low":
+      return {
+        level: "low",
+        label: "Low trust",
+        detail:
+          "The cross-encoder scored this chunk weakly. Treat it as a lead, not evidence — verify in Review.",
+      };
+    default:
+      // "unrated": reranking was skipped (too few candidates) or unavailable.
+      // Distinct from "low" — the chunk was never judged, so claiming it scored
+      // poorly would misrepresent what the pipeline actually did.
+      return {
+        level: "unrated",
+        label: "Not scored",
+        detail:
+          "Retrieved, but not scored by the cross-encoder — reranking was skipped for this query. Verify the cited lines yourself.",
+      };
   }
-  if (level === "medium") {
-    return {
-      level,
-      label: "Medium trust",
-      detail: "Relevant match but weaker ranking consensus. Skim the preview before relying on it.",
-    };
-  }
-  return {
-    level,
-    label: "Low trust",
-    detail: "Fallback or weakly-ranked source. Treat as a lead, not evidence — verify in Review.",
-  };
 }
 
 export function TrustLedgerDrawer({ source, onClose, activeRepoUrl, onOpenInReview }: TrustLedgerDrawerProps) {
@@ -85,7 +101,11 @@ export function TrustLedgerDrawer({ source, onClose, activeRepoUrl, onOpenInRevi
   }, [source]);
 
   const Icon = trust.level === "high" ? ShieldCheck : trust.level === "medium" ? ShieldAlert : Shield;
-  const iconColor = trust.level === "high" ? "text-emerald-400" : trust.level === "medium" ? "text-amber-400" : "text-gray-500";
+  const iconColor =
+    trust.level === "high" ? "text-emerald-400"
+    : trust.level === "medium" ? "text-amber-400"
+    : trust.level === "unrated" ? "text-sky-300/70"
+    : "text-gray-500";
 
   return (
     <div className="mt-2 overflow-hidden rounded-xl border border-purple-500/30 bg-gray-900">
@@ -107,7 +127,16 @@ export function TrustLedgerDrawer({ source, onClose, activeRepoUrl, onOpenInRevi
         <div className="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-gray-500">
           <span>lang: <span className="text-gray-300">{source.language || "?"}</span></span>
           {source.symbol_name && <span>symbol: <span className="text-gray-300">{source.symbol_name}</span></span>}
-          {source.trust_score !== undefined && <span>score: <span className="text-gray-300">{String(source.trust_score)}</span></span>}
+          {/* A null score means "never reranked" — say so rather than printing "null". */}
+          <span>
+            score:{" "}
+            <span className="text-gray-300">
+              {typeof source.trust_score === "number" ? source.trust_score : "not scored"}
+            </span>
+          </span>
+          {typeof source.chunk_count === "number" && source.chunk_count > 1 && (
+            <span>chunks: <span className="text-gray-300">{source.chunk_count}</span></span>
+          )}
           {activeRepoUrl && <span className="truncate">repo: <span className="text-gray-300">{activeRepoUrl}</span></span>}
         </div>
 
@@ -127,14 +156,25 @@ export function TrustLedgerDrawer({ source, onClose, activeRepoUrl, onOpenInRevi
           </pre>
         )}
 
-        {onOpenInReview && (
-          <button
-            onClick={() => onOpenInReview(source.source)}
-            className="flex items-center gap-1.5 rounded-lg border border-purple-500/40 bg-purple-500/10 px-3 py-1.5 text-xs text-purple-200 hover:bg-purple-500/20"
-          >
-            <ArrowUpRight className="w-3.5 h-3.5" /> Open in Code Review
-          </button>
-        )}
+        <button
+          onClick={() => {
+            // Carry the cited span so Review lands on the evidence itself,
+            // not on line 1 of a 700-line file.
+            openFileAt({
+              source: source.source,
+              startLine: source.start_line,
+              endLine: source.end_line,
+              lineRanges: source.line_ranges,
+            });
+            onOpenInReview?.(source.source);
+          }}
+          className="flex items-center gap-1.5 rounded-lg border border-purple-500/40 bg-purple-500/10 px-3 py-1.5 text-xs text-purple-200 hover:bg-purple-500/20"
+        >
+          <ArrowUpRight className="w-3.5 h-3.5" />
+          {typeof source.start_line === "number"
+            ? `Open at line ${source.start_line} in Review`
+            : "Open in Code Review"}
+        </button>
       </div>
     </div>
   );

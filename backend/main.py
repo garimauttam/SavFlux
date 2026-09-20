@@ -153,7 +153,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="CodeSage API",
+    title="SavFlux API",
     description="RAG-powered codebase Q&A and code review assistant",
     version="1.0.0",
     lifespan=lifespan,          # pass the lifespan context manager here
@@ -248,12 +248,19 @@ async def health_check():
     Railway uses this to decide whether to route traffic to the instance.
     Returns 503 if any check fails — so a misconfigured deploy is caught immediately.
     """
-    from app.services.llm_factory import get_hosted_display_name, get_provider_name
+    from app.services.llm_factory import (
+        get_hosted_client_kwargs,
+        get_hosted_display_name,
+        get_hosted_model_name,
+        get_provider_name,
+    )
     checks: dict[str, str] = {}
     overall_ok = True
 
     # ── Check 1: LLM provider ─────────────────────────────────────────────────
-    # Supported providers: "ollama" | "openai_compatible"  (see config.py Literal)
+    # Supported providers: "ollama" | "deepseek" | "openai"  (see config.py Literal).
+    # Ollama is probed over its native /api/tags route; every hosted provider
+    # speaks the OpenAI HTTP API, so one openai.AsyncOpenAI probe covers them all.
     if settings.llm_provider == "ollama":
         try:
             import httpx
@@ -267,26 +274,22 @@ async def health_check():
         except Exception as e:
             checks["llm"] = f"error: {str(e)[:120]}"
             overall_ok = False
-    elif settings.llm_provider == "openai_compatible":
-        # Generic OpenAI-style endpoint: Groq, OpenRouter, DeepSeek, Together,
-        # HuggingFace, GitHub Models, LM Studio, vLLM... The transport client is
-        # openai.AsyncOpenAI because they all speak the OpenAI HTTP API.
-        try:
-            import openai
-            client = openai.AsyncOpenAI(
-                api_key=settings.compat_api_key,
-                base_url=settings.compat_base_url,
-            )
-            await client.models.list()
-            checks["llm"] = (
-                f"ok ({get_hosted_display_name()} — {settings.compat_chat_model})"
-            )
-        except Exception as e:
-            checks["llm"] = f"error: {str(e)[:120]}"
-            overall_ok = False
     else:
-        checks["llm"] = f"error: unknown LLM_PROVIDER={settings.llm_provider!r}"
-        overall_ok = False
+        hosted_kwargs = get_hosted_client_kwargs()
+        if hosted_kwargs is None:
+            checks["llm"] = f"error: unknown LLM_PROVIDER={settings.llm_provider!r}"
+            overall_ok = False
+        else:
+            try:
+                import openai
+                client = openai.AsyncOpenAI(**hosted_kwargs)
+                await client.models.list()
+                checks["llm"] = (
+                    f"ok ({get_hosted_display_name()} — {get_hosted_model_name()})"
+                )
+            except Exception as e:
+                checks["llm"] = f"error: {str(e)[:120]}"
+                overall_ok = False
 
     # ── Check 2: ChromaDB ─────────────────────────────────────────────────────
     try:
@@ -307,7 +310,7 @@ async def health_check():
         status_code=status_code,
         content={
             "status": "ok" if overall_ok else "degraded",
-            "service": "CodeSage API",
+            "service": "SavFlux API",
             "provider": get_provider_name(),
             "checks": checks,
         },
