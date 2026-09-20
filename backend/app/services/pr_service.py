@@ -66,19 +66,30 @@ def validate_branches(head: str, base: str) -> tuple[str, str]:
 
 async def create_pr_via_api(repo_slug: str, head: str, base: str,
                             title: str, body: str = "") -> dict:
-    """Create a PR through api.github.com. Raises RuntimeError on failure."""
+    """
+    Create a PR through api.github.com. Raises RuntimeError on failure.
+
+    Every failure — HTTP status, DNS, TLS, timeout — surfaces as RuntimeError, so
+    callers have exactly one thing to handle and can fall back to the `gh` command.
+    A transport error used to escape as an unhandled httpx exception and turn the
+    endpoint into a 500 with an empty body: the one moment the manual plan is most
+    useful was the one moment it was unavailable.
+    """
     import httpx
     token = os.getenv("GITHUB_TOKEN", "").strip()
     if not token:
         raise RuntimeError("GITHUB_TOKEN is not configured")
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
-            f"{_API}/repos/{repo_slug}/pulls",
-            headers={"Authorization": f"Bearer {token}",
-                     "Accept": "application/vnd.github+json",
-                     "X-GitHub-Api-Version": "2022-11-28"},
-            json={"title": title, "head": head, "base": base, "body": body or ""},
-        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{_API}/repos/{repo_slug}/pulls",
+                headers={"Authorization": f"Bearer {token}",
+                         "Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28"},
+                json={"title": title, "head": head, "base": base, "body": body or ""},
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"could not reach api.github.com ({exc.__class__.__name__}: {exc})") from exc
     if resp.status_code not in (200, 201):
         try:
             detail = resp.json().get("message", resp.text[:200])

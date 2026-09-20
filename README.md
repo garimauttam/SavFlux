@@ -141,6 +141,42 @@ POST /api/v1/review/autofix   { "path": "net.py" }
 
 That diff applies with `git apply`. Verified in CI against a real scratch repo,
 not by string comparison.
+
+The review cache is inspectable state, so it has endpoints rather than being a
+directory you have to find:
+
+```bash
+GET    /api/v1/review/cache   # { "entries": 7, "hit_rate": 0.67, ... }
+DELETE /api/v1/review/cache   # { "removed": 7 } — force the next review to be cold
+```
+
+A review usually covers a dozen files, so the same gates run over a set in one
+request — one patch, one digest, one thing to confirm:
+
+```bash
+POST /api/v1/review/autofix-set   { "files": [{ "path": "net.py", "source": "…::net.py" }] }
+```
+
+The gate is inspectable too, and it answers questions without attempting
+anything:
+
+```bash
+GET  /api/v1/policy              # thresholds, signal weights, ledger size
+POST /api/v1/policy/assess       # score a diff or a set of files, get the token
+POST /api/v1/policy/verify       # did this patch apply? (three states, not two)
+GET  /api/v1/policy/ledger       # every decision: score, signals, reason, actor
+```
+
+**Nothing reaches GitHub without a confirmation.** `POST /review/create-pr`
+refuses to push when the caller does not echo back the digest of the exact diff
+it displayed — a stale preview or a swapped diff fails the check instead of
+being pushed. Without a `GITHUB_TOKEN` the same endpoint answers with the
+`gh pr create` command and the patch, so the whole path works at $0.
+
+The review panel and the agent both use it: review → *Find safe fixes* → read the
+diff → *Create PR…*. The agent's `create_pr` tool is a plan by default and only
+acts on a confirmed digest, so a model decision alone can never open a pull
+request.
 </details>
 
 ---
@@ -352,13 +388,96 @@ changing the *embedding* provider requires one.
 
 ```env
 REVIEW_MODE=fast          # fast | agentic
-REVIEW_MAX_FULL_FILES=8   # files getting a full LLM pass
-REVIEW_CONCURRENCY=2      # parallel LLM reviews
+REVIEW_LLM_BUDGET=12      # single-file model reviews per run
+REVIEW_CONCURRENCY=2      # parallel model calls
+REVIEW_CACHE_ENABLED=true # reuse a review when the file's content is unchanged
+RISK_GATE_ENABLED=true    # score every push and gate it on that score
+RISK_APPROVAL_THRESHOLD=6 # 0-10, higher = riskier
+RISK_BLOCK_THRESHOLD=10   # 0-10, refused outright at or above this
 ```
-`fast` runs deterministic analysis plus one model call per prioritised file.
-Files beyond the budget still get full AST analysis — static triage here is a
-real review, not a placeholder. Use `agentic` for the deeper multi-turn tool
-loop when you can accept the latency.
+
+`fast` plans the batch before it starts: the parser decides every file it can
+(AST + taint + complexity), the files that carry security shape or proven
+findings get a model call each up to `REVIEW_LLM_BUDGET`, and everything
+remaining is reviewed in batches of four per call. Files beyond any budget still
+get full AST analysis — static triage here is a real review, not a placeholder.
+
+Reviews are cached against the file's content hash, so re-reviewing an unchanged
+repo makes no model calls at all; a hit says so, and names the digest it matched.
+`GET /api/v1/review/cache` reports the cache's size and hit rate. If the provider
+stops answering, a circuit opens and the rest of the run is served by the
+analyzer instead of paying a connection timeout per file — the run says so
+rather than pretending. Use `agentic` for the deeper multi-turn tool loop when
+you can accept the latency.
+
+Measured on this repo (72 Python files, 602 KB):
+
+| | model calls | wall clock |
+|---|---|---|
+| every file to the model | 72 | ~65 s |
+| planned + batched | 26 | ~24 s |
+| planned + batched, unchanged repo | 0 | ~0.4 s |
+
+Static analysis of all 72 files takes about 0.4 s (≈5 ms/file); the model phase
+is what costs, so the pipeline's job is to spend it only where a model adds
+something. The "before" row is every file reviewed individually at the measured
+2.7 s per call, three at a time.
+</details>
+
+<details>
+<summary><b>Risk policy gate</b></summary>
+
+Every change SavFlux is asked to push is scored 0–10 — higher is riskier — and the
+score decides what happens to it. `POST /api/v1/policy/assess` returns the score,
+the signals that produced it, and the token to approve it; `POST
+/review/create-pr` runs the same assessment before it pushes anything.
+
+What the score is made of:
+
+| signal | points | fires when |
+|---|---|---|
+| `deterministic_findings` | 4 per critical, 2 per high (cap 5) | the change **introduces** a finding a rule proves |
+| `verification_failed` | 3 | the verifier ran and the patch did not apply |
+| `diff_security_flag` | 2 | added lines disable TLS, weaken a hash, hardcode a secret |
+| `sensitive_path` | 2 | the change touches auth, crypto, CI, env, or lockfiles |
+| `dependency_surface` | 2 | it adds or upgrades a dependency |
+| `not_verified` | 2 | nobody has checked it yet — proposed, not proved |
+| `unparsable_change` | 2 | the result is not valid syntax |
+| blast radius | 1–3 | ≥1 / ≥3 / ≥10 files depend on what changed |
+| `change_breadth` | 1 | more than 10 files or 400 lines |
+| `stale_index` | 1 | the index predates the repo's head |
+
+Findings are counted as a **delta**: a patch on a file that already had a
+hardcoded credential does not get charged for it again, and the pre-existing
+finding is reported in the signal's detail instead. On a change that adds an
+auth module with a hardcoded salt, a disabled-TLS call, and an `md5` digest, the
+score lands at 7 — high.
+
+The gate has three answers, and one of them is not the score's to make:
+
+- **allowed** — below the approval threshold, pushed as before.
+- **approval required** — the response carries an `approval_token` bound to the
+  change digest *and* the assessment digest, so any re-score invalidates it, plus
+  a written reason of at least eight characters. Both go back on the retry.
+- **blocked** — reserved for a change that is dangerous on every axis at once.
+
+Separately: **a patch the verifier proves does not apply is never pushed**, even
+with a perfect token. That is an integrity rule, not a risk judgement — SavFlux
+declines to push a change that does not do what it says it does, and hands back
+the `gh` command.
+
+The verifier is a real `git apply` in a throwaway repo, and it answers in three
+states rather than two: applied (`verified: true`), rejected (`false` — the
+integrity rule above), or *cannot tell* (`null` — no git on the machine, or no
+current content to patch against). "We could not check" is never reported as
+"checked and fine"; the third state costs 2 points and says so in words. Where
+the patch does apply, the resulting files are parsed for the risk score — the
+same evidence standard the review itself is held to, rather than pattern-matching
+the diff text.
+
+Every decision is recorded in a ledger (`GET /api/v1/policy/ledger`) holding
+digests, scores, signals and reasons — never the diff — so "why did this go out?"
+has an answer as well as "why was it refused?".
 </details>
 
 <details>
@@ -426,6 +545,28 @@ reads a one-line security diff instead of a reformatted function.
 </details>
 
 <details>
+<summary><b>The deterministic agent and its tools</b></summary>
+
+`POST /agent/run` plans from the goal, then executes local tools — no model call,
+so the same goal against the same index produces the same report bytes.
+
+| Tool | What it does |
+|---|---|
+| `retrieve_context` | hybrid search (the retrieval half of the chat pipeline) |
+| `read_file` | full file, from disk or reconstructed from the index |
+| `dependency_graph` | import graph — nodes, edges, hubs |
+| `blast_radius` | transitive dependents of a file |
+| `autofix` | verified repairs, one file |
+| `build_patch` | one git-applicable diff + digest + PR body |
+| `create_pr` | PR plan; pushes only on a confirmed digest |
+
+The goal decides how far a run may go: asking to *understand* code gets the four
+read-only tools, asking to *fix* adds `autofix` and `build_patch`, and only
+asking for a *pull request* adds `create_pr`. `GET /agent/tools` returns the
+catalogue with typed argument schemas and a `mutating` flag.
+</details>
+
+<details>
 <summary><b>Streaming protocol</b></summary>
 
 SSE with inline markers, so the UI can render structure while tokens arrive:
@@ -444,20 +585,20 @@ SSE with inline markers, so the UI can render structure while tokens arrive:
 
 ```
 backend/
-  app/api/            23 routers · 72 endpoints
-  app/services/       33 services
+  app/api/            23 routers · 80 endpoints
+  app/services/       38 services
     code_analysis/    ← AST engine, autofix, models
     citation_service.py
     patch_service.py
     retrieval_service.py · hybrid_retriever.py · reranker.py
-  tests/              32 files · 316 tests
+  tests/              36 test modules · 472 tests
 frontend/src/
-  components/         31 React components
+  components/         34 React components
   lib/openFile.ts     ← typed navigation contract
 eval_rag.py           45-query retrieval benchmark (runs in CI)
 scripts/              reproducible benchmarks
 ```
-~13k lines of Python in `app/`.
+~14.6k lines of Python in `app/`.
 </details>
 
 ---
@@ -465,7 +606,7 @@ scripts/              reproducible benchmarks
 ## 🧪 Testing
 
 ```bash
-cd backend && pytest -q                 # 316 tests, ~4.5s
+cd backend && pytest -q                 # 472 tests, ~4s
 cd frontend && npx tsc --noEmit         # type check
 python3 scripts/bench_security.py       # reproduce the F1 table
 ```
@@ -498,19 +639,25 @@ positives.
 - [x] AST + dataflow security analysis (F1 0.67 → 1.00)
 - [x] Verified deterministic autofix
 - [x] Git-applicable patch generation + PR creation
+- [x] Apply-fix + one-click PR in the review panel and the agent, behind a
+      digest-bound confirmation gate
 - [x] Hybrid retrieval: BM25 + dense + RRF + cross-encoder
 - [x] OSV CVE scanning (no API key)
 - [x] RAG benchmark gating CI
 - [x] GitHub Action PR review
+- [x] Planned review: parser-settled files skip the model, the rest batch four
+      files per call
+- [x] Content-hash review cache + provider circuit (unchanged repos make zero
+      model calls)
+- [x] Risk policy gates: a 0–10 score per change, approval tokens bound to the
+      assessment, and an integrity rule that never pushes an unverified patch
 
 **Next**
 
-- [ ] **Apply-patch button** in the review panel (backend is done)
 - [ ] **VS Code extension** — thin client over `POST /chat/stream`
 - [ ] **Incremental indexing** — `watcher_service.poll_once()` exists; needs delta ingest
 - [ ] **Symbol graph** for jump-to-definition
 - [ ] **Autofix for JS/TS** — currently Python only
-- [ ] **Policy gates** — block writes above a risk threshold without a second approval
 - [ ] **Cross-session memory** — history compacts to 6 turns today
 - [ ] **Eval dashboard** charting `GET /metrics`
 - [ ] **GitHub OAuth** onboarding instead of a manual PAT

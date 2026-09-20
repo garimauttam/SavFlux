@@ -111,6 +111,20 @@ class PatchResult:
         }
 
 
+def digest_of(diff: str) -> str:
+    """
+    Short, stable fingerprint of a diff.
+
+    This is the token a caller echoes back to confirm that a specific change set
+    is what they reviewed. It is a property of the content, so a diff that
+    changed after the preview produces a different digest and the confirmation
+    no longer applies — which is the whole point. Both `build_patch` and the
+    confirmation checks in `review.py` / `agent_tools.py` go through here, so the
+    two sides can never disagree about what was approved.
+    """
+    return hashlib.sha256((diff or "").encode("utf-8")).hexdigest()[:16]
+
+
 def normalise_path(path: str) -> str:
     """
     Validate a repository-relative path.
@@ -297,7 +311,7 @@ def build_patch(changes: list[FileChange], context: int = DEFAULT_CONTEXT) -> Pa
         additions=additions,
         deletions=deletions,
         file_summaries=summaries,
-        digest=hashlib.sha256(diff.encode("utf-8")).hexdigest()[:16],
+        digest=digest_of(diff),
     )
 
 

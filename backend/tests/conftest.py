@@ -14,7 +14,7 @@ We mock out external dependencies (OpenAI, ChromaDB) so tests:
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 
@@ -42,10 +42,39 @@ def isolated_data_dir(tmp_path, monkeypatch):
     """
     import app.core.paths as paths
 
+    # The review cache keeps its parsed document in memory between calls, so a
+    # test that relocates the data directory must also drop that copy — otherwise
+    # a previous test's review would be served as this test's result.
+    try:
+        from app.services import review_cache
+
+        review_cache.reset()
+    except Exception:  # noqa: BLE001 - the cache is optional for unrelated tests
+        pass
+
     target = tmp_path / "data"
     target.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(paths, "data_dir", lambda: target)
     return target
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_circuit():
+    """
+    Close the provider circuit before each test.
+
+    The circuit is process-wide on purpose (one broken provider is the same
+    provider for the next request), so a test that makes it trip would otherwise
+    silently disable model calls for every test that ran afterwards — passing for
+    the wrong reason.
+    """
+    try:
+        from app.services.multi_review_agent import _PROVIDER_CIRCUIT
+
+        _PROVIDER_CIRCUIT.record_success()
+    except Exception:  # noqa: BLE001 - unrelated tests do not need this
+        pass
+    yield
 
 
 @pytest.fixture(scope="session")

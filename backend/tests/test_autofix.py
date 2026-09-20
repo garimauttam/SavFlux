@@ -509,3 +509,134 @@ def test_autofix_endpoint_404s_when_the_file_is_unknown(client):
 def test_autofix_endpoint_requires_a_path(client):
     response = client.post("/api/v1/review/autofix", json={"path": "  "})
     assert response.status_code == 422
+
+
+# ── The repaired content travels with the patch ───────────────────────────────
+#
+# The review UI chains several files into one patch, which means the client needs
+# the text the backend actually verified. Returning it here — rather than letting
+# the client re-derive it — is what keeps one implementation of every fixer.
+
+
+def test_autofix_endpoint_returns_the_repaired_content(client):
+    source = "import requests\ndef f(u):\n    return requests.get(u, verify=False)\n"
+    data = client.post(
+        "/api/v1/review/autofix", json={"path": "net.py", "content": source}
+    ).json()
+
+    assert data["fixed"] is True
+    assert data["content"] == "import requests\ndef f(u):\n    return requests.get(u)\n"
+    assert data["content"] != source
+
+
+def test_autofix_endpoint_returns_the_input_when_nothing_changed(client):
+    source = "x = 1\n"
+    data = client.post(
+        "/api/v1/review/autofix", json={"path": "clean.py", "content": source}
+    ).json()
+
+    assert data["fixed"] is False and data["content"] == source
+
+
+def test_autofix_endpoint_resolves_content_from_the_index(client):
+    """
+    The UI knows the indexed source id but not the file text, and temp clones are
+    gone by the time it asks. `source` is the exact id, so the lookup is one
+    indexed query instead of a scan.
+    """
+    from unittest.mock import patch
+
+    source = "import hashlib\ndef key(d):\n    return hashlib.md5(d).hexdigest()\n"
+    with patch("app.services.indexed_content.read_indexed_file", return_value=source) as reader:
+        data = client.post(
+            "/api/v1/review/autofix",
+            json={"path": "hash.py", "source": "https://github.com/o/r::hash.py",
+                  "repo_url": "https://github.com/o/r"},
+        ).json()
+
+    assert data["fixed"] is True
+    assert "usedforsecurity=False" in data["content"]
+    assert reader.call_args.kwargs["source"] == "https://github.com/o/r::hash.py"
+
+
+# ── POST /review/autofix-set — the reviewed set ───────────────────────────────
+#
+# One request for a whole review, one patch, one digest to confirm. The per-file
+# endpoint stays for single-file fixes; this exists so a 30-file "apply
+# everything safe" click does not spend its last ten files on HTTP 429.
+
+
+def test_autofix_set_fixes_several_files_into_one_patch(client):
+    response = client.post("/api/v1/review/autofix-set", json={
+        "files": [
+            {"path": "net.py", "content": "import requests\ndef f(u):\n    return requests.get(u, verify=False)\n"},
+            {"path": "hash.py", "content": "import hashlib\ndef k(d):\n    return hashlib.md5(d).hexdigest()\n"},
+            {"path": "clean.py", "content": "x = 1\n"},
+        ],
+        "title": "Fix TLS and hashing",
+    })
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["scanned"] == 3
+    assert data["fixed_count"] == 2
+    assert [f["path"] for f in data["files"]] == ["net.py", "hash.py", "clean.py"]
+    assert data["errors"] == []
+
+    patch = data["patch"]
+    assert patch["files_changed"] == 2
+    assert patch["diff"].count("diff --git") == 2
+    assert patch["suggested_branch"].startswith("savflux/fix-tls-and-hashing")
+    assert patch["digest"]
+
+
+def test_autofix_set_does_not_stop_at_a_file_it_cannot_fix(client):
+    """
+    A review set is a mixed bag. One JavaScript file must not cost the user the
+    Python repairs in the same batch.
+    """
+    response = client.post("/api/v1/review/autofix-set", json={
+        "files": [
+            {"path": "app.js", "content": "eval(x);"},
+            {"path": "net.py", "content": "import requests\ndef f(u):\n    return requests.get(u, verify=False)\n"},
+        ],
+    })
+    data = response.json()
+
+    assert data["fixed_count"] == 1
+    assert [e["path"] for e in data["errors"]] == ["app.js"]
+    assert "python" in data["errors"][0]["reason"].lower()
+    assert data["patch"]["files_changed"] == 1
+
+
+def test_autofix_set_reports_an_honest_empty_result(client):
+    response = client.post("/api/v1/review/autofix-set", json={
+        "files": [{"path": "clean.py", "content": "x = 1\n"}],
+    })
+    data = response.json()
+
+    assert data["fixed_count"] == 0
+    assert data["patch"] is None
+    assert data["scanned"] == 1
+
+
+def test_autofix_set_validates_its_input(client):
+    assert client.post("/api/v1/review/autofix-set", json={"files": []}).status_code == 422
+    too_many = [{"path": f"f{i}.py", "content": "x = 1\n"} for i in range(26)]
+    assert client.post("/api/v1/review/autofix-set",
+                       json={"files": too_many}).status_code == 422
+
+
+def test_autofix_set_resolves_indexed_content_by_source(client):
+    """The UI holds source ids, not file text — the batch must accept them."""
+    from unittest.mock import patch
+
+    source = "import requests\ndef f(u):\n    return requests.get(u, verify=False)\n"
+    with patch("app.services.indexed_content.read_indexed_file", return_value=source):
+        data = client.post("/api/v1/review/autofix-set", json={
+            "files": [{"path": "net.py", "source": "https://github.com/o/r::net.py"}],
+            "repo_url": "https://github.com/o/r",
+        }).json()
+
+    assert data["fixed_count"] == 1
+    assert data["patch"]["digest"]

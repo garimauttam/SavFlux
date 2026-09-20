@@ -19,6 +19,50 @@ export interface ReviewSection {
   content: string;
   status: "pending" | "scanning" | "reviewing" | "writing" | "complete" | "skipped" | "error";
   statusMessage?: string;
+  // Server-reported provenance for this file (from the review planner):
+  //   tier   — how the file was reviewed: "static" | "fast" | "full"
+  //   cached — the review was reused from the content-hash cache, so no model
+  //            call was made for it in this run.
+  // Surfaced because a review that costs nothing should say why, and a review
+  // that never reached a model should not look like one that did.
+  tier?: string;
+  cached?: boolean;
+}
+
+/**
+ * A `__STATUS__` payload from the review stream.
+ *
+ * Every field is optional because the backend emits several kinds of token
+ * (plan, per-file progress, coverage, timing) and they carry different payloads.
+ * Unknown fields are ignored rather than rejected, so a newer backend can add
+ * telemetry without breaking an older client.
+ */
+export interface StatusMeta {
+  step?: string;
+  tool?: string;
+  file?: string;
+  id?: string;
+  index?: number;
+  total?: number;
+  mode?: string;
+  // coverage token
+  llm?: number;
+  static?: number;
+  pct?: number;
+  cache_hits?: number;
+  planned_static?: number;
+  fallback_static?: number;
+  // per-file token
+  cached?: boolean;
+  // planned token
+  static_only?: number;
+  batched_files?: number;
+  batch_count?: number;
+  model_calls?: number;
+  // per-file token
+  tier?: string;
+  batch?: string;
+  [key: string]: unknown;
 }
 
 export interface AgentStep {
@@ -45,6 +89,13 @@ export interface MultiReviewState {
   serverLlmCount?: number;     // exact LLM-reviewed count as reported by the backend
   serverStaticCount?: number;  // exact static-only count as reported by the backend
   serverCoveragePct?: number;  // exact LLM coverage % as reported by the backend
+  // Run plan, reported by the backend before any review happens: how many model
+  // calls this review will make, and why the rest of the files did not need one.
+  serverPlannedStatic?: number;   // files the parser fully determines
+  serverBatchedFiles?: number;    // files sharing a batched model call
+  serverBatchCount?: number;      // how many batched calls that is
+  serverModelCalls?: number;      // total model calls planned for this run
+  serverCacheHits?: number;       // files answered from the content-hash cache
   // Derived accuracy fields (not part of useState, computed from sections)
   reviewAccuracy?: number;      // 0–100: % of file sections with real LLM review
   llmReviewedCount?: number;    // absolute count of LLM-reviewed files
@@ -144,11 +195,22 @@ export function useMultiReview() {
         sectionId: string,
         status: ReviewSection["status"],
         statusMessage?: string,
+        provenance?: { tier?: string; cached?: boolean },
       ) => {
         setState((prev) => ({
           ...prev,
           sections: prev.sections.map((s) =>
-            s.id === sectionId ? { ...s, status, statusMessage } : s
+            s.id === sectionId
+              ? {
+                  ...s,
+                  status,
+                  statusMessage,
+                  // Provenance only ever accumulates: a later token without a
+                  // tier must not erase the tier an earlier token reported.
+                  tier: provenance?.tier ?? s.tier,
+                  cached: provenance?.cached ?? s.cached,
+                }
+              : s
           ),
         }));
       };
@@ -235,13 +297,16 @@ export function useMultiReview() {
               const message = jsonMatch
                 ? statusText.slice(0, statusText.lastIndexOf(jsonMatch[0])).trim()
                 : statusText.trim();
-              let meta: { step?: string; tool?: string; file?: string; id?: string; index?: number; total?: number; mode?: string; llm?: number; static?: number; pct?: number } = {};
+              let meta: StatusMeta = {};
               if (jsonMatch) {
                 try { meta = JSON.parse(jsonMatch[1]); } catch {}
               }
               const statusId = meta.id ?? currentSectionId;
               if (statusId) {
-                updateSectionStatus(statusId, sectionStatusFromMeta(meta, message), message);
+                updateSectionStatus(statusId, sectionStatusFromMeta(meta, message), message, {
+                  tier: typeof meta.tier === "string" ? meta.tier : undefined,
+                  cached: meta.cached === true ? true : undefined,
+                });
               }
 
               setState((prev) => ({
@@ -256,6 +321,15 @@ export function useMultiReview() {
                   serverLlmCount: meta.llm,
                   serverStaticCount: meta.static,
                   serverCoveragePct: meta.pct,
+                  serverCacheHits: meta.cache_hits,
+                }),
+                // ...and the plan from the "planned" token, emitted before any
+                // review so the UI can explain the shape of the run up front.
+                ...(meta.step === "planned" && {
+                  serverPlannedStatic: meta.static_only,
+                  serverBatchedFiles: meta.batched_files,
+                  serverBatchCount: meta.batch_count,
+                  serverModelCalls: meta.model_calls,
                 }),
               }));
               changed = true;
