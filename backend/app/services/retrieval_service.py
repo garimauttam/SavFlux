@@ -775,3 +775,114 @@ async def get_indexed_files() -> list[dict]:
             })
 
     return sorted(files, key=lambda x: x["file_name"])
+
+
+# ── Retrieval without generation ──────────────────────────────────────────────
+#
+# `stream_answer` is retrieval *plus* an LLM: the two are interleaved so status
+# markers reach the browser as each stage starts. Any caller that wants the
+# evidence but not the answer — the deterministic agent, a future eval harness —
+# used to have no way in. The agent's `retrieve_context` tool called
+# `hybrid_search_with_sources`, which was never written; every run raised
+# ImportError into a broad `except` and reported "no chunks matched", so the
+# whole agent pipeline quietly returned nothing.
+#
+# This is that missing entry point. The stages, weights and filters are the same
+# ones `stream_answer` runs — dense MMR + BM25 fused by two-branch RRF, then the
+# cross-encoder, then per-source diversification — so agent retrieval cannot
+# drift from what chat retrieval returns. Only the sequencing is duplicated
+# (~40 lines), because the alternative was threading a status callback through
+# `stream_answer`'s generator and risking the product's main path.
+
+async def retrieve_chunks(
+    query: str,
+    repo_url: str | None = None,
+    top_k: int | None = None,
+) -> list[Document]:
+    """
+    Evidence for `query`: reranked, diversified, and free of any model call.
+
+    Returns [] rather than raising when the index is empty or a stage fails —
+    the caller (an agent step) reports "no chunks" as a finding, not a crash.
+    """
+    question, file_scope = extract_file_scope(query or "")
+    if not question.strip():
+        return []
+
+    top_k = max(1, min(int(top_k or settings.top_k_results), 50))
+    candidate_count = max(top_k * 3, 10)
+
+    def _filter(extra: dict) -> dict | None:
+        parts: list[dict] = []
+        if repo_url:
+            parts.append({"repo_url": repo_url})
+        if file_scope:
+            parts.append({"file_name": {"$contains": file_scope}})
+        if extra:
+            parts.append(extra)
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else {"$and": parts}
+
+    try:
+        vectorstore = _get_vectorstore()
+    except Exception as exc:  # noqa: BLE001 — no index configured
+        logger.debug("retrieve_chunks: vector store unavailable: %s", exc)
+        return []
+
+    intent = route_query_intent(question)
+    query_variants = (
+        local_query_variants(question) if settings.query_expansion_enabled else [question]
+    )
+
+    async def _dense(filter_clause: dict | None) -> list[list[Document]]:
+        kwargs: dict = {"k": candidate_count, "fetch_k": candidate_count * 2}
+        if filter_clause:
+            kwargs["filter"] = filter_clause
+        retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs=kwargs)
+        return list(await asyncio.gather(*(retriever.ainvoke(v) for v in query_variants)))
+
+    try:
+        dense_lists = await _dense(_filter(get_intent_filter(intent)))
+        # Corrective retrieval: an intent filter that matched nothing is a filter
+        # problem, not an empty index. Retry unfiltered before believing it.
+        if intent != "general" and not any(dense_lists):
+            dense_lists = await _dense(_filter({}))
+
+        async with _get_bm25_lock():
+            bm25_index = await asyncio.to_thread(_get_bm25_index, vectorstore)
+
+        bm25_lists: list[list[Document]] = []
+        if bm25_index:
+            hints = await asyncio.to_thread(_get_dep_graph_hints, question, vectorstore)
+            bm25_lists = [
+                bm25_index.search(query=variant, top_k=candidate_count,
+                                  repo_urls=[repo_url] if repo_url else None,
+                                  file_filter=file_scope)
+                for variant in (query_variants + hints)
+            ]
+
+        fused = (
+            two_branch_rrf(dense_lists=dense_lists, bm25_lists=bm25_lists,
+                           k=60, top_n=candidate_count * 2)
+            if any(bm25_lists)
+            else reciprocal_rank_fusion(dense_lists, k=60, top_n=candidate_count * 2)
+        )
+
+        if file_scope:
+            scoped = [
+                doc for doc in fused
+                if file_scope.lower() in doc.metadata.get("source", "").lower()
+                or file_scope.lower() in doc.metadata.get("file_name", "").lower()
+            ]
+            if scoped:
+                fused = scoped
+
+        reranked = await rerank(question, fused, top_n=candidate_count)
+    except Exception as exc:  # noqa: BLE001 — retrieval failure is not a 500
+        logger.debug("retrieve_chunks failed for %r: %s", query, exc)
+        return []
+
+    return diversify_documents(
+        reranked, top_n=top_k, max_per_source=3 if file_scope else 2
+    )

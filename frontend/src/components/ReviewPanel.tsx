@@ -43,6 +43,7 @@ import {
 import { IndexedFile } from "../types";
 import { PRReviewPanel } from "./PRReviewPanel";
 import { EvidenceViewer } from "./EvidenceViewer";
+import { ApplyFixPanel } from "./ApplyFixPanel";
 import { useReview } from "../hooks/useReview";
 import { useMultiReview, ReviewSection } from "../hooks/useMultiReview";
 
@@ -142,6 +143,10 @@ function ReviewActivityPanel({
   mode,
   reviewAccuracy,
   llmReviewedCount,
+  modelCalls,
+  plannedStatic,
+  batchedFiles,
+  cacheHits,
 }: {
   isActive: boolean;
   currentStep: string | null;
@@ -152,6 +157,13 @@ function ReviewActivityPanel({
   mode?: string | null;
   reviewAccuracy?: number;
   llmReviewedCount?: number;
+  // The run's plan, from the backend: how many model calls this review makes,
+  // how many files the parser covers, how many share batched calls, and how many
+  // were answered from the content-hash cache. "Fast" should be explainable.
+  modelCalls?: number;
+  plannedStatic?: number;
+  batchedFiles?: number;
+  cacheHits?: number;
 }) {
   const elapsed = useElapsed(isActive);
   const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
@@ -198,14 +210,30 @@ function ReviewActivityPanel({
                     : "text-gray-500"
                 }`}
                 title={
-                  (reviewAccuracy ?? 0) === 0
-                    ? `All ${total} files used deterministic static analysis — no LLM provider available. Configure Ollama (ollama serve) for deeper reviews.`
-                    : `${llmReviewedCount ?? 0}/${total} files had a full LLM review; ${total - (llmReviewedCount ?? 0)} used static analysis only`
+                  [
+                    (reviewAccuracy ?? 0) === 0
+                      ? `All ${total} files used deterministic static analysis — no LLM provider available. Configure Ollama (ollama serve) for deeper reviews.`
+                      : `${llmReviewedCount ?? 0}/${total} files had a model review; ${total - (llmReviewedCount ?? 0)} used static analysis only`,
+                    modelCalls !== undefined
+                      ? `${modelCalls} model call(s) for ${total} file(s)${batchedFiles ? `, ${batchedFiles} batched` : ""}${plannedStatic ? `, ${plannedStatic} settled by the parser` : ""}${cacheHits ? `, ${cacheHits} from cache` : ""}`
+                      : "",
+                    cacheHits ? `${cacheHits} file(s) were byte-identical to a previous review and made no call.` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")
                 }
               >
                 {(reviewAccuracy ?? 0) === 0
                   ? "⚙️ Static analysis only"
                   : `🤖 ${llmReviewedCount ?? 0}/${total} LLM · ${(reviewAccuracy ?? 0)}%`}
+              </div>
+            )}
+            {!isActive && total > 1 && modelCalls !== undefined && (
+              <div className="mt-1 text-[11px] text-gray-500 font-mono">
+                {modelCalls} call{modelCalls === 1 ? "" : "s"}
+                {cacheHits ? ` · ♻️ ${cacheHits}` : ""}
+                {batchedFiles ? ` · ⚡ ${batchedFiles}` : ""}
+                {plannedStatic ? ` · ⚙️ ${plannedStatic}` : ""}
               </div>
             )}
           </div>
@@ -254,6 +282,60 @@ function sectionStatusStyle(status: ReviewSection["status"]) {
   if (status === "reviewing" || status === "scanning") return "border-blue-500/30 bg-blue-500/10 text-blue-300";
   return "border-gray-600 bg-gray-800 text-gray-400";
 }
+
+/**
+ * Where a file's review came from.
+ *
+ * The review planner decides per file whether the parser is enough, whether the
+ * file shares a batched model call, or whether it earns a call of its own; and a
+ * file whose bytes have not changed is answered from the content-hash cache
+ * without a call at all. Showing that is the difference between "this was fast"
+ * and "this was fast because nothing was skipped".
+ */
+function ReviewProvenanceChip({ section }: { section: ReviewSection }) {
+  if (section.cached) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300"
+        title="Byte-identical to a previous review — served from the content-hash cache, no model call made."
+      >
+        ♻️ Cached
+      </span>
+    );
+  }
+  if (section.tier === "static") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded border border-gray-600 bg-gray-800 px-1.5 py-0.5 text-[10px] font-medium text-gray-400"
+        title="The static analyzer fully determined this file — a model review would restate its findings, so none was made."
+      >
+        ⚙️ Static
+      </span>
+    );
+  }
+  if (section.tier === "fast") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-300"
+        title="Reviewed by the model, sharing one call with the other files in its batch."
+      >
+        ⚡ Batched
+      </span>
+    );
+  }
+  if (section.tier === "full") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-[10px] font-medium text-purple-300"
+        title="Reviewed by the model on its own — this file carried security shape, a proven finding, or real complexity."
+      >
+        🔍 Deep
+      </span>
+    );
+  }
+  return null;
+}
+
 
 function SectionStatusBadge({ section }: { section: ReviewSection }) {
   const label =
@@ -478,6 +560,7 @@ function SectionCard({ section, defaultOpen }: { section: ReviewSection; default
           <span className="truncate">{section.fileName}</span>
         </span>
         <span className="ml-3 flex shrink-0 items-center gap-2">
+          <ReviewProvenanceChip section={section} />
           <SectionStatusBadge section={section} />
           {open ? <ChevronUp className="w-3.5 h-3.5 text-gray-500" /> : <ChevronDown className="w-3.5 h-3.5 text-gray-500" />}
         </span>
@@ -656,6 +739,9 @@ export function ReviewPanel({
   // File selection
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
+  // Sources that were sent for review — the scope of any "apply fix" afterwards.
+  const [reviewedSources, setReviewedSources] = useState<string[]>([]);
+
   // Paste mode
   const [pastedCode, setPastedCode]     = useState("");
   const [pasteLanguage, setPasteLanguage] = useState("python");
@@ -738,11 +824,13 @@ export function ReviewPanel({
 
   const handleReview = () => {
     if (tab === "paste" && pastedCode.trim()) {
+      setReviewedSources([]); // pasted code has no indexed file to repair
       single.reviewPaste(pastedCode, pasteLanguage, pasteName);
       return;
     }
     if (selected.size === 0) return;
     const files = indexedFiles.filter((f) => selected.has(f.source));
+    setReviewedSources(files.map((f) => f.source));
     if (files.length === 1) {
       single.reviewFile(files[0]);
     } else {
@@ -785,6 +873,19 @@ export function ReviewPanel({
   );
 
   const hasOutput = isMulti ? multi.sections.length > 0 : !!single.review;
+
+  // The files the finished review actually covered, captured when the run starts.
+  // "Apply fix" must operate on the reviewed set, not on whatever happens to be
+  // ticked in the tree afterwards — fixing a file nobody looked at is how a diff
+  // becomes a surprise.
+  const fixableFiles = useMemo(
+    () =>
+      indexedFiles.filter(
+        (f) =>
+          reviewedSources.includes(f.source) && (f.language || "").toLowerCase() === "py",
+      ),
+    [indexedFiles, reviewedSources],
+  );
   const activeError   = isMulti ? multi.error   : single.error;
   const currentStep   = isMulti ? multi.currentStep : single.currentStep;
   const singleToolSteps = single.agentSteps.filter((step): step is ActivityStep & { tool: string } => Boolean(step.tool));
@@ -840,7 +941,12 @@ export function ReviewPanel({
               Download
             </button>
             <button
-              onClick={() => { single.reset(); multi.reset(); setSelected(new Set()); }}
+              onClick={() => {
+                single.reset();
+                multi.reset();
+                setSelected(new Set());
+                setReviewedSources([]);
+              }}
               className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 transition-colors"
             >
               <RotateCcw className="w-3.5 h-3.5" />
@@ -1098,6 +1204,9 @@ export function ReviewPanel({
                   {single.error}
                 </div>
               )}
+              {!single.isReviewing && single.review && fixableFiles.length > 0 && (
+                <ApplyFixPanel files={fixableFiles} />
+              )}
             </div>
           )}
 
@@ -1115,6 +1224,10 @@ export function ReviewPanel({
                     mode={multi.currentMode}
                     reviewAccuracy={multi.reviewAccuracy}
                     llmReviewedCount={multi.llmReviewedCount}
+                    modelCalls={multi.serverModelCalls}
+                    plannedStatic={multi.serverPlannedStatic}
+                    batchedFiles={multi.serverBatchedFiles}
+                    cacheHits={multi.serverCacheHits}
                   />
               )}
               {orderedMultiSections.map((section, i) => (
@@ -1124,6 +1237,9 @@ export function ReviewPanel({
                 <div className="text-red-400 text-sm bg-red-900/20 border border-red-800 rounded-lg px-4 py-3">
                   {multi.error}
                 </div>
+              )}
+              {!multi.isReviewing && multi.sections.length > 0 && fixableFiles.length > 0 && (
+                <ApplyFixPanel files={fixableFiles} />
               )}
             </div>
           )}

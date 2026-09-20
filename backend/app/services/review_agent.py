@@ -502,3 +502,171 @@ async def stream_fast_code_review(
 
     except Exception as e:
         yield f"__ERROR__{str(e)[:200]}__ERROR_END__\n"
+
+
+# ── Batched multi-file review ─────────────────────────────────────────────────
+#
+# WHY BATCH THE MIDDLE OF THE REPO
+# --------------------------------
+# Most files in a repository are unremarkable. They have no security shape, the
+# parser found nothing, and their complexity is ordinary — but they are still
+# real code that a reviewer would want a second pair of eyes on. Reviewed one at a
+# time, each of those files costs a full model call and a slot in the concurrency
+# semaphore, which is where a 60-file review spends most of its sixty seconds.
+#
+# The question asked of such a file ("does anything here look wrong?") does not
+# depend on the other files being absent from the prompt. So a group of them is
+# asked once, with each file clearly delimited, and the answer is split back into
+# per-file sections. Four files, one call, and the model still sees every line.
+#
+# The delimiter is a machine-readable header rather than prose because a parser
+# that guesses where one file's review ends will attribute findings to the wrong
+# file — the worst possible failure for a review tool.
+
+BATCH_FILE_MARKER = "=== FILE: {name} ==="
+BATCH_END_MARKER = "=== END FILE ==="
+
+#: Per-file preview budget inside a batch prompt. Small enough that four files
+#: fit in a comfortable context window, large enough for the model to see the
+#: code rather than a summary of it.
+BATCH_FILE_CHARS = 4500
+#: Per-file share of the verified-facts block.
+BATCH_FACTS_CHARS = 900
+
+BATCH_REVIEW_SYSTEM_PROMPT = """\
+You are SavFlux, a senior software engineer reviewing several files from one
+repository in a single pass.
+
+You are given each file's content plus a "Verified static analysis" block
+produced by a parser that analysed that exact file. Use ONLY this supplied data —
+never invent bugs, line numbers, or behaviours not visible in the evidence.
+
+RULES:
+- Review each file independently. A finding must belong to the file it is
+  written under, and line numbers must come from that file.
+- Items under "VERIFIED ISSUES" were proven by parsing: treat them as fact and
+  explain impact rather than re-deriving them.
+- Items under "POSSIBLE ISSUES" are heuristics: confirm against the source shown
+  before repeating them.
+- Be terse. A clean file gets "None found" under each heading. Do not pad.
+"""
+
+
+def _batch_prompt(files_slice: list[dict], repo_context_map: dict[str, str]) -> str:
+    """One prompt holding several files, each behind an unambiguous header."""
+    from app.services.code_analysis.analyzer import build_llm_facts
+
+    blocks: list[str] = []
+    for file_info in files_slice:
+        name = file_info.get("file_name", "unknown")
+        language = file_info.get("language", "")
+        content = file_info.get("content", "")
+        preview = content[:BATCH_FILE_CHARS]
+        truncation = (
+            f"\n[Truncated — showing {BATCH_FILE_CHARS} of {len(content)} chars]"
+            if len(content) > BATCH_FILE_CHARS else ""
+        )
+
+        try:
+            analysis = analyze_file(content, name, language)
+            facts = build_llm_facts(analysis)[:BATCH_FACTS_CHARS]
+        except Exception:  # noqa: BLE001 — facts are an aid, not a precondition
+            facts = "Static analysis unavailable for this file."
+
+        context = repo_context_map.get(name, "")
+        context_block = f"\n### Cross-file Repo Context\n{context}\n" if context else ""
+
+        blocks.append(
+            f"{BATCH_FILE_MARKER.format(name=name)}\n"
+            f"language: {language}\n\n"
+            f"### Code\n```{language}\n{preview}\n```{truncation}\n"
+            f"{context_block}"
+            f"### Verified static analysis\n{facts}\n"
+        )
+
+    headings = ", ".join(f"`{f.get('file_name')}`" for f in files_slice)
+    return (
+        f"Review these {len(files_slice)} files: {headings}.\n\n"
+        + "\n".join(blocks)
+        + "\n\nFor EACH file above, emit exactly this structure and nothing else:\n"
+        + BATCH_FILE_MARKER.format(name="<filename as given above>") + "\n"
+        "## 🐛 Bugs & Risks\n## 🔒 Security\n## ⚠️ Maintainability\n"
+        "## 🔗 Cross-file Issues\n## ⚡ Fast Fixes\n## 📊 Score (1–10)\n"
+        + BATCH_END_MARKER + "\n\n"
+        "The header and footer lines must appear verbatim — an automated parser "
+        "splits your answer with them, and a file left without a block is shown to "
+        "the user as not reviewed.\n"
+        "Write 'None found' for any heading that is clean."
+    )
+
+
+async def stream_batch_code_review(
+    files_slice: list[dict],
+    repo_context_map: dict[str, str] | None = None,
+    model_override: str = "",
+) -> AsyncGenerator[str, None]:
+    """
+    Stream one review covering several files, delimited by BATCH_FILE_MARKER.
+
+    Yields raw text; the caller splits it with `split_batch_review`. Streaming is
+    kept (rather than returning a string) so the caller can bound the whole batch
+    with a timeout and so a partially produced answer is still usable.
+    """
+    increment_request("review")
+    streaming_llm = get_review_llm(model_override, streaming=True)
+    prompt = _batch_prompt(files_slice, repo_context_map or {})
+
+    messages = [
+        SystemMessage(content=BATCH_REVIEW_SYSTEM_PROMPT),
+        HumanMessage(content=prompt),
+    ]
+
+    raw_stream = (
+        chunk.content
+        async for chunk in streaming_llm.with_config(callbacks=[get_token_callback()]).astream(messages)
+        if chunk.content
+    )
+    async for token in _strip_think_tags(raw_stream):
+        yield token
+
+
+def split_batch_review(text: str, expected_names: list[str]) -> dict[str, str]:
+    """
+    Split a batched review into {file_name: review_text}.
+
+    Matching is by exact name first, then by basename, because a model that was
+    given `src/auth/tokens.py` will sometimes echo `tokens.py`. A file with no
+    block is simply absent from the result — the caller falls back to the
+    deterministic report for it and says so, rather than attributing one file's
+    findings to another.
+
+    Pure function: no I/O, no globals, so the parsing can be tested directly.
+    """
+    if not text.strip():
+        return {}
+
+    pattern = re.compile(
+        r"^[=\s]*FILE:\s*(?P<name>[^\n=]+?)\s*[=]*\s*$"
+        r"(?P<body>.*?)"
+        r"^[=\s]*END FILE[=\s]*$",
+        re.MULTILINE | re.DOTALL,
+    )
+
+    by_name: dict[str, str] = {}
+    by_basename: dict[str, str] = {}
+    for match in pattern.finditer(text):
+        name = match.group("name").strip()
+        body = match.group("body").strip()
+        if not name:
+            continue
+        by_name[name] = body
+        by_basename.setdefault(name.rsplit("/", 1)[-1], body)
+
+    result: dict[str, str] = {}
+    for expected in expected_names:
+        body = by_name.get(expected)
+        if body is None:
+            body = by_basename.get(expected.rsplit("/", 1)[-1])
+        if body:
+            result[expected] = body
+    return result

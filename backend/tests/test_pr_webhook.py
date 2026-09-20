@@ -111,13 +111,23 @@ def test_static_triage_ignores_placeholder_secret_config():
     assert "Hardcoded credential" not in review
 
 
-def test_concurrent_review_emits_section_before_its_tokens():
+def test_concurrent_review_emits_section_before_its_tokens(isolated_data_dir):
+    """
+    The wire-protocol property: a section header is emitted before that file's
+    tokens, so the UI can attach them to the right card.
+
+    The fixtures are realistic files rather than one-line stubs because the
+    planner sends a 14-character stub to static analysis — correctly, there is
+    nothing in it to review — and then no model stream exists to order against.
+    These files score high enough to earn their own review, which is what this
+    test is about.
+    """
     async def fake_stream(file_name, content, language, repo_context="", model_override=""):
         yield f"review for {file_name}"
 
     files = [
-        {"file_name": "a.py", "content": "def a(): pass", "language": "py"},
-        {"file_name": "b.py", "content": "def b(): pass", "language": "py"},
+        {"file_name": "auth_a.py", "content": _REVIEWABLE_SOURCE_A, "language": "py"},
+        {"file_name": "auth_b.py", "content": _REVIEWABLE_SOURCE_B, "language": "py"},
     ]
     fake_settings = SimpleNamespace(
         review_mode="fast",
@@ -134,7 +144,7 @@ def test_concurrent_review_emits_section_before_its_tokens():
             return [token async for token in stream_multi_review(files)]
 
     output = asyncio.run(collect())
-    for name in ("a.py", "b.py"):
+    for name in ("auth_a.py", "auth_b.py"):
         marker = f'"file_name": "{name}"'
         assert any(marker in token for token in output)
         marker_index = next(i for i, token in enumerate(output) if marker in token)
@@ -142,14 +152,14 @@ def test_concurrent_review_emits_section_before_its_tokens():
         assert marker_index < token_index
 
 
-def test_fast_review_mode_uses_single_pass_reviewer():
+def test_fast_review_mode_uses_single_pass_reviewer(isolated_data_dir):
     async def fake_fast_stream(file_name, content, language, repo_context="", model_override=""):
         yield f"fast review for {file_name}"
 
     async def fake_agentic_stream(file_name, content, language, repo_context="", model_override=""):
         yield f"agentic review for {file_name}"
 
-    files = [{"file_name": "service.py", "content": "def run(): pass", "language": "py"}]
+    files = [{"file_name": "auth_service.py", "content": _REVIEWABLE_SOURCE_A, "language": "py"}]
     fake_settings = SimpleNamespace(
         review_mode="fast",
         review_max_full_files=1,
@@ -165,15 +175,54 @@ def test_fast_review_mode_uses_single_pass_reviewer():
             return "".join([token async for token in stream_multi_review(files)])
 
     output = asyncio.run(collect())
-    assert "fast review for service.py" in output
+    assert "fast review for auth_service.py" in output
     assert "agentic review" not in output
 
 
-def test_multi_review_falls_back_to_static_triage_when_provider_review_fails():
+#: Realistic fixture sources. Content must clear the planner's reviewability floor
+#: (and score well enough to earn its own model call) for the LLM paths below to
+#: be exercised at all.
+_REVIEWABLE_SOURCE_A = """\
+import hashlib
+import requests
+
+TOKEN_SALT = "static-salt"
+
+
+def fetch_profile(url: str) -> dict:
+    response = requests.get(url, verify=False, timeout=10)
+    return response.json()
+
+
+def token_digest(token: str) -> str:
+    return hashlib.md5((token + TOKEN_SALT).encode()).hexdigest()
+
+
+def is_same_token(a: str, b: str) -> bool:
+    return a == b
+"""
+
+_REVIEWABLE_SOURCE_B = """\
+import subprocess
+
+
+def run_report(path: str) -> str:
+    command = f"wc -l {path}"
+    completed = subprocess.run(command, shell=True, capture_output=True, text=True)
+    return completed.stdout.strip()
+
+
+def load_settings(payload: str) -> dict:
+    import yaml
+    return yaml.load(payload)
+"""
+
+
+def test_multi_review_falls_back_to_static_triage_when_provider_review_fails(isolated_data_dir):
     async def failing_stream(file_name, content, language, repo_context="", model_override=""):
         yield "__ERROR__Error code: 402 - Insufficient Balance__ERROR_END__\n"
 
-    files = [{"file_name": "billing.py", "content": "password = value", "language": "py"}]
+    files = [{"file_name": "billing_service.py", "content": _REVIEWABLE_SOURCE_A, "language": "py"}]
     fake_settings = SimpleNamespace(
         review_mode="fast",
         review_max_full_files=1,
@@ -190,5 +239,7 @@ def test_multi_review_falls_back_to_static_triage_when_provider_review_fails():
     output = asyncio.run(collect())
     # _static_triage emits "Static analysis" in its footer sentinel
     assert "Static analysis" in output
+    # A provider's error text must never reach the user's review — it is logged
+    # server-side instead. The file still gets a real deterministic report.
     assert "Insufficient Balance" not in output
-    assert "Static fallback" in output
+    assert "Static analysis shown" in output

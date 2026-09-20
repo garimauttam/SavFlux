@@ -99,6 +99,38 @@ class Settings(BaseSettings):
     # review_concurrency=3 concurrent LLM calls.
     review_max_full_files: int = 80
     review_concurrency: int = 3
+    # review_llm_budget: how many *single-file* model reviews one batch may make.
+    # This is the knob that trades review depth for wall-clock time, and it is
+    # separate from review_max_full_files because the pipeline no longer sends
+    # every file to the model: most files are answered by the static analyzer
+    # (4.5ms each) and the remainder share batched calls. 12 single reviews plus
+    # batching covers a 70-file repo in a fraction of the calls.
+    review_llm_budget: int = 12
+    # review_cache_enabled: reuse a review when the file's content hash, language,
+    # model and prompt version all match a previous run. Off = every review is a
+    # fresh model call.
+    review_cache_enabled: bool = True
+
+    # --- Risk policy gate ---
+    # risk_gate_enabled: require approval (or refuse) when a change is risky
+    # enough. The score is deterministic — parsed findings, blast radius, path
+    # sensitivity, verification — so this can be reasoned about and argued with,
+    # unlike a model's opinion of "risky".
+    risk_gate_enabled: bool = True
+    # risk_approval_threshold: at or above this score (0–10), a change needs a
+    # token bound to that exact change plus a written reason before it is pushed.
+    # 6 is reachable by one severe, parsed finding in a security-relevant file
+    # with real blast radius — i.e. "someone should look at this" — and is not
+    # reachable by ordinary work.
+    risk_approval_threshold: int = 6
+    # risk_block_threshold: at or above this, SavFlux refuses to push at all and
+    # returns the manual `gh` command instead. Approval cannot override this.
+    # The default is 10 — the maximum — because the approval gate is the one the
+    # roadmap asked for, and an unapprovable band should be reserved for a change
+    # that is dangerous on every axis at once. Separately from the score, a patch
+    # the verifier proves does not apply is never pushed, at any score: that is an
+    # integrity rule, not a judgement about risk.
+    risk_block_threshold: int = 10
 
     # --- LangSmith Observability ---
     # LangSmith traces every LangChain call automatically when these vars are set.
