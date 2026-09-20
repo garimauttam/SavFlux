@@ -9,7 +9,7 @@
   "chunk_size": 700,
   "chunk_overlap": 150,
   "top_k_results": 5,
-  "langchain_project": "codesage",
+  "langchain_project": "savflux",
   "port": 8000,
   "cors_origins": "http://localhost:3000,http://localhost:5173"
 }

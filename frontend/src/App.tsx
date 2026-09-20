@@ -33,10 +33,11 @@ import { MetricsBar } from "./components/MetricsBar";
 import { ShareView } from "./components/ShareView";
 import { CommandPalette, ShortcutsHelp } from "./components/CommandPalette";
 import { IndexedFile, IndexedRepo } from "./types";
+import { OPEN_FILE_EVENT, openFileAt, parseOpenFileDetail } from "./lib/openFile";
 import { apiFetch } from "./api";
 
 // localStorage helpers for persisting activeRepoUrl across page refreshes
-const ACTIVE_REPO_KEY = "codesage:activeRepoUrl";
+const ACTIVE_REPO_KEY = "savflux:activeRepoUrl";
 function loadActiveRepo(): string | null {
   try { return localStorage.getItem(ACTIVE_REPO_KEY); } catch { return null; }
 }
@@ -63,6 +64,11 @@ function App() {
   // Source path of the file the user double-clicked in the graph — used to
   // pre-select it in the Review panel when navigating graph → review
   const [reviewTargetSource, setReviewTargetSource] = useState<string | null>(null);
+  // Line span to scroll to / highlight when the Review panel opens a file.
+  // Set when navigation came from a line-precise citation; null for a plain open.
+  const [reviewTargetLines, setReviewTargetLines] = useState<
+    { start: number; end: number; ranges?: string } | null
+  >(null);
   const [historyTargetSource, setHistoryTargetSource] = useState<string | null>(null);
   const [isPaletteOpen, setPaletteOpen] = useState(false);
   const [isHelpOpen, setHelpOpen] = useState(false);
@@ -106,14 +112,26 @@ function App() {
   // P2 Notifications — poll unread count for tab badge (optional, not blocking)
   // (Badge is shown inside NotificationsPanel; global polling could be added here if desired)
 
-  // P2 Explorer — open file in Review when tree item clicked
+  // Open a file in Review — raised by the file tree, the graph, and by
+  // line-precise chat citations (which also carry the span to scroll to).
   useEffect(() => {
     const handler = (e: Event) => {
-      const src = (e as CustomEvent).detail as string;
-      if (src) { setReviewTargetSource(src); setActiveTab("review"); }
+      const detail = parseOpenFileDetail((e as CustomEvent).detail);
+      if (!detail) return;
+      setReviewTargetSource(detail.source);
+      setReviewTargetLines(
+        typeof detail.startLine === "number"
+          ? {
+              start: detail.startLine,
+              end: detail.endLine ?? detail.startLine,
+              ranges: detail.lineRanges,
+            }
+          : null,
+      );
+      setActiveTab("review");
     };
-    window.addEventListener("savflux:open-file" as any, handler);
-    return () => window.removeEventListener("savflux:open-file" as any, handler);
+    window.addEventListener(OPEN_FILE_EVENT as any, handler);
+    return () => window.removeEventListener(OPEN_FILE_EVENT as any, handler);
   }, []);
 
   // P1 Time Machine — open file history from Code Writer
@@ -248,7 +266,11 @@ function App() {
             <ReviewPanel
               indexedFiles={indexedFiles}
               initialSelectedSource={reviewTargetSource}
-              onInitialSourceConsumed={() => setReviewTargetSource(null)}
+              initialTargetLines={reviewTargetLines}
+              onInitialSourceConsumed={() => {
+                setReviewTargetSource(null);
+                setReviewTargetLines(null);
+              }}
             />
           )}
           {activeTab === "write"  && <CodeWriterPanel indexedFiles={indexedFiles} />}
@@ -279,7 +301,7 @@ function App() {
           {activeTab === "snippets" && <SnippetVault />}
           {activeTab === "activity" && <ActivityFeed />}
           {activeTab === "bulk" && <BulkOpsPanel onFilesUpdated={() => window.location.reload()} />}
-          {activeTab === "explorer" && <FileTreePanel onOpenFile={(src) => { window.dispatchEvent(new CustomEvent("savflux:open-file", { detail: src })); }} />}
+          {activeTab === "explorer" && <FileTreePanel onOpenFile={(src) => openFileAt(src)} />}
           {activeTab === "diff" && <DiffViewer />}
           {activeTab === "notifications" && <NotificationsPanel />}
           {activeTab === "history" && (

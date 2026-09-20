@@ -1,4 +1,4 @@
-# Training-only dependencies — NOT required to run the CodeSage server.
+# Training-only dependencies — NOT required to run the SavFlux server.
 # Install with:  pip install -r training/requirements-train.txt
 # Recommended: use a separate virtualenv or conda env for training.
 

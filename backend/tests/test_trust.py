@@ -9,10 +9,9 @@ SHA_B = "b" * 40
 
 
 @pytest.fixture()
-def _isolated_storage(tmp_path, monkeypatch):
-    import app.services.trust_service as ts
-    monkeypatch.setattr(ts.settings, "chroma_persist_directory", str(tmp_path))
-    return tmp_path
+def _isolated_storage(isolated_data_dir):
+    """All trust-ledger state redirected to a tmp dir (see conftest)."""
+    return isolated_data_dir
 
 
 def test_verified_stale_unknown(_isolated_storage, monkeypatch):

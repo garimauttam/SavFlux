@@ -14,10 +14,8 @@ pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git binary 
 
 
 @pytest.fixture()
-def _repo(tmp_path, monkeypatch):
-    import app.services.history_service as hs
-    monkeypatch.setattr(hs.settings, "chroma_persist_directory", str(tmp_path / "data"))
-
+def _repo(tmp_path, isolated_data_dir):
+    # isolated_data_dir redirects the git-mirror root into tmp (see conftest).
     src = tmp_path / "src"
     src.mkdir()
     env = {"GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@t.t",
@@ -70,8 +68,6 @@ def test_blame_rejects_bad_rev(_repo):
         file_blame(url, "app.py", rev="HEAD~1; rm -rf /")
 
 
-def test_uploads_have_no_history(tmp_path, monkeypatch):
+def test_uploads_have_no_history(isolated_data_dir):
     from app.services.history_service import ensure_mirror
-    import app.services.history_service as hs
-    monkeypatch.setattr(hs.settings, "chroma_persist_directory", str(tmp_path / "data"))
     assert ensure_mirror("uploaded_files") is None

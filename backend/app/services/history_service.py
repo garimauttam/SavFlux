@@ -21,9 +21,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
+from app.core.paths import data_file
 
-settings = get_settings()
 _LOCK = threading.Lock()
 _GIT_TIMEOUT = 15
 
@@ -31,12 +30,13 @@ _GIT_TIMEOUT = 15
 # ── Mirrors ───────────────────────────────────────────────────────────────────
 
 def _mirrors_root() -> Path:
-    p = Path(settings.chroma_persist_directory) / "mirrors"
+    """Resolved lazily so a changed data dir takes effect immediately."""
+    root = data_file("mirrors")
     try:
-        p.mkdir(parents=True, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
-    return p
+    return root
 
 
 def mirror_slug(repo_url: str) -> str:

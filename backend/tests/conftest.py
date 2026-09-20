@@ -24,6 +24,30 @@ def _make_fake_settings():
     return Settings(llm_provider="openai", openai_api_key="sk-test-fake-key-for-tests")
 
 
+@pytest.fixture()
+def isolated_data_dir(tmp_path, monkeypatch):
+    """
+    Redirect ALL local SavFlux state (ledger, prompts, snippets, notifications,
+    analytics, watcher state, share links, git mirrors) into a per-test tmp dir.
+
+    WHY ONE FIXTURE INSTEAD OF PATCHING EACH SERVICE?
+    Tests used to do `monkeypatch.setattr(mod.settings, "chroma_persist_directory", ...)`
+    once per service module. That only worked because each service happened to
+    snapshot `settings` at import time, and it silently missed any service the
+    test forgot to list — a test could pass while writing into the developer's
+    real `chroma_data/`.
+
+    Every service now resolves its path through `app.core.paths.data_file()`, so
+    patching `data_dir` in that one module isolates all of them at once.
+    """
+    import app.core.paths as paths
+
+    target = tmp_path / "data"
+    target.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(paths, "data_dir", lambda: target)
+    return target
+
+
 @pytest.fixture(scope="session")
 def client():
     """

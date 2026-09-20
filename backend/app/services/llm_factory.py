@@ -188,6 +188,48 @@ def get_provider_name() -> str:
     return f"OpenAI ({s.openai_chat_model}) + {s.openai_embedding_model}"
 
 
+def get_hosted_display_name() -> str:
+    """
+    Short vendor label for the hosted (non-Ollama) provider.
+
+    Used by the /health endpoint so the payload reads
+    `ok (DeepSeek — deepseek-chat)` rather than leaking a base URL.
+    Returns "Local" when the active provider has no hosted component.
+    """
+    s = _settings()
+    if s.llm_provider == "deepseek":
+        return "DeepSeek"
+    if s.llm_provider == "openai":
+        return "OpenAI"
+    return "Local"
+
+
+def get_hosted_client_kwargs() -> dict[str, Any] | None:
+    """
+    Connection kwargs for probing the hosted provider with `openai.AsyncOpenAI`.
+
+    Returns None for providers with no hosted endpoint (Ollama), so callers can
+    branch without re-implementing the provider matrix. Keeping this here means
+    /health never has to know which settings field holds which key.
+    """
+    s = _settings()
+    if s.llm_provider == "deepseek":
+        return {"api_key": s.deepseek_api_key, "base_url": s.deepseek_base_url}
+    if s.llm_provider == "openai":
+        return {"api_key": s.openai_api_key}
+    return None
+
+
+def get_hosted_model_name() -> str:
+    """Model name for the active hosted provider ("" when fully local)."""
+    s = _settings()
+    if s.llm_provider == "deepseek":
+        return s.deepseek_chat_model
+    if s.llm_provider == "openai":
+        return s.openai_chat_model
+    return ""
+
+
 def _require_key(name: str, value: Any) -> None:
     """Raise early if a required API key is missing."""
     if not value:

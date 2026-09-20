@@ -187,7 +187,7 @@ def compact_chat_history(chat_history: list[dict], max_turns: int = 6) -> str:
     HISTORY_TRUNCATE = 250
     history_str = ""
     for msg in chat_history[-max_turns:]:
-        role = "User" if msg.get("role") == "user" else "CodeSage"
+        role = "User" if msg.get("role") == "user" else "SavFlux"
         content = msg.get("content", "")
         if len(content) > HISTORY_TRUNCATE:
             content = content[:HISTORY_TRUNCATE] + "…[truncated]"

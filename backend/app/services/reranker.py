@@ -57,6 +57,17 @@ def _get_cross_encoder():
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
+RERANK_SCORE_KEY = "rerank_score"
+"""
+Metadata key holding the cross-encoder relevance score for a chunk.
+
+Written onto `Document.metadata` by `rerank()` so downstream consumers (the
+trust ledger, diagnostics) can reason about *how* relevant a chunk was rather
+than just its ordinal position. Absent when reranking was skipped or failed —
+callers must treat a missing key as "unscored", never as zero.
+"""
+
+
 async def rerank(
     query: str,
     documents: list[Document],
@@ -65,6 +76,12 @@ async def rerank(
     """
     Re-rank a list of documents by relevance to the query.
     Returns the top_n most relevant documents, sorted by score descending.
+
+    Each returned document carries its cross-encoder score under
+    `metadata[RERANK_SCORE_KEY]`. The score is the evidence behind a citation's
+    trust level: a chunk that merely placed first in a weak field is not the
+    same as one the cross-encoder scored highly, and the UI should not present
+    them identically.
 
     We run it in a thread because CrossEncoder.predict() is synchronous CPU work.
     Running it directly in the async event loop would block all other requests.
@@ -83,7 +100,16 @@ async def rerank(
         scores = cross_encoder.predict(pairs)
         # Zip scores with docs, sort by score descending, return top_n docs
         scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in scored[:top_n]]
+        ranked: list[Document] = []
+        for score, doc in scored[:top_n]:
+            # Copy before mutating: these Documents come from a module-level BM25
+            # cache shared across requests, so writing a per-query score onto them
+            # in place would leak one user's relevance scores into another's results.
+            ranked.append(Document(
+                page_content=doc.page_content,
+                metadata={**doc.metadata, RERANK_SCORE_KEY: float(score)},
+            ))
+        return ranked
 
     try:
         result = await asyncio.to_thread(_score)

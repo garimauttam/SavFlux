@@ -1,0 +1,102 @@
+name: SavFlux Automated PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 2 only fetches the PR merge ref, so origin/<base> and
+          # origin/<head> do not exist locally and `git diff` aborts with
+          # "unknown revision". 0 fetches full history so the merge base is
+          # reachable.
+          fetch-depth: 0
+
+      - name: Extract PR Diff
+        id: diff
+        run: |
+          set -euo pipefail
+          # Diff the exact SHAs from the event payload rather than branch names:
+          # a force-push mid-run would silently move a branch ref and review the
+          # wrong code. Three-dot = changes introduced by the PR, excluding
+          # commits that landed on the base branch after it was opened.
+          BASE='${{ github.event.pull_request.base.sha }}'
+          HEAD='${{ github.event.pull_request.head.sha }}'
+          git diff "$BASE...$HEAD" > pr_diff.patch
+          echo "diff_size=$(wc -c < pr_diff.patch)" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger SavFlux Agent Review
+        id: savflux
+        env:
+          # Accept either name: the secrets were registered as CODESAGE_* before
+          # the rename, and secrets live in repo settings, not in git, so a
+          # find/replace here cannot migrate them.
+          BACKEND_URL: ${{ secrets.SAVFLUX_BACKEND_URL || secrets.CODESAGE_BACKEND_URL }}
+          WEBHOOK_SECRET: ${{ secrets.SAVFLUX_WEBHOOK_SECRET || secrets.CODESAGE_WEBHOOK_SECRET }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${BACKEND_URL}" ]; then
+            echo "No backend URL configured — skipping AI review."
+            echo "Set the SAVFLUX_BACKEND_URL repository secret to enable it."
+            echo "SAVFLUX_SKIPPED=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          DIFF_CONTENT=$(head -c 40000 pr_diff.patch)
+
+          # PR title is untrusted input — pass via env, never interpolate into
+          # the shell, or a crafted title can inject commands into this runner.
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO" \
+            --arg pr "$PR_NUMBER" \
+            --arg diff "$DIFF_CONTENT" \
+            --arg title "$PR_TITLE" \
+            '{repo: $repo, pr_number: ($pr|tonumber), title: $title, diff: $diff}')
+
+          HTTP_CODE=$(curl -sS -o response.json -w '%{http_code}' \
+            --max-time 120 --retry 2 --retry-connrefused \
+            -X POST "${BACKEND_URL}/api/v1/review/pr-webhook" \
+            -H "Content-Type: application/json" \
+            -H "X-SavFlux-Token: ${WEBHOOK_SECRET}" \
+            -d "$PAYLOAD") || HTTP_CODE="000"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Backend returned HTTP ${HTTP_CODE} — skipping review comment."
+            head -c 500 response.json || true
+            echo "SAVFLUX_SKIPPED=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          {
+            echo "REVIEW_BODY<<SAVFLUX_EOF"
+            jq -r '.review // "Review generation completed."' response.json
+            echo "SAVFLUX_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Post PR Review Comment
+        if: env.SAVFLUX_SKIPPED != '1'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const review = process.env.REVIEW_BODY;
+            const commentBody = `### 🧙‍♂️ SavFlux AI Pull Request Review\n\n${review}\n\n---\n*Automated review by [SavFlux Agent](https://github.com/${context.repo.owner}/${context.repo.repo})*`;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });

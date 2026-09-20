@@ -6,10 +6,9 @@ import pytest
 
 
 @pytest.fixture()
-def _isolated_storage(tmp_path, monkeypatch):
-    import app.services.share_service as ss
-    monkeypatch.setattr(ss.settings, "chroma_persist_directory", str(tmp_path))
-    return tmp_path
+def _isolated_storage(isolated_data_dir):
+    """All share-link state redirected to a tmp dir (see conftest)."""
+    return isolated_data_dir
 
 
 def test_share_crud(_isolated_storage):

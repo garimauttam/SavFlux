@@ -22,6 +22,13 @@ RESULT:
 - No unrelated code noise in the chunk
 - `symbol_name` metadata enables precise citation ("In `auth.py::verify_token`:")
 
+LINE-PRECISE CITATIONS:
+Every chunk also carries `start_line` / `end_line` (1-indexed, inclusive) —
+the exact span in the ORIGINAL file the chunk was cut from. That is what turns
+a file-level citation ("auth.py") into evidence ("auth.py:42-58"), and what
+lets the UI scroll to and highlight the cited lines. Computing it here is free:
+the AST already knows every node's line range.
+
 LIMITATIONS:
 - Python only — other languages use RecursiveCharacterTextSplitter as before
 - Decorated functions: the decorator is included in the chunk (correct behaviour)
@@ -44,10 +51,26 @@ def _source_lines(source: str) -> List[str]:
 
 
 def _extract_node_source(lines: List[str], node: ast.AST) -> str:
-    """Extract the source text for an AST node using line numbers."""
-    start = node.lineno - 1   # ast is 1-indexed
-    end   = node.end_lineno   # exclusive upper bound when used as slice
-    return "".join(lines[start:end])
+    """
+    Extract the source text for an AST node, including any decorators.
+
+    WHY DECORATORS MUST BE INCLUDED
+    `node.lineno` for a decorated function points at the `def` line, not at the
+    first `@`. Slicing from there dropped every decorator from the chunk — and
+    because the module-level pass treats decorator lines as "inside a
+    definition", they were excluded from the module chunk too. The result was
+    that decorator lines existed in *no* chunk and were therefore absent from
+    the index entirely:
+
+        @app.get("/api/v1/users/{user_id}")   ← unsearchable
+        def read_user(user_id: int): ...
+
+    Searching for a route path, a Celery task name, or a pytest fixture marker
+    returned nothing, and the LLM never saw that a function was a route handler
+    at all. `_node_span` uses the same start line, so spans and text agree.
+    """
+    start, end = _node_span(node)
+    return "".join(lines[start - 1:end])   # ast is 1-indexed; slice end is exclusive
 
 
 def _node_name(node: ast.AST) -> str:
@@ -69,6 +92,93 @@ def _node_type(node: ast.AST) -> str:
     return "module"
 
 
+def _node_span(node: ast.AST) -> tuple[int, int]:
+    """
+    Return the 1-indexed, inclusive (start_line, end_line) a node occupies.
+
+    Decorators are part of the definition as far as a reader is concerned, so
+    `@app.get("/x")` on the line above `def handler():` is included in the span.
+    `_extract_node_source` slices from `node.lineno`, so the two must agree or
+    the cited line numbers would be off by the decorator count.
+    """
+    start = node.lineno
+    end = getattr(node, "end_lineno", None) or node.lineno
+    for decorator in getattr(node, "decorator_list", []):
+        start = min(start, decorator.lineno)
+    return start, end
+
+
+def _line_span_of_offset(
+    source: str, start_offset: int, length: int
+) -> tuple[int, int]:
+    """
+    Convert a character offset + length inside `source` into 1-indexed line numbers.
+
+    Used when a single oversized function is window-split: each window covers a
+    different slice of the same node, so they must not all claim the node's full
+    span or every window would cite identical lines.
+
+    The end line is derived from the slice's LAST character rather than from a
+    newline count over the whole slice. A slice ending exactly on "\n" closes the
+    line it terminates; counting newlines would push end_line one past it and
+    report a line that the chunk does not actually contain (and which may not
+    exist at all, when the slice ends at end-of-file).
+    """
+    start_line = source.count("\n", 0, start_offset) + 1
+    if length <= 0:
+        return start_line, start_line
+    last_char_index = min(start_offset + length, len(source)) - 1
+    end_line = source.count("\n", 0, last_char_index) + 1
+    return start_line, max(start_line, end_line)
+
+
+def _encode_line_ranges(line_numbers: List[int]) -> str:
+    """
+    Collapse a sorted list of line numbers into compact ranges: "1-30,88-92".
+
+    ChromaDB metadata values must be scalars (str/int/float/bool) — a list is
+    rejected — so discontinuous spans are encoded as a string and parsed back by
+    the consumer. Adjacent numbers merge into a single range, which keeps the
+    value short even for a file with imports scattered throughout.
+    """
+    if not line_numbers:
+        return ""
+    ranges: List[tuple[int, int]] = []
+    start = previous = line_numbers[0]
+    for line in line_numbers[1:]:
+        if line == previous + 1:
+            previous = line
+            continue
+        ranges.append((start, previous))
+        start = previous = line
+    ranges.append((start, previous))
+    return ",".join(f"{a}-{b}" if a != b else str(a) for a, b in ranges)
+
+
+def parse_line_ranges(encoded: str) -> List[tuple[int, int]]:
+    """
+    Inverse of :func:`_encode_line_ranges`. Malformed segments are skipped.
+
+    Returns [] for empty input so callers can treat "no detailed ranges" and
+    "unparseable ranges" the same way — fall back to start_line/end_line.
+    """
+    ranges: List[tuple[int, int]] = []
+    for part in (encoded or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                a, b = part.split("-", 1)
+                ranges.append((int(a), int(b)))
+            else:
+                value = int(part)
+                ranges.append((value, value))
+        except ValueError:
+            continue
+    return ranges
+
+
 def _split_class_by_methods(
     class_source: str,
     class_name: str,
@@ -78,11 +188,17 @@ def _split_class_by_methods(
     repo_url: str,
     base_metadata: dict,
     chunk_index_start: int,
+    class_start_line: int = 1,
 ) -> List[Document]:
     """
     When a class body is too large for one chunk, split by method.
     Prepend `class_header` (class Foo:  + class docstring) to each method chunk
     so the LLM always knows which class the method belongs to.
+
+    `class_start_line` is the class's first line in the ORIGINAL file. Method
+    line numbers are parsed from `class_source` (which starts at line 1), so they
+    must be rebased onto the original file or every method in an oversized class
+    would cite a line number near the top of the file.
     """
     try:
         tree = ast.parse(class_source)
@@ -109,6 +225,9 @@ def _split_class_by_methods(
         if len(combined) < MIN_CHUNK_CHARS:
             continue
 
+        # Rebase the method's span from class-relative onto file-absolute.
+        # class_source line 1 == class_start_line in the original file.
+        method_start, method_end = _node_span(method)
         docs.append(Document(
             page_content=combined[:MAX_CHUNK_CHARS],
             metadata={
@@ -116,6 +235,8 @@ def _split_class_by_methods(
                 "symbol_name": f"{class_name}.{method.name}",
                 "symbol_type": "method",
                 "chunk_index": chunk_idx,
+                "start_line": class_start_line + method_start - 1,
+                "end_line": class_start_line + method_end - 1,
             },
         ))
         chunk_idx += 1
@@ -178,12 +299,24 @@ def chunk_python_file(
         definition_line_set.update(range(start, end + 1))
 
     module_level_lines: List[str] = []
+    module_line_numbers: List[int] = []
     for line_number, line in enumerate(lines, start=1):
         if line_number not in definition_line_set:
             module_level_lines.append(line)
+            module_line_numbers.append(line_number)
 
     module_content = "".join(module_level_lines).strip()
     if len(module_content) >= MIN_CHUNK_CHARS:
+        # Module-level code is gathered from NON-CONTIGUOUS regions: the import
+        # header, then constants sitting between function definitions. A single
+        # start/end pair would span the whole file and highlight 150 lines to
+        # point at 20 — technically true, useless as evidence.
+        #
+        # So we record both:
+        #   start_line/end_line — the hull, for consumers that expect one range
+        #   line_ranges         — "1-30,88-92", the exact regions, so the UI can
+        #                         highlight only the lines really in this chunk
+        # ChromaDB metadata must be a scalar, hence the compact string encoding.
         docs.append(Document(
             page_content=module_content[:MAX_CHUNK_CHARS],
             metadata={
@@ -191,6 +324,9 @@ def chunk_python_file(
                 "symbol_name": "<module>",
                 "symbol_type": "module",
                 "chunk_index": chunk_idx,
+                "start_line": module_line_numbers[0],
+                "end_line": module_line_numbers[-1],
+                "line_ranges": _encode_line_ranges(module_line_numbers),
             },
         ))
         chunk_idx += 1
@@ -203,6 +339,7 @@ def chunk_python_file(
         node_src = _extract_node_source(lines, node)
         symbol_name = _node_name(node)
         symbol_type = _node_type(node)
+        node_start, node_end = _node_span(node)
 
         if len(node_src) < MIN_CHUNK_CHARS:
             continue  # skip trivial stubs
@@ -215,6 +352,8 @@ def chunk_python_file(
                     "symbol_name": symbol_name,
                     "symbol_type": symbol_type,
                     "chunk_index": chunk_idx,
+                    "start_line": node_start,
+                    "end_line": node_end,
                 },
             ))
             chunk_idx += 1
@@ -239,6 +378,7 @@ def chunk_python_file(
                     repo_url=repo_url,
                     base_metadata=base_metadata,
                     chunk_index_start=chunk_idx,
+                    class_start_line=node.lineno,
                 )
                 docs.extend(sub_docs)
                 chunk_idx += len(sub_docs)
@@ -250,6 +390,9 @@ def chunk_python_file(
                     part = node_src[start:start + MAX_CHUNK_CHARS]
                     if len(part) < MIN_CHUNK_CHARS:
                         break
+                    # Each window covers a different slice of the function, so
+                    # derive its own span instead of repeating the whole node's.
+                    win_start, win_end = _line_span_of_offset(node_src, start, len(part))
                     docs.append(Document(
                         page_content=part,
                         metadata={
@@ -257,6 +400,9 @@ def chunk_python_file(
                             "symbol_name": symbol_name,
                             "symbol_type": symbol_type,
                             "chunk_index": chunk_idx,
+                            # node_src starts at node.lineno, so rebase onto the file.
+                            "start_line": node.lineno + win_start - 1,
+                            "end_line": node.lineno + win_end - 1,
                         },
                     ))
                     chunk_idx += 1

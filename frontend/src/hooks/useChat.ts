@@ -8,7 +8,7 @@
  * 2. activeRepoUrl — passed to the backend so retrieval is scoped to one repo.
  *
  * 3. localStorage persistence — chat history is saved per-repo and restored on
- *    page refresh. Key format: "codesage:messages:{repoUrl}". Stored messages
+ *    page refresh. Key format: "savflux:messages:{repoUrl}". Stored messages
  *    have isStreaming stripped so a refreshed page never shows stale spinners.
  */
 
@@ -21,7 +21,7 @@ function generateId(): string {
 }
 
 function storageKey(repoUrl: string | null | undefined): string {
-  return `codesage:messages:${repoUrl ?? "__none__"}`;
+  return `savflux:messages:${repoUrl ?? "__none__"}`;
 }
 
 function loadMessages(repoUrl: string | null | undefined): Message[] {

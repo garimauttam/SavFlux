@@ -1,6 +1,6 @@
-# CodeSage — QLoRA Fine-Tuning
+# SavFlux — QLoRA Fine-Tuning
 
-This directory contains the **full** fine-tuning pipeline for CodeSage's local model.
+This directory contains the **full** fine-tuning pipeline for SavFlux's local model.
 The production request path remains:
 
 ```
@@ -35,7 +35,7 @@ in ChatML format:
 
 ```json
 {"messages":[
-  {"role":"system","content":"You are CodeSage, a grounded code review assistant. Use only the supplied code and evidence."},
+  {"role":"system","content":"You are SavFlux, a grounded code review assistant. Use only the supplied code and evidence."},
   {"role":"user","content":"Review this Python function.\n\n```python\ndef get_user(id):\n    return db.execute(\"SELECT * FROM users WHERE id=\"+id)\n```"},
   {"role":"assistant","content":"## Bugs & Critical Issues\n- **SQL injection** (line 2): `id` is concatenated directly into the query string.\n\n## Suggested Fix\n```python\ndef get_user(id):\n    return db.execute(\"SELECT * FROM users WHERE id=?\", (id,))\n```\n\n## Evidence\nThe string concatenation on line 2 passes unsanitised input to `db.execute`."}
 ]}
@@ -71,16 +71,16 @@ python training/train.py
 python training/train.py --merge-only --export-ollama
 
 # 5. Convert to GGUF (requires llama.cpp)
-python llama.cpp/convert_hf_to_gguf.py training/output/merged --outfile codesage.gguf
+python llama.cpp/convert_hf_to_gguf.py training/output/merged --outfile savflux.gguf
 
 # 6. (Optional) quantise for CPU / low-VRAM inference
-llama.cpp/llama-quantize codesage.gguf codesage-q4_k_m.gguf Q4_K_M
+llama.cpp/llama-quantize savflux.gguf savflux-q4_k_m.gguf Q4_K_M
 
 # 7. Register with Ollama
-ollama create codesage-7b -f training/output/Modelfile
+ollama create savflux-7b -f training/output/Modelfile
 
-# 8. Set the model in .env and restart CodeSage
-#    OLLAMA_CHAT_MODEL=codesage-7b
+# 8. Set the model in .env and restart SavFlux
+#    OLLAMA_CHAT_MODEL=savflux-7b
 ```
 
 ---

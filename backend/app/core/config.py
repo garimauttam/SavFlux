@@ -75,6 +75,12 @@ class Settings(BaseSettings):
 
     # --- ChromaDB ---
     chroma_persist_directory: str = "./chroma_data"
+    # Deliberately still "codesage" after the rename to SavFlux. This is a
+    # storage key, not branding: every already-indexed repository lives in a
+    # collection with this name. Changing it does not migrate anything — it
+    # silently points the app at a new, empty collection, so existing users
+    # would see their whole index vanish with no error. Override it with
+    # CHROMA_COLLECTION_NAME if you want a fresh namespace.
     chroma_collection_name: str = "codesage"
 
     # --- Chunking ---
@@ -88,7 +94,7 @@ class Settings(BaseSettings):
     review_mode: Literal["fast", "agentic"] = "fast"
     # review_max_full_files: max files that get a full LLM review per batch.
     # Remaining files get fast deterministic static analysis.
-    # Set to 80 to cover full-repo reviews (CodeSage itself has ~79 indexable files).
+    # Set to 80 to cover full-repo reviews (SavFlux itself has ~79 indexable files).
     # Raise further for larger repos; the only cost is wall-clock time at
     # review_concurrency=3 concurrent LLM calls.
     review_max_full_files: int = 80
@@ -101,7 +107,7 @@ class Settings(BaseSettings):
     # Free tier at smith.langchain.com — no credit card needed.
     langchain_tracing_v2: Optional[str] = None       # "true" to enable
     langchain_api_key: Optional[str] = None           # from smith.langchain.com
-    langchain_project: str = "codesage"               # project name in LangSmith UI
+    langchain_project: str = "savflux"               # project name in LangSmith UI
 
     # --- Authentication ---
     # API key that protects all write/query endpoints.

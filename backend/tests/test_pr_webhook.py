@@ -84,16 +84,20 @@ def test_static_triage_ignores_ui_words_that_look_like_sql():
         "const isSearchDim = matchingIds !== null;",
     ])
     review = _static_triage({"file_name": "App.tsx", "language": "tsx", "content": content})
-    assert "Dynamic SQL" not in review
-    assert "No high-signal security patterns" in review
+    # `selectedNode`/`isSelected` contain the substring "select"; a keyword scan
+    # reads that as SQL. Asserting on the all-clear marker rather than the
+    # absence of one phrase keeps this honest if rule wording changes.
+    security = review.split("## 🔒 Security")[1].split("## ⚠️")[0]
+    assert "✅" in security, f"clean TSX should have no security findings, got: {security}"
 
 
 def test_static_triage_flags_real_dynamic_sql():
     content = 'cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")'
     review = _static_triage({"file_name": "db.py", "language": "py", "content": content})
-    # New format: "🗄️ **Dynamic SQL** at line(s) 1"
-    assert "Dynamic SQL" in review
-    assert "1" in review
+    security = review.split("## 🔒 Security")[1].split("## ⚠️")[0]
+    assert "SQL injection" in security
+    assert "CWE-89" in security, "a security finding should carry its CWE id"
+    assert "L1" in security, "the finding should name the offending line"
 
 
 def test_static_triage_ignores_placeholder_secret_config():
