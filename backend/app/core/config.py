@@ -41,10 +41,19 @@ def _load_json_configs() -> dict:
 
 class Settings(BaseSettings):
     # --- LLM Provider ---
-    # "deepseek" → DeepSeek hosted API (primary), Ollama local (fallback)
-    # "ollama"   → fully local, no API key, no quota
+    # "ollama"   → fully local via Ollama, no API key, no quota, no network.
+    #              THE DEFAULT, because the README promises "$0, no credit card"
+    #              and a default that needs a key makes that promise false.
+    # "deepseek" → hosted DeepSeek API (cheap, paid), falls back to local Ollama
     # "openai"   → GPT-4o, paid
-    llm_provider: Literal["openai", "ollama", "deepseek"] = "deepseek"
+    #
+    # Every provider in this Literal must have a branch in llm_factory's
+    # `_build_chat_llm`, `get_provider_name`, `get_hosted_client_kwargs` and
+    # `get_embedding_fn`. A provider named in docs but absent here is not a
+    # missing feature, it is a startup crash: pydantic rejects the value before
+    # any route runs. That is exactly what `.env.example` used to instruct users
+    # to do, so test_provider_config.py now asserts the two agree.
+    llm_provider: Literal["ollama", "deepseek", "openai"] = "ollama"
 
     # --- OpenAI (used when llm_provider=openai) ---
     openai_api_key: Optional[str] = None
@@ -54,19 +63,64 @@ class Settings(BaseSettings):
     # --- Ollama (self-hosted local models) ---
     # Requires Ollama running at ollama_base_url with the model already pulled.
     ollama_base_url: str = "http://localhost:11434"
-    ollama_chat_model: str = "qwen2.5-coder:14b"
+    #
+    # SIZES MATTER, because a default nobody can run is not a default. A fresh
+    # clone pulls exactly one model, so `ollama_chat_model` is chosen to run on an
+    # 8 GB laptop on CPU:
+    #   qwen2.5-coder:7b  ~4.7 GB   the default — runs on 8 GB, Apache-2.0
+    #   qwen2.5-coder:14b ~9.0 GB   better, needs ~16 GB or a GPU
+    #   qwen2.5-coder:32b ~20 GB    best local, needs ~32 GB
+    ollama_chat_model: str = "qwen2.5-coder:7b"
     # ollama_review_model: dedicated model for code reviews (Tier 2 — full reasoning).
-    # deepseek-r1:14b has strong reasoning for code. Falls back to ollama_chat_model if empty.
-    ollama_review_model: str = "deepseek-r1:14b"
+    #
+    # Empty by default ON PURPOSE, and it falls back to `ollama_chat_model`. Setting
+    # it to a second model means a fresh install downloads twice before a review can
+    # run at all, which is how a "$0 in 5 minutes" quickstart becomes a 9 GB wait.
+    # One model that works beats two that might not start.
+    #
+    # To spend more of your machine on review reasoning — genuinely worth it if you
+    # have the RAM — set either of these. Both are open-weight:
+    #   OLLAMA_REVIEW_MODEL=deepseek-r1:7b    ~4.7 GB, MIT, reasoning traces
+    #   OLLAMA_REVIEW_MODEL=deepseek-r1:14b   ~9.0 GB, MIT, strongest of the two
+    ollama_review_model: str = ""
     # ollama_fast_model: cheap/fast model for Tier-1 files (config, yaml, small utils).
     # Set to "" to disable Tier-1 routing (all LLM files use the full model).
-    # Example: "qwen2.5-coder:7b" — smaller, faster, good enough for low-risk files.
+    # Example: "qwen2.5-coder:1.5b" — smaller, faster, good enough for low-risk files.
     ollama_fast_model: str = ""
     # summary_mixture_models: list of Ollama model names to use for MoA repo summary.
     # If empty (default), the repo summary uses the single configured provider as before.
     # Example: "qwen2.5-coder:7b,deepseek-r1:1.5b" (comma-separated)
     # Each model gets the same prompt in parallel; an aggregator synthesises their drafts.
     summary_mixture_models: str = ""
+
+    # --- Embeddings (local, free) — used by every provider except openai ---
+    # This is the model that decides WHAT the LLM is allowed to read. Retrieval
+    # quality is a hard ceiling on answer quality: a 7B code model handed the
+    # wrong three chunks still answers wrong. So it is a setting, not a literal.
+    #
+    #   all-MiniLM-L6-v2               384d   ~80 MB   Apache-2.0   ← default
+    #       General-purpose English sentences. Fast, runs anywhere — and has never
+    #       seen a code corpus. It also reads only 256 tokens and silently drops
+    #       the rest, which the chunker's 3000-char ceiling guarantees will happen.
+    #
+    #   jinaai/jina-embeddings-v2-base-code   768d   ~640 MB  Apache-2.0
+    #       Trained on github-code + 150M code Q&A pairs. 8K context, 30 languages.
+    #       Better retrieval on code; costs a re-index because the dims differ.
+    #
+    # Switching this while a populated chroma_data/ exists mixes 384-dim vectors
+    # with 768-dim ones and returns noise. Wipe the collection and re-index.
+    # `tests/test_embedding_config.py` pins the dimensions and window of each
+    # documented option so the numbers in this comment cannot quietly go stale.
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # sentence-transformers encodes a batch at a time. The old hardcoded 1 left the
+    # hardware almost entirely idle. This changes how long indexing takes, not the
+    # vectors: each row is encoded independently and padding is attention-masked.
+    embedding_batch_size: int = 32
+    # "auto" | "cpu" | "cuda" | "mps". "auto" uses CUDA when torch can see a GPU
+    # and falls back to CPU otherwise, so the same default works on a laptop CI box
+    # and a workstation. Override to "cpu" if a GPU is present but you want the CPU
+    # left free for something else.
+    embedding_device: str = "auto"
 
     # --- DeepSeek API (OpenAI-compatible, primary provider) ---
     deepseek_api_key: Optional[str] = None
@@ -157,6 +211,42 @@ class Settings(BaseSettings):
 
     # Accept Union of str or List[str] so pydantic_settings doesn't treat it as complex JSON decode
     cors_origins: str | List[str] = "http://localhost:3000,http://localhost:5173"
+
+    # --- Embedding settings: reject values that fail late and confusingly ---
+
+    @field_validator("embedding_batch_size", mode="after")
+    @classmethod
+    def _validate_embedding_batch_size(cls, v: int) -> int:
+        """
+        A batch size of 0 reaches sentence-transformers as an empty batch and
+        surfaces much later as an IndexError from inside torch, pointing at a
+        library rather than at the config line that caused it. Fail here instead.
+        """
+        if v < 1:
+            raise ValueError(
+                f"EMBEDDING_BATCH_SIZE must be at least 1, got {v}. "
+                "A batch size of 0 encodes nothing and fails inside torch."
+            )
+        return v
+
+    @field_validator("embedding_device", mode="after")
+    @classmethod
+    def _validate_embedding_device(cls, v: str) -> str:
+        """
+        Validate against the devices torch actually exposes.
+
+        The cost of not doing this: a typo like "gpu" is accepted by pydantic,
+        passed to torch, and fails on the first embedding call — during indexing,
+        after the clone, the parse and the chunking have already run.
+        """
+        allowed = {"auto", "cpu", "cuda", "mps"}
+        normalised = v.strip().lower()
+        if normalised not in allowed:
+            raise ValueError(
+                f"EMBEDDING_DEVICE must be one of {sorted(allowed)}, got {v!r}. "
+                "Use 'auto' to pick CUDA when available and otherwise fall back."
+            )
+        return normalised
 
     @field_validator("cors_origins", mode="after")
     @classmethod

@@ -26,12 +26,17 @@ from dataclasses import dataclass, field
 
 from app.services.code_analysis import analyze_file
 from app.services.code_analysis.autofix import AppliedFix, autofix_python
+from app.services.code_analysis.autofix_js import JS_EXTENSIONS, autofix_javascript
 from app.services.patch_service import FileChange, PatchError, build_patch
 
 #: Extensions this module can rewrite. Other languages are analysed but not
 #: edited — a fixer that has never been verified for a language is worse than
 #: no fixer at all.
 PYTHON_EXTENSIONS = frozenset({"py", "pyw", "pyi"})
+
+#: Languages with a deterministic fixer. Kept as one set so the dispatch and the
+#: error message cannot disagree about what is supported.
+FIXABLE_EXTENSIONS = PYTHON_EXTENSIONS | JS_EXTENSIONS
 
 
 class FixError(Exception):
@@ -133,7 +138,14 @@ def _apply(original: str, path: str, language: str) -> FixOutcome:
         score_before=analysis.risk_score(),
     )
 
-    result = autofix_python(original, analysis.findings, path)
+    # One dispatch, by language. Both fixers return the same `FixResult`, so
+    # everything below — the re-analysis, the score delta, the patch — is
+    # identical for either and cannot diverge.
+    if language in PYTHON_EXTENSIONS:
+        result = autofix_python(original, analysis.findings, path)
+    else:
+        result = autofix_javascript(original, analysis.findings, path, language)
+
     outcome.fixes = result.fixes
     outcome.skipped = result.rejected
     outcome.content = result.content
@@ -181,10 +193,14 @@ async def apply_fixes(
     loop that is simultaneously streaming someone else's review.
     """
     language = detect_language(path)
-    if language not in PYTHON_EXTENSIONS:
+    if language not in FIXABLE_EXTENSIONS:
+        # Name the languages, not the extension list: the caller is a person
+        # reading a 400. Saying "Python, JavaScript and TypeScript" answers the
+        # question they actually have.
         raise UnsupportedLanguageError(
-            "Automatic fixes are currently implemented for Python only. "
-            "Other languages are analysed but not rewritten."
+            "Automatic fixes are implemented for Python, JavaScript and "
+            f"TypeScript. {language or 'This file'} is analysed but not rewritten "
+            "— a fixer that has not been verified for a language is worse than none."
         )
 
     original = content or ""

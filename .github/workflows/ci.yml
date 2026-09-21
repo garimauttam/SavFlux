@@ -39,9 +39,17 @@ jobs:
         env:
           # CI secrets — provide dummy values so Pydantic settings validation passes.
           # Tests mock all real external calls (LLM, ChromaDB) so these are never used.
+          #
+          # LLM_PROVIDER=openai here is deliberate and not interchangeable with the
+          # app's `ollama` default. The `openai` path uses OpenAIEmbeddings, so it
+          # never imports sentence-transformers. On the ollama path, any test that
+          # reaches get_embedding_fn() tries to fetch all-MiniLM-L6-v2 from
+          # HuggingFace — and on a sandbox without egress that is 5 retries with
+          # exponential backoff (~30s per affected test) rather than a failure.
+          # The suite goes from "apparent hang" to ~5s because of this line.
+          # Local runs need it too: see README's testing section.
           LLM_PROVIDER: openai
           OPENAI_API_KEY: sk-ci-placeholder
-          GEMINI_API_KEY: ci-placeholder
         run: python -m pytest -v --tb=short
 
   # ── Backend: RAG eval (self-benchmark) ──────────────────────────────────────
@@ -71,18 +79,30 @@ jobs:
         env:
           LLM_PROVIDER: openai
           OPENAI_API_KEY: sk-ci-placeholder
-          GEMINI_API_KEY: ci-placeholder
+        # --embedder offline --no-rerank keeps this job offline and fast.
+        #   `offline`  : a deterministic hashing embedder, no model download. It
+        #                exercises the dense branch's plumbing; its numbers are NOT
+        #                a measure of retrieval quality and the report says so.
+        #   `--no-rerank`: without it, each query retries a cross-encoder download
+        #                with exponential backoff before the failure path disables
+        #                it, turning a 2-second run into several minutes and
+        #                corrupting the latency metric.
         run: |
-          python eval_rag.py --quiet --json-out eval_results.json
+          python eval_rag.py --quiet --embedder offline --no-rerank --json-out eval_results.json
           echo "=== Benchmark Results ==="
           cat eval_results.json | python3 -c "
           import sys, json
           d = json.load(sys.stdin)
           m = d['metrics']
-          print(f\"Hit Rate @ 5:  {m['hit_rate_at_k']}%\")
-          print(f\"MRR:           {m['mean_reciprocal_rank_mrr']}\")
-          print(f\"Symbol Recall: {m['symbol_recall_pct']}%\")
-          print(f\"Avg Latency:   {m['avg_latency_ms']} ms/query\")
+          for leg, v in m['by_leg'].items():
+              if v.get('hit_rate_at_k') is None:
+                  print(f'  {leg:<16s} {v[\"note\"]}')
+              else:
+                  print(f'  {leg:<16s} hit@5={v[\"hit_rate_at_k\"]:>5.1f}%  '
+                        f'mrr={v[\"mean_reciprocal_rank_mrr\"]:.3f}  '
+                        f'symbols={v[\"symbol_recall_pct\"]:>5.1f}%')
+          print(f'  dense leg embedder: {m[\"dense_leg_embedder\"]}')
+          print(f'  avg latency: {m[\"avg_latency_ms\"]} ms/query')
           hr = m['hit_rate_at_k']
           if hr < 40:
               print(f'FAIL: Hit Rate {hr}% is below the 40% regression threshold.')

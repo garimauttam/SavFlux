@@ -103,7 +103,7 @@ def test_static_triage_flags_real_dynamic_sql():
 def test_static_triage_ignores_placeholder_secret_config():
     content = "\n".join([
         "OPENAI_API_KEY: sk-ci-placeholder",
-        "GEMINI_API_KEY=your_free_key_from_aistudio",
+        "DEEPSEEK_API_KEY=sk-your_deepseek_key",
         "api_key = settings.api_key",
     ])
     review = _static_triage({"file_name": "ci.yml", "language": "yml", "content": content})

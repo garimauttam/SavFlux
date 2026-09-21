@@ -13,9 +13,35 @@ We mock out external dependencies (OpenAI, ChromaDB) so tests:
   4. Are deterministic (no flaky LLM responses)
 """
 
-import pytest
-from unittest.mock import patch
-from fastapi.testclient import TestClient
+import os
+
+# ── Pin the provider BEFORE any app module is imported ────────────────────────
+#
+# The app defaults to `ollama`, which is right for users ($0, no key, offline)
+# and wrong for tests. On the local-embedding path, any test that reaches
+# get_embedding_fn() constructs HuggingFaceEmbeddings, which tries to fetch
+# all-MiniLM-L6-v2 from huggingface.co on first use. On a machine without egress
+# that is not a failure, it is five retries with exponential backoff — ~30s per
+# affected test, which reads as "the suite hangs" rather than "the suite needs
+# the network".
+#
+# CI already exported LLM_PROVIDER=openai for exactly this reason, so tests were
+# green there while the README's own command (`cd backend && pytest -q`) hung on
+# a fresh clone. Setting the default here makes local and CI agree, which is the
+# point: the suite must not be fast in one place and broken in the other.
+#
+# openai is chosen because that path uses OpenAIEmbeddings and never imports
+# sentence-transformers. No real call is made — every external client is mocked
+# below and no key is ever used for network access.
+#
+# setdefault, not assignment: an explicit LLM_PROVIDER still wins, so a developer
+# can point the suite at the local path deliberately.
+os.environ.setdefault("LLM_PROVIDER", "openai")
+os.environ.setdefault("OPENAI_API_KEY", "sk-test-fake-key-for-tests")
+
+import pytest  # noqa: E402 - must follow the env setup above
+from unittest.mock import patch  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
 
 def _make_fake_settings():
