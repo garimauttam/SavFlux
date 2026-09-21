@@ -14,11 +14,11 @@ We attach an instance of TokenUsageCallback to each LLM call via
   llm.with_config(callbacks=[get_token_callback()])
 This is non-invasive — no changes to the main LLM logic, just a side-channel observer.
 
-GEMINI NOTE:
-Gemini's LangChain wrapper populates llm_output["token_usage"] with
-  {"prompt_token_count": N, "candidates_token_count": M, "total_token_count": T}
-We read whichever keys are present, falling back to 0 for missing ones.
-OpenAI uses {"prompt_tokens", "completion_tokens", "total_tokens"}.
+TOKEN KEY NAMES ACROSS PROVIDERS:
+Every provider LangChain wraps reports usage under different keys —
+OpenAI-style {"prompt_tokens", "completion_tokens", "total_tokens"}, and
+others with *_count suffixes. We read whichever keys are present and fall back
+to 0 for the missing ones, so adding a provider cannot make this raise.
 """
 
 import threading

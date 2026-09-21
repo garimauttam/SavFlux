@@ -341,15 +341,22 @@ pip install -r requirements.txt
 
 **2 · Free local model**
 ```bash
-ollama pull qwen2.5-coder:14b
+# ~4.7 GB. Runs on an 8 GB laptop on CPU — the point of a free default.
+ollama pull qwen2.5-coder:7b
 ```
 ```bash
+# .env.example already contains exactly this, so copying it is enough.
 cat > .env <<'EOF'
 LLM_PROVIDER=ollama
-OLLAMA_CHAT_MODEL=qwen2.5-coder:14b
+OLLAMA_CHAT_MODEL=qwen2.5-coder:7b
 OLLAMA_BASE_URL=http://localhost:11434
 EOF
 ```
+
+Have more RAM? `qwen2.5-coder:14b` (~9 GB) is a straight quality upgrade, and
+`OLLAMA_REVIEW_MODEL=deepseek-r1:14b` spends it on review reasoning instead.
+Both are one line in `.env` — the default is small so the free path actually
+starts on a normal machine.
 
 </td><td width="50%" valign="top">
 
@@ -606,10 +613,17 @@ scripts/              reproducible benchmarks
 ## 🧪 Testing
 
 ```bash
-cd backend && pytest -q                 # 472 tests, ~4s
+cd backend && pytest -q                 # full suite, ~5s
 cd frontend && npx tsc --noEmit         # type check
 python3 scripts/bench_security.py       # reproduce the F1 table
 ```
+
+No environment setup is needed: `conftest.py` pins `LLM_PROVIDER=openai` so the
+suite never reaches for a downloadable model. Without that pin the local
+embedding path tries to fetch `all-MiniLM-L6-v2` from HuggingFace, and on a
+machine without egress that is five retries with exponential backoff per
+affected test — which reads as a hung suite. Exporting `LLM_PROVIDER` yourself
+still overrides it if you want to exercise the local path deliberately.
 
 Tests assert **behaviour, not wording** — `git apply --check` runs against a
 real scratch repo rather than comparing diff strings, which is how the

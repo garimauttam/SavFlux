@@ -146,6 +146,27 @@ def _build_chat_llm(provider: str, streaming: bool = False, *, review: bool = Fa
         raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
+def _resolve_embedding_device(configured: str) -> str:
+    """
+    Turn the `auto` setting into a concrete device.
+
+    `auto` exists so one shipped default is right on a CPU-only CI runner and on a
+    workstation with a GPU. torch is imported lazily and defensively: this function
+    runs while *building* the embedding function, and a torch that cannot
+    initialise CUDA must degrade to CPU, not take the request down with it.
+    """
+    if configured != "auto":
+        return configured
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:  # pragma: no cover - depends on the host's torch build
+        pass
+    return "cpu"
+
+
 @lru_cache(maxsize=1)
 def get_embedding_fn() -> Any:
     """
@@ -154,7 +175,8 @@ def get_embedding_fn() -> Any:
     IMPORTANT: the model used at index time must match the model used at query time.
     Mixing embedding models produces garbage retrieval. Re-index after switching.
 
-    deepseek / ollama providers use local HuggingFace all-MiniLM-L6-v2 (free, CPU).
+    deepseek / ollama providers use a local HuggingFace model — see
+    `embedding_model`, `embedding_batch_size` and `embedding_device` in config.
     openai uses text-embedding-3-small (paid, 1536 dims).
     """
     s = _settings()
@@ -164,9 +186,12 @@ def get_embedding_fn() -> Any:
         except ImportError:
             from langchain_community.embeddings import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True, "batch_size": 1},
+            model_name=s.embedding_model,
+            model_kwargs={"device": _resolve_embedding_device(s.embedding_device)},
+            encode_kwargs={
+                "normalize_embeddings": True,
+                "batch_size": s.embedding_batch_size,
+            },
         )
     else:
         _require_key("OPENAI_API_KEY", s.openai_api_key)
@@ -178,13 +203,23 @@ def get_embedding_fn() -> Any:
 
 
 def get_provider_name() -> str:
-    """Human-readable provider name for logging and health checks."""
+    """
+    Human-readable provider name for logging and health checks.
+
+    Reports the *configured* embedding model rather than the name of the model
+    that used to be hardcoded. This string is what `/health` shows and what the
+    benchmark output is stamped with, and both are useless for diagnosing a
+    retrieval problem if they name a model that is not the one running.
+    """
     s = _settings()
     if s.llm_provider == "ollama":
-        return f"Ollama ({s.ollama_chat_model}) + local MiniLM embeddings"
+        return f"Ollama ({s.ollama_chat_model}) + {s.embedding_model} embeddings"
     if s.llm_provider == "deepseek":
         review_model = s.ollama_review_model or s.ollama_chat_model
-        return f"DeepSeek ({s.deepseek_chat_model}) → Ollama ({review_model}) fallback + local MiniLM"
+        return (
+            f"DeepSeek ({s.deepseek_chat_model}) → Ollama ({review_model}) fallback "
+            f"+ {s.embedding_model}"
+        )
     return f"OpenAI ({s.openai_chat_model}) + {s.openai_embedding_model}"
 
 

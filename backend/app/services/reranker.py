@@ -39,6 +39,22 @@ _RERANKER_MAX_FAILURES = 5   # disable after 5 consecutive failures (real breaka
 # at import time (which would slow down every cold start, even for requests
 # that don't need re-ranking)
 
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+"""
+The cross-encoder whose raw logits `citation_service` calibrates against.
+
+Named here, once, because two places need to agree on it and they used to differ:
+
+  - `_get_cross_encoder()` builds it.
+  - `citation_service.HIGH_TRUST_SCORE` / `MEDIUM_TRUST_SCORE` are thresholds *in
+    this model's logit space*. Swapping the model without recalibrating them does
+    not error — it silently relabels every citation's trust level, keeping the
+    same confident wording while the numbers underneath it mean something else.
+
+`eval_rag.py` reports this string with every benchmark run so a change to it is
+visible in the results rather than inferred from a suspicious metric.
+"""
+
 
 @lru_cache(maxsize=1)
 def _get_cross_encoder():
@@ -54,7 +70,7 @@ def _get_cross_encoder():
     - ~80MB — small enough to include in a Docker image
     """
     from sentence_transformers import CrossEncoder
-    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return CrossEncoder(RERANKER_MODEL)
 
 
 RERANK_SCORE_KEY = "rerank_score"

@@ -733,8 +733,9 @@ def _get_raw_collection():
 
     WHY NOT USE _get_vectorstore() HERE?
     _get_vectorstore() (and the LangChain Chroma wrapper) calls get_embedding_fn() at
-    construction time. get_embedding_fn() imports sentence-transformers when the provider
-    is gemini/ollama/deepseek. If sentence-transformers is not installed, both
+    construction time. get_embedding_fn() imports sentence-transformers for every local
+    embedding provider (ollama, deepseek); only `openai` uses the hosted embedder.
+    If sentence-transformers is not installed, both
     get_indexed_files() and get_indexed_repos() crash with ImportError → HTTP 500.
 
     These metadata-only endpoints never perform semantic search, so they don't need

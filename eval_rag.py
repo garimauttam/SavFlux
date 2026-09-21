@@ -35,9 +35,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
 
 from typing import List, Dict, Any, Optional
 from langchain_core.documents import Document
-from app.services.hybrid_retriever import BM25Index, reciprocal_rank_fusion
-from app.services.reranker import rerank
+from app.services.hybrid_retriever import (
+    BM25Index,
+    reciprocal_rank_fusion,
+    two_branch_rrf,
+)
+from app.services.reranker import RERANK_SCORE_KEY, rerank
 from app.services.query_enhancer import extract_file_scope, local_query_variants
+from app.services.offline_embedder import DenseIndex
 
 
 # ── Benchmark Dataset ─────────────────────────────────────────────────────────
@@ -294,22 +299,97 @@ BENCHMARK_DATASET: List[Dict[str, Any]] = [
 
 # ── Evaluation Engine ─────────────────────────────────────────────────────────
 
+def _build_embedder(mode: str):
+    """
+    Return the embedder the dense leg will use.
+
+    `offline` is the deterministic hashing embedder: no download, no network, and
+    therefore runnable in CI. Its similarities are lexical, so numbers from it prove
+    the dense path *works* and say nothing about retrieval quality.
+
+    `model` is whatever `EMBEDDING_MODEL` names, i.e. what production uses. It needs
+    the weights available locally. There is deliberately NO silent fallback to the
+    offline embedder: a quality number that quietly came from a lexical stand-in is
+    worse than a failure, because it looks like evidence.
+    """
+    if mode == "offline":
+        from app.services.offline_embedder import OfflineEmbedder
+
+        return OfflineEmbedder()
+
+    if mode != "model":
+        raise ValueError(f"unknown embedder mode {mode!r}; expected 'offline' or 'model'")
+
+    from app.services.llm_factory import get_embedding_fn
+
+    try:
+        return get_embedding_fn()
+    except Exception as exc:  # noqa: BLE001 - any load failure is actionable here
+        raise RuntimeError(
+            f"Could not load the configured embedding model: {type(exc).__name__}: {exc}.\n"
+            "Run with --embedder offline for a plumbing-only check that needs no "
+            "weights, or install the model (needs access to huggingface.co)."
+        ) from exc
+
+
+def _rank_of(ranked_docs: List[Document], target_file: str) -> Optional[int]:
+    """1-based position of the first document from `target_file`, else None."""
+    needle = target_file.lower()
+    for idx, doc in enumerate(ranked_docs, start=1):
+        if needle in doc.metadata.get("file_name", "").lower():
+            return idx
+        if needle in doc.metadata.get("source", "").lower():
+            return idx
+    return None
+
+
+def _empty_leg() -> Dict[str, Any]:
+    return {"hits": 0, "ranks": [], "symbol_hits": 0, "symbols_expected": 0}
+
+
 async def evaluate_pipeline(
     dataset: List[Dict[str, Any]],
     corpus_docs: List[Document],
     top_k: int = 5,
     verbose: bool = True,
+    embedder_mode: str = "model",
+    rerank_enabled: bool = True,
 ) -> Dict[str, Any]:
     """
-    Evaluates retrieval performance across a benchmark dataset.
+    Evaluates retrieval performance across a benchmark dataset, PER RETRIEVAL LEG.
 
     Metrics computed:
     - Hit Rate @ K:      fraction of queries where the target file was in top-K results
     - MRR:               mean of 1/rank for the first hit (0 if miss)
     - Symbol Recall:     fraction of expected code symbols found in retrieved chunks
     - Avg latency (ms):  mean retrieval + reranking time per query
+
+    WHY PER-LEG
+    -----------
+    This benchmark used to run BM25 through flat RRF and call it "the pipeline". It
+    was neither the pipeline production runs (which adds a dense branch and fuses with
+    weighted two_branch_rrf) nor a measurement of the embedding model, which it never
+    loaded — so swapping the embedder could not move any number it produced.
+
+    Reporting each leg separately answers the question that actually decides whether
+    an embedder swap is worth a re-index: how much does the dense branch contribute
+    over BM25 alone, on this query mix? If BM25-only already scores highly, semantic
+    retrieval is not the bottleneck and a new embedder is money spent on the wrong
+    leg. If dense adds a lot, it is.
+
+    `bm25_only` and `dense_only` are each fused within their own branch with the same
+    RRF used in production; `fused` is production's weighted two_branch_rrf.
     """
     bm25 = BM25Index(corpus_docs)
+    dense = DenseIndex(corpus_docs, _build_embedder(embedder_mode))
+
+    legs: Dict[str, Dict[str, Any]] = {
+        "bm25_only": _empty_leg(),
+        "dense_only": _empty_leg(),
+        "fused": _empty_leg(),
+        "fused_reranked": _empty_leg(),
+    }
+    rerank_observed = False
 
     hits_at_k = 0
     reciprocal_ranks: List[float] = []
@@ -329,27 +409,56 @@ async def evaluate_pipeline(
 
         t0 = time.monotonic()
 
-        # Evaluate the same cheap query-variant strategy used by production RAG.
-        candidate_lists = [
+        # Same cheap query-variant strategy production uses, on both branches.
+        variants = list(local_query_variants(query))
+        bm25_lists = [
             bm25.search(query=variant, top_k=top_k * 3, file_filter=file_scope)
-            for variant in local_query_variants(query)
+            for variant in variants
         ]
-        bm25_candidates = reciprocal_rank_fusion(candidate_lists, top_n=top_k * 3)
+        dense_lists = [dense.search(query=variant, top_k=top_k * 3) for variant in variants]
 
-        # Cross-encoder reranking
-        ranked_docs = await rerank(query, bm25_candidates, top_n=top_k)
+        # ── Each leg, scored independently ───────────────────────────────────
+        leg_rankings = {
+            "bm25_only": reciprocal_rank_fusion(bm25_lists, top_n=top_k),
+            "dense_only": reciprocal_rank_fusion(dense_lists, top_n=top_k),
+            # Production's fusion: weighted branches, not flat RRF over both lists,
+            # which would give BM25 N× the weight for N query variants.
+            "fused": two_branch_rrf(dense_lists, bm25_lists, top_n=top_k * 3),
+        }
+
+        if rerank_enabled:
+            inner_reranked = await rerank(query, leg_rankings["fused"], top_n=top_k)
+            # A leg must not be reported as measured when it silently did not run.
+            # `rerank` returns its input unchanged when the cross-encoder cannot be
+            # loaded, so the presence of its score is the only evidence it ran — and
+            # asserting it here keeps a missing model from masquerading as a result.
+            if any(RERANK_SCORE_KEY in d.metadata for d in inner_reranked):
+                rerank_observed = True
+            leg_rankings["fused_reranked"] = inner_reranked
+        else:
+            leg_rankings["fused_reranked"] = leg_rankings["fused"]
+
+        for leg_name, ranking in leg_rankings.items():
+            leg = legs[leg_name]
+            leg_rank = _rank_of(ranking, target_file)
+            if leg_rank is not None:
+                leg["hits"] += 1
+                leg["ranks"].append(1.0 / leg_rank)
+            else:
+                leg["ranks"].append(0.0)
+
+            leg_text = " ".join(d.page_content for d in ranking)
+            leg["symbol_hits"] += sum(1 for s in expected_syms if s in leg_text)
+            leg["symbols_expected"] += len(expected_syms)
+
+        # The headline metrics follow production: fused, then reranked.
+        ranked_docs = leg_rankings["fused_reranked"]
 
         latency_ms = (time.monotonic() - t0) * 1000
         latencies.append(latency_ms)
 
         # ── Hit Rate & MRR ────────────────────────────────────────────────────
-        rank: Optional[int] = None
-        for idx, doc in enumerate(ranked_docs, start=1):
-            file_name = doc.metadata.get("file_name", "")
-            source    = doc.metadata.get("source", "")
-            if target_file.lower() in file_name.lower() or target_file.lower() in source.lower():
-                rank = idx
-                break
+        rank = _rank_of(ranked_docs, target_file)
 
         if rank is not None:
             hits_at_k += 1
@@ -393,6 +502,37 @@ async def evaluate_pipeline(
     sym_recall   = symbol_hits / total_expected_symbols if total_expected_symbols else 0.0
     avg_latency  = sum(latencies) / len(latencies) if latencies else 0.0
 
+    def _leg_metrics(leg: Dict[str, Any]) -> Dict[str, Any]:
+        n = total_queries or 1
+        return {
+            "hit_rate_at_k": round(leg["hits"] / n * 100, 2),
+            "mean_reciprocal_rank_mrr": round(sum(leg["ranks"]) / n, 3),
+            "symbol_recall_pct": round(
+                leg["symbol_hits"] / leg["symbols_expected"] * 100
+                if leg["symbols_expected"]
+                else 0.0,
+                2,
+            ),
+        }
+
+    by_leg = {name: _leg_metrics(leg) for name, leg in legs.items()}
+    if not rerank_enabled:
+        # Reported as null rather than as a number equal to the fused leg. A leg that
+        # did not execute must not appear in a results file as though it had.
+        by_leg["fused_reranked"] = {
+            "hit_rate_at_k": None,
+            "mean_reciprocal_rank_mrr": None,
+            "symbol_recall_pct": None,
+            "note": "reranking disabled (--no-rerank)",
+        }
+    elif not rerank_observed:
+        by_leg["fused_reranked"] = {
+            "hit_rate_at_k": None,
+            "mean_reciprocal_rank_mrr": None,
+            "symbol_recall_pct": None,
+            "note": "cross-encoder unavailable — reranking did not run",
+        }
+
     result = {
         "metrics": {
             "total_queries": total_queries,
@@ -404,6 +544,12 @@ async def evaluate_pipeline(
                 (sum(precision_values) / len(precision_values) if precision_values else 0.0) * 100,
                 2,
             ),
+            "by_leg": by_leg,
+            "dense_leg_embedder": (
+                "offline-hashing (NOT a quality model)"
+                if embedder_mode == "offline"
+                else "configured model"
+            ),
         },
         "query_breakdown": query_results,
     }
@@ -413,17 +559,106 @@ async def evaluate_pipeline(
         "dataset_sha256": hashlib.sha256(
             json.dumps(dataset, sort_keys=True).encode("utf-8")
         ).hexdigest(),
-        "retrieval": "BM25 + local query variants + RRF + cross-encoder reranking",
+        "retrieval": (
+            "dense + BM25 (weighted two-branch RRF)"
+            + (" + cross-encoder reranking" if rerank_enabled else " (reranking disabled)")
+        ),
     }
+    result["models"] = _model_provenance(embedder_mode)
     return result
 
 
+def _model_provenance(embedder_mode: str = "model") -> Dict[str, str]:
+    """
+    Record WHICH models produced these numbers.
+
+    Without this the benchmark is not a benchmark. Comparing a run on
+    all-MiniLM-L6-v2 with a run on jina-embeddings-v2-base-code is the entire
+    point of having a harness, and two JSON files that both say
+    "BM25 + RRF + cross-encoder reranking" cannot be told apart after the fact.
+
+    Nothing here loads a model: it reads configuration and, for the reranker, the
+    module constant that names it. A provenance block that required downloading
+    2 GB to print a string would not get printed.
+    """
+    provenance: Dict[str, str] = {
+        "retrieval": "dense + BM25 (weighted two-branch RRF) + cross-encoder reranking",
+        # Which embedder produced the dense-leg numbers. Without this, an offline
+        # plumbing run and a real quality run are indistinguishable in the artefact.
+        "dense_embedder_mode": embedder_mode,
+    }
+
+    try:
+        from app.core.config import get_settings
+
+        s = get_settings()
+        provenance["provider"] = s.llm_provider
+        if s.llm_provider == "openai":
+            provenance["embedder"] = s.openai_embedding_model
+        else:
+            provenance["embedder"] = s.embedding_model
+            provenance["embedder_device"] = s.embedding_device
+            provenance["embedder_batch_size"] = str(s.embedding_batch_size)
+    except Exception as exc:  # pragma: no cover - config must never break a report
+        provenance["embedder"] = f"<unavailable: {type(exc).__name__}>"
+
+    # The reranker is a module constant, not a setting — read it, don't guess it.
+    try:
+        from app.services.reranker import RERANKER_MODEL
+
+        provenance["reranker"] = RERANKER_MODEL
+    except Exception as exc:  # pragma: no cover
+        provenance["reranker"] = f"<unavailable: {type(exc).__name__}>"
+
+    return provenance
+
+
+CORPUS_EXCLUDED_DIRS = frozenset({
+    # Virtualenvs and installed dependencies. `rglob("*.py")` does not know the
+    # difference between this project and everything pip installed alongside it.
+    ".venv", "venv", "env", "site-packages", "dist-packages",
+    "node_modules", "__pycache__",
+    # Tooling and build output.
+    ".git", ".mypy_cache", ".pytest_cache", ".tox", ".ruff_cache",
+    "build", "dist", ".eggs",
+})
+
+
+def _is_project_source(path: Path, root: Path) -> bool:
+    """
+    True when `path` is this project's own source rather than an installed package.
+
+    WHY THIS EXISTS
+    ---------------
+    `rglob("*.py")` over `backend/` matched **19,501 files** here instead of the
+    ~1,200 that are actually this project, because it descended into
+    `backend/.venv/lib/python3.11/site-packages/`. Two consequences, both bad:
+
+    1. It was slow for no reason — building the BM25 index over 19.5k documents took
+       125 seconds, and every dense query scored against all of them.
+    2. Worse, **the corpus depended on the machine**. Install one more package and
+       the benchmark scores the same queries against a different document set, so a
+       hit-rate from CI is not comparable with a hit-rate from a laptop. A metric
+       that moves when the environment moves cannot support a decision.
+
+    Hidden directories other than the root are excluded too: they are tooling, not
+    source, and their contents vary between machines.
+    """
+    try:
+        relative_parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        return False
+    return not any(
+        part in CORPUS_EXCLUDED_DIRS or part.startswith(".")
+        for part in relative_parts
+    )
+
+
 def load_corpus(backend_dir: Path) -> List[Document]:
-    """Load Python source files from the backend as the evaluation corpus."""
+    """Load this project's own Python source as the evaluation corpus."""
     docs = []
-    for p in backend_dir.rglob("*.py"):
-        # Skip __pycache__ and test stubs
-        if "__pycache__" in str(p):
+    for p in sorted(backend_dir.rglob("*.py")):
+        if not _is_project_source(p, backend_dir):
             continue
         try:
             content = p.read_text(encoding="utf-8")
@@ -449,6 +684,33 @@ def print_report(result: Dict[str, Any]) -> None:
     print(f"  Precision @ K        : {m['precision_at_k_pct']}%")
     print(f"  Avg latency          : {m['avg_latency_ms']} ms/query")
     print("=" * 60)
+
+    by_leg = m.get("by_leg") or {}
+    if by_leg:
+        # The table that decides whether an embedder swap is worth a re-index.
+        print("  BY RETRIEVAL LEG           hit@K      MRR   symbols")
+        for name in ("bm25_only", "dense_only", "fused", "fused_reranked"):
+            leg = by_leg.get(name)
+            if not leg:
+                continue
+            hit = leg.get("hit_rate_at_k")
+            if hit is None:
+                print(f"    {name:<22s} {'—':>6s} {'—':>8s}   {leg.get('note', '')}")
+            else:
+                print(
+                    f"    {name:<22s} {hit:>5.1f}%  {leg['mean_reciprocal_rank_mrr']:>6.3f}"
+                    f"  {leg['symbol_recall_pct']:>5.1f}%"
+                )
+        print("=" * 60)
+
+    # Which models produced these numbers. Printed before the grade, not after:
+    # a hit rate with no model attached to it is not a result.
+    models = result.get("models", {})
+    if models:
+        print("  MODELS")
+        for key in sorted(models):
+            print(f"    {key:<20s}: {models[key]}")
+        print("=" * 60)
     # Grade bands
     hr = m["hit_rate_at_k"]
     if hr >= 80:
@@ -469,6 +731,27 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=5, help="Top-K candidates to evaluate")
     parser.add_argument("--quiet", action="store_true", help="Only print JSON result (for CI)")
     parser.add_argument("--json-out", help="Write JSON result to this file path")
+    parser.add_argument(
+        "--embedder",
+        choices=("model", "offline"),
+        default="model",
+        help=(
+            "Which embedder drives the dense leg. 'model' = the configured "
+            "EMBEDDING_MODEL, i.e. production (needs weights). 'offline' = a "
+            "deterministic hashing embedder needing no download, for CI plumbing "
+            "checks only — its numbers are not a measure of retrieval quality."
+        ),
+    )
+    parser.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help=(
+            "Skip cross-encoder reranking. Use when the model is not available: "
+            "without this, each query retries a cross-encoder download with "
+            "exponential backoff before the failure path disables it, which turns a "
+            "few-second run into several minutes and corrupts the latency metric."
+        ),
+    )
     args = parser.parse_args()
 
     # Load dataset
@@ -487,11 +770,18 @@ if __name__ == "__main__":
         print(f"   Queries: {len(dataset)}  |  top_k={args.top_k}")
         print()
 
+    if not args.quiet and args.embedder == "offline":
+        print("   ⚠️  --embedder offline: dense-leg numbers come from a deterministic")
+        print("      hashing embedder. They prove the plumbing works and say nothing")
+        print("      about retrieval quality. Use --embedder model for that.\n")
+
     result = asyncio.run(evaluate_pipeline(
         dataset=dataset,
         corpus_docs=corpus,
         top_k=args.top_k,
         verbose=not args.quiet,
+        embedder_mode=args.embedder,
+        rerank_enabled=not args.no_rerank,
     ))
 
     if args.json_out:

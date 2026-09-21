@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from app.services.code_analysis.js_analyzer import detect_structural_issues
 from app.services.code_analysis.models import (
     FileAnalysis,
     Finding,
@@ -509,6 +510,29 @@ def analyze_generic(source: str, file_name: str = "", language: str = "") -> Fil
                     )
                 )
                 break
+
+    # ── Structural pass: what the regexes provably cannot reach ───────────────
+    #
+    # Every rule above matched against `line.code`, which has string *contents*
+    # blanked. That is correct for the great majority of patterns, but it makes
+    # two of them unreachable, because their trigger IS a string literal:
+    #
+    #   createHash('md5')                          → becomes createHash('   ')
+    #   NODE_TLS_REJECT_UNAUTHORIZED = '0'         → becomes ... = ' '
+    #
+    # Loosening those regexes to match the raw line would trade a silent miss for
+    # false positives on comments and prose. Instead they are detected from the
+    # parse tree, which can tell an argument from a mention. See js_analyzer.py.
+    #
+    # Findings are merged by (rule_id, line): the unquoted `= 0` form already
+    # matches the regex, and one problem must be reported once.
+    for finding in detect_structural_issues(source, file_name, language):
+        already_reported = any(
+            f.rule_id == finding.rule_id and f.line == finding.line
+            for f in analysis.findings
+        )
+        if not already_reported:
+            analysis.findings.append(finding)
 
     analysis.functions = _find_functions(lines, language)
 

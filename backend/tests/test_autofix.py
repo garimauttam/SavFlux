@@ -492,13 +492,29 @@ def test_autofix_endpoint_reports_an_honest_empty_result(client):
     assert data["findings_after"] == data["findings_before"]
 
 
-def test_autofix_endpoint_rejects_non_python(client):
-    """Saying "Python only" is better than silently returning no fixes."""
+def test_autofix_endpoint_rejects_an_unsupported_language(client):
+    """
+    Naming what IS supported beats silently returning no fixes.
+
+    Go stands in for "no verified fixer". JavaScript was the original fixture and
+    is now supported, so it would assert the opposite of what it used to.
+    """
     response = client.post(
-        "/api/v1/review/autofix", json={"path": "app.js", "content": "eval(x);"}
+        "/api/v1/review/autofix", json={"path": "main.go", "content": "package main"}
     )
     assert response.status_code == 400
-    assert "python" in response.json()["detail"].lower()
+    detail = response.json()["detail"].lower()
+    assert "javascript" in detail and "python" in detail
+
+
+def test_autofix_endpoint_accepts_javascript_now(client):
+    """The positive half of the same contract: JS is supported, not refused."""
+    response = client.post("/api/v1/review/autofix", json={
+        "path": "app.js",
+        "content": "const a = new Agent({ rejectUnauthorized: false });\n",
+    })
+    assert response.status_code == 200
+    assert response.json()["findings_after"] == 0
 
 
 def test_autofix_endpoint_404s_when_the_file_is_unknown(client):
@@ -592,20 +608,42 @@ def test_autofix_set_fixes_several_files_into_one_patch(client):
 
 def test_autofix_set_does_not_stop_at_a_file_it_cannot_fix(client):
     """
-    A review set is a mixed bag. One JavaScript file must not cost the user the
-    Python repairs in the same batch.
+    A review set is a mixed bag. One file in a language we cannot rewrite must not
+    cost the user the repairs available in the same batch.
     """
     response = client.post("/api/v1/review/autofix-set", json={
         "files": [
-            {"path": "app.js", "content": "eval(x);"},
+            {"path": "main.go", "content": "package main"},
             {"path": "net.py", "content": "import requests\ndef f(u):\n    return requests.get(u, verify=False)\n"},
         ],
     })
     data = response.json()
 
     assert data["fixed_count"] == 1
-    assert [e["path"] for e in data["errors"]] == ["app.js"]
-    assert "python" in data["errors"][0]["reason"].lower()
+    assert [e["path"] for e in data["errors"]] == ["main.go"]
+    assert "javascript" in data["errors"][0]["reason"].lower()
+    assert data["patch"]["files_changed"] == 1
+
+
+def test_autofix_set_distinguishes_unsupported_from_nothing_to_fix(client):
+    """
+    These are different outcomes and the API must not conflate them.
+
+    A Go file is *unsupported* — an error worth reporting. A JavaScript file with
+    nothing auto-fixable (`eval(x)` needs a human decision) is *supported and
+    clean* — no error at all. Reporting the second as a failure would tell users a
+    feature is missing when it simply had nothing to do.
+    """
+    response = client.post("/api/v1/review/autofix-set", json={
+        "files": [
+            {"path": "app.js", "content": "eval(x);\n"},
+            {"path": "net.py", "content": "import requests\ndef f(u):\n    return requests.get(u, verify=False)\n"},
+        ],
+    })
+    data = response.json()
+
+    assert data["errors"] == [], f"eval() is unsupported to FIX, not to analyse: {data['errors']}"
+    assert data["fixed_count"] == 1
     assert data["patch"]["files_changed"] == 1
 
 

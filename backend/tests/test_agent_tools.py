@@ -156,10 +156,17 @@ async def test_autofix_tool_reports_no_fixable_findings_honestly():
     assert "nothing safe to fix" in result.message
 
 
-async def test_autofix_tool_refuses_non_python_rather_than_guessing():
-    result = await agent_tools.autofix("app.js")
+async def test_autofix_tool_refuses_a_language_it_cannot_fix():
+    """
+    The contract: refuse loudly rather than return a silent empty result.
+
+    Go is the fixture because it has no verified fixer. JavaScript used to be
+    used here, and stopped being a valid example once JS/TS autofix landed — the
+    point of the test is the refusal, not which language demonstrates it.
+    """
+    result = await agent_tools.autofix("main.go")
     assert result.ok is False
-    assert "python" in result.message.lower()
+    assert "javascript" in result.message.lower(), result.message
 
 
 async def test_autofix_tool_reports_a_missing_file():

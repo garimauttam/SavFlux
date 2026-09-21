@@ -33,7 +33,7 @@ from chromadb.config import Settings as ChromaSettings
 
 from app.core.config import get_settings
 from app.services.llm_factory import get_embedding_fn
-from app.services.ast_chunker import chunk_python_file
+from app.services.code_chunker import chunk_code_file
 
 settings = get_settings()
 ingestion_lock = asyncio.Lock()
@@ -138,10 +138,13 @@ def _load_and_split(
     """
     Load each file and split into chunks.
 
-    Python files use AST-boundary chunking (one chunk per function/class) for
-    better retrieval precision — see ast_chunker.py for the rationale.
+    Source files are chunked on AST boundaries where a parser exists — one chunk
+    per function/class — because a chunk that is exactly one symbol embeds as that
+    symbol instead of as a fragment of two. See `code_chunker.py`.
 
-    All other file types use RecursiveCharacterTextSplitter as before.
+    Files with no grammar (markdown, JSON, YAML), grammars whose wheel is not
+    installed, and files that would not parse fall back to
+    RecursiveCharacterTextSplitter exactly as before.
 
     chunk_overlap=200 means adjacent chunks share 200 characters.
     This prevents a function signature being in chunk N and its body in chunk N+1
@@ -174,24 +177,34 @@ def _load_and_split(
         if source_root is not None:
             source_id = f"{repo_url}::{fpath.relative_to(source_root).as_posix()}"
 
-        # ── Python: AST-boundary chunking ─────────────────────────────────────
-        # Produces one chunk per top-level function/class — far better retrieval
-        # precision than character-based splitting for code Q&A.
-        if ext == ".py" and source_text:
-            ast_chunks = chunk_python_file(
+        # ── AST-boundary chunking ─────────────────────────────────────────────
+        # One chunk per top-level function/class — far better retrieval precision
+        # than character-based splitting for code Q&A, because a chunk that is
+        # exactly one symbol embeds as that symbol instead of as a fragment.
+        #
+        # `chunk_code_file` is the single routing point: Python goes through
+        # ast.parse (stdlib, exact, already tested), every other language through
+        # tree-sitter. Keeping the decision there rather than here means a caller
+        # cannot accidentally pair a file with the wrong parser.
+        #
+        # An empty list means "no AST chunking applies" — an unsupported type, a
+        # grammar whose wheel is not installed, or a file that would not parse —
+        # and we fall through to the character splitter, which is exactly the
+        # behaviour that predates all of this.
+        if source_text:
+            ast_chunks = chunk_code_file(
                 source=source_text,
                 file_path=source_id,
                 file_name=fpath.name,
-                language="py",
+                language=ext.lstrip("."),
                 repo_url=repo_url,
                 content_hash=content_hash,
             )
             if ast_chunks:
                 documents.extend(ast_chunks)
                 continue
-            # AST parse failed (syntax error) — fall through to char splitter
 
-        # ── Non-Python (or AST fallback): RecursiveCharacterTextSplitter ──────
+        # ── Fallback: RecursiveCharacterTextSplitter ──────────────────────────
         if language:
             # Language-aware splitter: knows to split on class/function boundaries
             splitter = RecursiveCharacterTextSplitter.from_language(
