@@ -356,6 +356,36 @@ Two traps worth writing down:
   from a model that is no longer running. That is why the reranker name is now a module
   constant (`reranker.RERANKER_MODEL`), reported in every benchmark run.
 
+**The reranker had the same silent-truncation defect as the embedder**, and it was
+closed the same way — by making the window explicit rather than inherited.
+`CrossEncoder.predict()` truncates each (query, passage) pair to `max_length`, defaulting
+to the model's own `max_seq_length` when the argument is omitted. `reranker.py` omitted
+it. Measured over this project's 1533 production chunks (median 555 chars, p90 2011,
+max 3000 — the chunker's ceiling), the share exceeding a 512-token window is:
+
+| chars/token assumption | chars | chunks over the window |
+|---|---|---|
+| 3.0 | 1536 | 14.0% |
+| 3.5 | 1792 | 11.7% |
+| 4.0 | 2048 | 9.8% |
+| 4.5 | 2304 | 8.0% |
+
+The spread is the estimate in `chars/token`, not measurement error: the real tokenizer
+needs weights this sandbox cannot fetch, so it is swept rather than asserted. This is a
+*smaller* defect than the embedder's 46–55%, and it is survivable by design — the
+reranker only orders candidates retrieval already found, so a dropped tail costs ranking
+precision on long chunks rather than making them unreachable. What it must not do is be
+silent, which is what `RERANKER_MAX_LENGTH = 512` fixes: it is passed explicitly, a test
+fails if `predict()` is ever called without it, and a second test fails if the constant
+drifts from the model it was chosen for.
+
+Worth knowing when reading those numbers: **BM25 candidates carry the full parent** in
+`page_content` (that is what `_bm25_corpus` builds), so they are the inputs that overflow
+this window. Dense candidates are already windows. Windowed reranking — splitting a long
+passage and keeping the best window's score — would recover the lost precision, and is
+deliberately not bundled here because it multiplies rerank cost by the window count and
+wants its own measurement.
+
 **Why it is still not measured HERE:** this sandbox cannot reach `huggingface.co` (nor
 `hf-mirror.com`), and no weights are cached, so a real before/after comparison is
 impossible in it. Rather than publish inferred numbers, the harness was made to report
@@ -386,6 +416,87 @@ is what decides whether an embedder swap is worth a re-index: on this query mix 
 adds **+6.8 points** of hit rate over BM25 alone (79.5 vs 72.7) while *lowering* MRR
 (0.451 vs 0.487), which is the recognisable RRF signature — fusion buys recall at the
 top and pays for it in ordering precision.
+
+**The dense leg of the harness was then found to embed whole files**, which meant it
+measured a retrieval path production does not have — and, worse, it reproduced the very
+defect the pipeline was being fixed for: the embedder reads 256 tokens, so a file's tail
+was never in vector space and no query about it could be answered. A benchmark that
+cannot tell a fixed pipeline from a broken one is not a benchmark.
+
+It now indexes **windows**, via the same `children_of` ingestion calls, and collapses
+them to one entry per file with `dedupe_to_parents`. Collapsing is not cosmetic: several
+windows of one file in a top-5 is one parent wearing five hats, which would read as the
+windowing having improved ranking. Depth is held equal across the two branches
+(`top_k*3` files each) so the comparison varies **coverage and nothing else** — before, a
+file's vector was its first window; now the file is reachable through any of its windows.
+Symbol recall is scored on `parent_context`, i.e. what the model would actually be shown,
+not on the window that happened to match.
+
+| Leg | whole-file dense | windowed dense |
+|---|---|---|
+| `bm25_only` | 70.45% | **70.45%** (unchanged by design) |
+| `dense_only` | 36.36% | **50.00%** |
+| `fused` | 77.27% | **77.27%** |
+| `fused` MRR | 0.441 | **0.504** |
+
+`dense_only` gains **+13.6 points** and `fused`'s MRR improves, while BM25 is untouched —
+which is the expected signature, since only the dense corpus changed. One number moved the
+wrong way and is recorded rather than hidden: `fused` symbol recall dipped 88.62 → 87.8,
+a consequence of a different file now ranking into the top-5.
+
+**This is coverage, not quality.** The offline embedder hashes tokens, so these numbers
+say the tail of a file is now reachable and say nothing about whether a real model ranks
+it well. The quality judgement still needs the local command above, and `evaluation.dense_corpus`
+in the JSON now records `{files, windows}` so a run from before this change cannot be
+mistaken for one after it.
+
+**The candidate-depth defect, and it was live.** `retrieval_service` asked the vector
+store for `CANDIDATE_COUNT` **rows**. Rows are windows, so the same number spanned fewer
+distinct chunks than before the write side — the branch's candidate coverage shrank
+silently, because nothing errors when a search returns fewer chunks than you assumed.
+
+Measured over the 44 benchmark queries, at `CANDIDATE_COUNT = 10`:
+
+| | distinct chunks surfaced (mean) | queries short of 10 |
+|---|---|---|
+| old depth (10 rows) | **8.68** | **36 / 44 (82%)** |
+| new depth (40 rows, collapsed, cut to 10) | **10.00** | 0 / 44 |
+
+The fix multiplies by `max_windows_per_parent()`, which is an **upper bound rather than
+an estimate**: `children_of` walks in steps of `window - overlap` and may only drop
+spans, so it can emit at most `ceil(chunk / step)` — and `MAX_CHUNK_CHARS` bounds the
+input since the generic splitter's `chunk_size` (700) is below it. At the current
+constants that is 4 windows, verified by sweeping **every** length from 1 to 3000 rather
+than sampling endpoints, which is how a ceiling bound ends up quietly wrong.
+
+Collapsing before fusion rather than leaving it to fusion is deliberate. `two_branch_rrf`
+collapses on `{source}::{chunk_index}` anyway, so results are chunk-level either way — but
+it accumulates a term per occurrence, so a chunk with four matching windows would arrive
+carrying four terms' worth of score. That conflates "matched by more query variants",
+which is evidence, with "happens to be a long chunk", which is an artefact of splitting.
+Collapsing first also makes production match what the harness measures, so the two can be
+compared at all.
+
+**Corpus identity, because the benchmark measures its own source.** The corpus is this
+project's source, so it moves whenever the code does: add a test file and `bm25_only`
+shifts, not because retrieval changed but because the document set did. Every artifact
+carried a hit rate and a `dataset_sha256` for the *queries* — identical — while the corpus
+silently differed. That is the same failure the per-leg work was about: a metric that
+moves when the code moves cannot support a comparison.
+
+Two changes, and neither freezes the corpus (it has to track the code to be worth
+measuring):
+
+- `evaluation.corpus_sha256` records which corpus produced a run, so comparability is
+  checkable rather than assumed.
+- `--corpus-dir` pins a checkout, so two runs **can** be held still while one thing is
+  varied.
+
+```bash
+# pin the corpus, then compare one variable at a time
+python eval_rag.py --corpus-dir /pinned/savflux/backend --embedder model --json-out after.json
+# both JSONs carry corpus_sha256 — equal means comparable
+```
 
 ```bash
 # 1. baseline, production pipeline, configured model

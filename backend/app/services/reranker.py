@@ -56,6 +56,36 @@ visible in the results rather than inferred from a suspicious metric.
 """
 
 
+RERANKER_MAX_LENGTH = 512
+"""
+The cross-encoder's input window, in tokens, including the query.
+
+WHY THIS IS PASSED EXPLICITLY
+-----------------------------
+`CrossEncoder.predict()` truncates each (query, passage) pair to `max_length`,
+defaulting to the model's `max_seq_length` when the argument is omitted. Leaving it
+omitted means the truncation is real but invisible: no warning, no error, and a
+library upgrade that changed the default would change ranking quality with nothing in
+this repository to show for it.
+
+This is the same defect class as the embedder's 256-token window, and it is the same
+reasoning: the model was trained at this length, so the fix is to stop feeding it more
+than it can read — not to widen the window. Measured on this project's own chunks,
+8-14% exceed 512 tokens (the range is the chars-per-token estimate, not the
+measurement), so for those the reranker scores only a prefix.
+
+Unlike the embedder, the truncation here is survivable by design: the reranker only
+*orders* candidates that retrieval already found, so a dropped tail costs ranking
+precision on long chunks rather than making them unreachable. What it must not do is
+be silent — hence the explicit constant, and a test that fails if `predict()` is
+called without it.
+
+Windowed scoring — splitting a long passage and taking the best window's score —
+would recover that precision. It multiplies rerank cost by the window count, so it
+wants its own measurement before landing rather than being bundled here.
+"""
+
+
 @lru_cache(maxsize=1)
 def _get_cross_encoder():
     """
@@ -111,9 +141,13 @@ async def rerank(
 
     def _score():
         cross_encoder = _get_cross_encoder()
-        # CrossEncoder expects a list of (query, passage) pairs
+        # CrossEncoder expects a list of (query, passage) pairs.
+        # max_length is passed explicitly rather than left to default: see
+        # RERANKER_MAX_LENGTH. Note `doc.page_content`, not the parent text — BM25
+        # candidates carry the full parent here, which is exactly the case that
+        # exceeds the window.
         pairs = [(query, doc.page_content) for doc in documents]
-        scores = cross_encoder.predict(pairs)
+        scores = cross_encoder.predict(pairs, max_length=RERANKER_MAX_LENGTH)
         # Zip scores with docs, sort by score descending, return top_n docs
         scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
         ranked: list[Document] = []

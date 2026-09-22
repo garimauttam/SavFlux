@@ -32,6 +32,11 @@ from app.services.citation_service import build_citations
 from app.services.reranker import rerank
 from app.services.llm_factory import get_chat_llm, get_embedding_fn
 from app.services.hybrid_retriever import BM25Index, reciprocal_rank_fusion, diversify_documents, two_branch_rrf
+from app.services.parent_child import (
+    dedupe_to_parents,
+    max_windows_per_parent,
+    parent_context,
+)
 from app.services.query_enhancer import (
     extract_file_scope, local_query_variants, compact_chat_history,
     route_query_intent, get_intent_filter,
@@ -274,6 +279,35 @@ def save_bm25_on_shutdown() -> None:
         _save_bm25_to_disk(_bm25_index_cache, _bm25_doc_count)
 
 
+def _bm25_corpus(rows: list[Document]) -> list[Document]:
+    """
+    The text BM25 is allowed to index — one entry per parent.
+
+    WHY THIS IS A FUNCTION AND NOT INLINE: the lexical leg and the dense leg must
+    read *different text from the same row*. Dense reads the stored `page_content`,
+    which may be a window sized to fit the embedder. BM25 has no such window —
+    longer text is strictly more signal — so it reads `pc_parent_text`.
+
+    Skipping this does not fail loudly. BM25 would index a 900-character window
+    where it used to index the whole chunk, silently degrading the strongest leg
+    (72.7% hit@5 against dense's 36.4%) at the same time as the dense leg improved,
+    so the fused number could fall with nothing in the diff to explain it.
+
+    The dedupe drops the other windows of the same parent. They share the parent's
+    text, so keeping them would index N identical copies: IDF would be computed
+    over duplicates, and one parent could fill the result list.
+
+    For rows that never went through `children_of` — an index built before this
+    change — `parent_context` returns `page_content` and `dedupe_to_parents` finds
+    no shared parent ids, so this is the identity. That is what makes the wiring
+    safe to land before the re-index.
+    """
+    return dedupe_to_parents(
+        Document(page_content=parent_context(row), metadata=row.metadata)
+        for row in rows
+    )
+
+
 def _get_bm25_index(vectorstore: Chroma) -> BM25Index | None:
     """
     Returns a BM25 index over all documents in ChromaDB.
@@ -307,11 +341,11 @@ def _get_bm25_index(vectorstore: Chroma) -> BM25Index | None:
         results = vectorstore._collection.get(include=["documents", "metadatas"])
         docs_raw = results.get("documents") or []
         metas_raw = results.get("metadatas") or []
-        documents = [
+        rows = [
             Document(page_content=content, metadata=meta or {})
             for content, meta in zip(docs_raw, metas_raw)
         ]
-        _bm25_index_cache = BM25Index(documents)
+        _bm25_index_cache = BM25Index(_bm25_corpus(rows))
         _bm25_doc_count = current_count
         _save_bm25_to_disk(_bm25_index_cache, current_count)
         return _bm25_index_cache
@@ -479,9 +513,24 @@ async def stream_answer(
 
     base_filter = _build_chroma_filter(_repo_filter_urls, intent_filter, file_scope)
 
+    # What the DENSE branch asks for, which is no longer what the pipeline wants back.
+    #
+    # Indexed rows are windows: several belong to one chunk, so `CANDIDATE_COUNT`
+    # rows can cover as few as `CANDIDATE_COUNT / max_windows_per_parent()` distinct
+    # chunks. Before the write side landed, that constant returned CANDIDATE_COUNT
+    # chunks; afterwards it quietly returned fewer, thinning the pool that fusion and
+    # the reranker both work from. Nothing errors, and the harness would not show it
+    # — the harness pins its own depth deliberately, which is the point of pinning it.
+    #
+    # So fetch enough ROWS that at least CANDIDATE_COUNT distinct chunks survive the
+    # collapse below, then cut to the count the rest of the pipeline was tuned for.
+    # `max_windows_per_parent()` is an upper bound rather than an estimate — see its
+    # docstring — which is what makes multiplying honest instead of a fudge factor.
+    CANDIDATE_ROWS = CANDIDATE_COUNT * max_windows_per_parent()
+
     search_kwargs: dict = {
-        "k": CANDIDATE_COUNT,
-        "fetch_k": CANDIDATE_COUNT * 2,
+        "k": CANDIDATE_ROWS,
+        "fetch_k": CANDIDATE_ROWS * 2,
     }
     if base_filter:
         search_kwargs["filter"] = base_filter
@@ -507,7 +556,7 @@ async def stream_answer(
     # without the intent filter (P05 fallback). This ensures a non-empty answer.
     if intent != "general" and not any(dense_lists):
         yield _status(f"Intent filter [{intent}] returned 0 — retrying general search...", "crag-fallback")
-        fallback_kwargs: dict = {"k": CANDIDATE_COUNT, "fetch_k": CANDIDATE_COUNT * 2}
+        fallback_kwargs: dict = {"k": CANDIDATE_ROWS, "fetch_k": CANDIDATE_ROWS * 2}
         fallback_filter = _build_chroma_filter(_repo_filter_urls, {})
         if fallback_filter:
             fallback_kwargs["filter"] = fallback_filter
@@ -518,6 +567,22 @@ async def stream_answer(
             *(fallback_retriever.ainvoke(query) for query in query_variants)
         ))
         intent = "general"  # reset so diagnostics don't re-fire P05
+
+    # Collapse the dense branch to one entry per chunk, then cut to the depth the
+    # rest of the pipeline was built around.
+    #
+    # WHY HERE, AND NOT LEFT TO FUSION
+    # `two_branch_rrf` already collapses on `{source}::{chunk_index}`, and siblings
+    # share those, so fused results would be parent-level either way. What fusion
+    # would NOT do is the cut: it accumulates a term per occurrence, so a chunk with
+    # four matching windows would arrive carrying four terms' worth of score. That
+    # conflates "matched by more query variants" — real evidence — with "happens to
+    # be a long chunk" — an artefact of how it was split. Collapsing first keeps the
+    # score meaning the former, and matches what the benchmark does, so the two can
+    # be compared at all.
+    dense_lists = [
+        dedupe_to_parents(docs)[:CANDIDATE_COUNT] for docs in dense_lists
+    ]
 
     # Branch B: BM25 lexical keyword search + dep-graph hints
     # Run in asyncio.to_thread: both are synchronous CPU work that would block the event loop.
@@ -617,6 +682,12 @@ async def stream_answer(
     for doc in relevant_docs:
         file_name = doc.metadata.get("file_name", "unknown")
         language = doc.metadata.get("language", "")
+        # WHY parent_context() AND NOT doc.page_content?
+        # The retriever matches windows, but the model has to answer about a whole
+        # function. A window can be the only thing that matched and still be the
+        # wrong thing to show: half a function reads as a complete one, and the
+        # grounding rules above then forbid the model from asking for the rest.
+        # Line labels come from metadata, so citations keep their real offsets.
         symbol_name = doc.metadata.get("symbol_name", "")
         chunk_index = doc.metadata.get("chunk_index", "")
         start_line = doc.metadata.get("start_line")
@@ -633,7 +704,7 @@ async def stream_answer(
         if chunk_index != "":
             location += f" chunk={chunk_index}"
 
-        part = f"### File: {file_name}{location}\n```{language}\n{doc.page_content}\n```"
+        part = f"### File: {file_name}{location}\n```{language}\n{parent_context(doc)}\n```"
         if context_parts and context_chars + len(part) > settings.max_context_chars:
             continue
         context_parts.append(part)

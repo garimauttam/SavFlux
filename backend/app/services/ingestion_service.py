@@ -34,6 +34,7 @@ from chromadb.config import Settings as ChromaSettings
 from app.core.config import get_settings
 from app.services.llm_factory import get_embedding_fn
 from app.services.code_chunker import chunk_code_file
+from app.services.parent_child import children_of_all
 
 settings = get_settings()
 ingestion_lock = asyncio.Lock()
@@ -271,6 +272,29 @@ def _load_and_split(
     return documents
 
 
+def _to_index_rows(documents: list[Document]) -> list[Document]:
+    """
+    The rows Chroma actually stores: one per embed window, not one per chunk.
+
+    Chroma holds what the *retriever* searches, and the retriever searches windows
+    because the embedder silently truncates at 256 tokens. The whole chunk travels
+    in each row's metadata instead and is what the LLM is handed at read time by
+    `parent_context()`.
+
+    Everything else in ingestion keeps working on parents. The delta logic compares
+    one content_hash per file, and the progress messages count chunks, because that
+    is the unit a user can reason about ("12 chunks from 3 files"). Only the rows
+    handed to Chroma change, which is why this is a function with a name rather
+    than the same one-line call pasted at two call sites — the third call site is
+    the one that gets missed.
+
+    A chunk that already fits its window comes back as a single row that is a copy
+    of it, so there is no "sometimes a parent, sometimes a child" branch anywhere
+    downstream for `parent_context` to be forgotten on.
+    """
+    return children_of_all(documents)
+
+
 async def ingest_github_repo(
     repo_url: str,
     branch: Optional[str] = None,
@@ -423,13 +447,20 @@ async def ingest_github_repo(
 
         # Embed and insert in batches to provide incremental progress updates
         # and prevent reverse-proxy timeout (SSE keepalive).
+        #
+        # BATCH_SIZE stays on parents for progress granularity. One batch can
+        # therefore hand Chroma several hundred rows; that is not what limits
+        # embedding throughput — EMBEDDING_BATCH_SIZE is.
         BATCH_SIZE = 100
+        rows_indexed = 0
         for i in range(0, len(new_docs), BATCH_SIZE):
             batch = new_docs[i:i + BATCH_SIZE]
+            rows = await asyncio.to_thread(_to_index_rows, batch)
             await asyncio.to_thread(
                 vectorstore.add_documents,
-                documents=batch,
+                documents=rows,
             )
+            rows_indexed += len(rows)
             if progress_callback:
                 processed = min(i + BATCH_SIZE, len(new_docs))
                 await progress_callback({
@@ -460,9 +491,15 @@ async def ingest_github_repo(
         chunks_added = len(new_docs)
         if progress_callback:
             skip_note = f" ({files_skipped} unchanged)" if files_skipped else ""
+            # Report vectors only when they differ from chunks. "Indexed 12 chunks
+            # (31 vectors)" is honest but reads as jargon when both numbers are
+            # 12; the distinction only earns its words when there is one.
+            vectors_note = (
+                f" ({rows_indexed} vectors)" if rows_indexed != chunks_added else ""
+            )
             await progress_callback({
                 "step": "done",
-                "message": f"✅ Indexed {chunks_added} chunks from {len(files) - files_skipped} files{skip_note}.",
+                "message": f"✅ Indexed {chunks_added} chunks{vectors_note} from {len(files) - files_skipped} files{skip_note}.",
             })
 
         # Trust ledger: record the exact upstream commit this index was
@@ -488,7 +525,11 @@ async def ingest_github_repo(
             "repo_url": repo_url,
             "files_indexed": len(files) - files_skipped,
             "files_skipped": files_skipped,
+            # chunks_created keeps meaning chunks. vectors_created is additive, so
+            # a caller already parsing chunks_created does not start seeing a
+            # different number under the same key.
             "chunks_created": chunks_added,
+            "vectors_created": rows_indexed,
         }
 
     finally:
@@ -529,11 +570,18 @@ async def ingest_uploaded_files(files_content: list[tuple[str, bytes]]) -> dict:
             }
 
         # Use the same PersistentClient-backed store as ingest_github_repo.
+        #
+        # Same row shape as the GitHub path on purpose. This writes to the same
+        # collection, so indexing whole chunks here would leave two shapes in one
+        # index and make `parent_context` correct on only one of them.
         vectorstore = _get_vectorstore()
         BATCH_SIZE = 100
+        rows_indexed = 0
         for i in range(0, len(documents), BATCH_SIZE):
             batch = documents[i:i + BATCH_SIZE]
-            await asyncio.to_thread(vectorstore.add_documents, documents=batch)
+            rows = await asyncio.to_thread(_to_index_rows, batch)
+            await asyncio.to_thread(vectorstore.add_documents, documents=rows)
+            rows_indexed += len(rows)
 
         # Invalidate read singleton — same reason as in ingest_github_repo
         try:
@@ -553,6 +601,7 @@ async def ingest_uploaded_files(files_content: list[tuple[str, bytes]]) -> dict:
             "status": "success",
             "files_indexed": len(paths),
             "chunks_created": len(documents),
+            "vectors_created": rows_indexed,
         }
 
     finally:

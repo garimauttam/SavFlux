@@ -167,7 +167,12 @@ async def test_rerank_attaches_scores_without_mutating_cached_documents():
     docs = [_doc(f"repo::f{i}.py", start=1, end=5) for i in range(6)]
 
     class _FakeEncoder:
-        def predict(self, pairs):
+        # `max_length` is accepted because the real CrossEncoder.predict() accepts
+        # it and `rerank()` passes it explicitly (see RERANKER_MAX_LENGTH). A
+        # narrower double turns that argument into a TypeError, which `rerank()`
+        # catches as a model failure — so the test would fail on the fallback path
+        # rather than on anything it claims to assert.
+        def predict(self, pairs, **kwargs):
             return [float(len(pairs) - i) for i in range(len(pairs))]
 
     with patch.object(rr, "_get_cross_encoder", return_value=_FakeEncoder()):
