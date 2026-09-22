@@ -287,3 +287,219 @@ async def test_the_result_says_the_dense_leg_was_not_a_quality_model(eval_rag_mo
     assert "offline" in label.lower()
     assert "not a quality model" in label.lower(), label
     assert result["models"]["dense_embedder_mode"] == "offline"
+
+
+# ── 5. The dense leg indexes windows, and collapses them to parents ──────────
+#
+# The dense branch used to embed whole files, which reproduced the very defect the
+# pipeline was being fixed for: the embedder reads 256 tokens, so a file's tail was
+# never in vector space and no query about it could be answered. A harness that
+# measures a path production does not have cannot tell a fixed pipeline from a
+# broken one.
+
+# Long enough to need several 900-character windows.
+WINDOW_FILLER = "def helper(value):\n    return value + 1\n" * 40
+TAIL_FACT = "\ndef rotate_credentials(token):\n    return token[::-1]\n"
+
+
+def _long_file():
+    return Document(
+        page_content=WINDOW_FILLER + TAIL_FACT,
+        metadata={"source": "/x/big.py", "file_name": "big.py"},
+    )
+
+
+def test_the_dense_corpus_is_windowed_not_whole_files(eval_rag_module):
+    from app.services.parent_child import EMBED_WINDOW_CHARS
+
+    docs = eval_rag_module._dense_corpus([_long_file()])
+
+    assert len(docs) > 1, "a file longer than the window must split"
+    assert all(len(d.page_content) <= EMBED_WINDOW_CHARS for d in docs)
+
+
+def test_the_dense_leg_can_reach_a_fact_past_the_embed_window(eval_rag_module):
+    """
+    The payoff, with the counterfactual measured rather than asserted.
+
+    Embedding the whole file puts nothing past the window into its vector, so the
+    tail fact is unreachable. Windowing makes it reachable. Both numbers are
+    computed here rather than described, so this cannot pass by accident.
+    """
+    from app.services.offline_embedder import DenseIndex, OfflineEmbedder
+
+    doc = _long_file()
+    embedder = OfflineEmbedder()
+    query = "rotate_credentials"
+
+    whole_file_score = DenseIndex([doc], embedder).scores(query, top_k=1)[0][1]
+    window_scores = DenseIndex(
+        eval_rag_module._dense_corpus([doc]), embedder
+    ).scores(query, top_k=1)
+
+    # The hashing embedder's numbers are lexical, so this is a coverage claim, not
+    # a quality claim: the tokens simply are or are not inside the embedded text.
+    assert whole_file_score < 0.05, (
+        "the whole-file vector unexpectedly contains the tail; the fixture no "
+        "longer exceeds the embed window and this test proves nothing"
+    )
+    assert window_scores[0][1] > whole_file_score
+
+
+@pytest.mark.asyncio
+async def test_a_tail_fact_is_retrievable_end_to_end(eval_rag_module):
+    dataset = [
+        {
+            "query": "rotate_credentials token",
+            "ground_truth_file": "big.py",
+            "expected_symbols": ["rotate_credentials"],
+        }
+    ]
+    result = await eval_rag_module.evaluate_pipeline(
+        dataset=dataset,
+        corpus_docs=[_long_file()],
+        top_k=1,
+        verbose=False,
+        embedder_mode="offline",
+        rerank_enabled=False,
+    )
+    by_leg = result["metrics"]["by_leg"]
+    assert by_leg["dense_only"]["hit_rate_at_k"] == 100.0
+    # Symbol recall must count what the MODEL would see — the whole file — not the
+    # window that happened to match. Scoring the window would report 0 here and
+    # read as a retrieval failure.
+    assert by_leg["dense_only"]["symbol_recall_pct"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_dense_candidates_are_collapsed_to_one_entry_per_file(
+    eval_rag_module, monkeypatch
+):
+    """
+    No file may appear twice in the dense branch's candidate list.
+
+    Without the collapse, several windows of one file fill the top-k and the leg
+    is scored on "one parent wearing five hats" — a depth artefact that would look
+    like the windowing improved ranking.
+    """
+    recorded = []
+    real_fusion = eval_rag_module.reciprocal_rank_fusion
+
+    def spy(lists, **kwargs):
+        recorded.append([list(docs) for docs in lists])
+        return real_fusion(lists, **kwargs)
+
+    monkeypatch.setattr(eval_rag_module, "reciprocal_rank_fusion", spy)
+    corpus = [_long_file(), Document(
+        page_content="unrelated decorative styling rules",
+        metadata={"source": "/x/ui.tsx", "file_name": "ui.tsx"},
+    )]
+    dataset = [{
+        "query": "rotate_credentials",
+        "ground_truth_file": "big.py",
+        "expected_symbols": [],
+    }]
+
+    await eval_rag_module.evaluate_pipeline(
+        dataset=dataset,
+        corpus_docs=corpus,
+        top_k=2,
+        verbose=False,
+        embedder_mode="offline",
+        rerank_enabled=False,
+    )
+
+    assert recorded, "fusion was never called; the spy is in the wrong place"
+
+    from app.services.parent_child import parent_id_of
+
+    # The dense branch's lists are the ones made of windows.
+    dense_lists = [
+        docs
+        for call in recorded
+        for docs in call
+        if any("pc_parent_id" in d.metadata for d in docs)
+    ]
+    assert dense_lists, "no windowed list reached fusion; the dense leg is unwired"
+
+    for docs in dense_lists:
+        parents = [parent_id_of(d.metadata) for d in docs]
+        assert len(parents) == len(set(parents)), (
+            f"several windows of one file reached fusion: {parents}"
+        )
+        assert len(docs) <= 2 * 3, "candidate depth exceeded the requested top_k*3"
+
+
+@pytest.mark.asyncio
+async def test_the_result_records_that_the_dense_corpus_was_windowed(eval_rag_module):
+    """
+    Runs made before the dense leg indexed windows are not comparable with runs
+    made after. The artefact has to say which kind it is.
+    """
+    result = await eval_rag_module.evaluate_pipeline(
+        dataset=[{
+            "query": "rotate_credentials",
+            "ground_truth_file": "big.py",
+            "expected_symbols": [],
+        }],
+        corpus_docs=[_long_file()],
+        top_k=1,
+        verbose=False,
+        embedder_mode="offline",
+        rerank_enabled=False,
+    )
+    dense_corpus = result["evaluation"]["dense_corpus"]
+    assert dense_corpus["files"] == 1
+    assert dense_corpus["windows"] > 1
+
+
+# The symbol must live in the parent but NOT in the window that gets retrieved,
+# or the two are indistinguishable and the test cannot fail.
+
+HEAD_FACT = "def parse_manifest(path):\n    return json.loads(path.read_text())\n"
+
+
+@pytest.mark.asyncio
+async def test_symbol_recall_scores_the_parent_not_the_matched_window(eval_rag_module):
+    """
+    Guard-the-guard first: this only discriminates if the retrieved window lacks
+    the symbol.
+
+    A previous version of this test used a query matching the tail fact, which put
+    the symbol inside the window that ranked first — so scoring window text found
+    it anyway and the mutation survived. Here the query matches the HEAD, so the
+    best window is the head one and the expected symbol sits past the window
+    boundary. Only parent text can find it.
+    """
+    from app.services.parent_child import EMBED_WINDOW_CHARS
+
+    doc = Document(
+        page_content=HEAD_FACT + WINDOW_FILLER + TAIL_FACT,
+        metadata={"source": "/x/big.py", "file_name": "big.py"},
+    )
+    dataset = [{
+        "query": "parse_manifest",
+        "ground_truth_file": "big.py",
+        "expected_symbols": ["rotate_credentials"],
+    }]
+
+    result = await eval_rag_module.evaluate_pipeline(
+        dataset=dataset,
+        corpus_docs=[doc],
+        top_k=1,
+        verbose=False,
+        embedder_mode="offline",
+        rerank_enabled=False,
+    )
+
+    # The window the dense leg retrieves really does lack the symbol — otherwise
+    # the assertion below would hold for the wrong reason.
+    from app.services.offline_embedder import DenseIndex, OfflineEmbedder
+
+    best_window = DenseIndex(
+        eval_rag_module._dense_corpus([doc]), OfflineEmbedder()
+    ).search("parse_manifest", top_k=1)[0]
+    assert "rotate_credentials" not in best_window.page_content
+    assert len(best_window.page_content) <= EMBED_WINDOW_CHARS
+
+    assert result["metrics"]["by_leg"]["dense_only"]["symbol_recall_pct"] == 100.0

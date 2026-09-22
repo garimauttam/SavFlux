@@ -43,6 +43,7 @@ from app.services.hybrid_retriever import (
 from app.services.reranker import RERANK_SCORE_KEY, rerank
 from app.services.query_enhancer import extract_file_scope, local_query_variants
 from app.services.offline_embedder import DenseIndex
+from app.services.parent_child import children_of, dedupe_to_parents, parent_context
 
 
 # ── Benchmark Dataset ─────────────────────────────────────────────────────────
@@ -347,6 +348,33 @@ def _empty_leg() -> Dict[str, Any]:
     return {"hits": 0, "ranks": [], "symbol_hits": 0, "symbols_expected": 0}
 
 
+def _dense_corpus(docs: List[Document]) -> List[Document]:
+    """
+    The documents the dense leg indexes: embed windows, not whole files.
+
+    WHY THIS DIFFERS FROM `corpus_docs`
+    -----------------------------------
+    Ingestion stores one row per embed window, because the embedder reads 256
+    tokens and silently discards everything after them — 46-55% of this project's
+    chunks are longer than that window. Embedding whole files here would measure a
+    retrieval path production does not have, and would hide the exact defect this
+    harness exists to catch: a query whose answer sits past the window boundary is
+    unreachable by the dense leg, and the harness would record that as the
+    embedder's retrieval quality.
+
+    The windows come from `children_of`, the function ingestion calls, so this
+    models the pipeline instead of reimplementing it in a form that can drift.
+
+    BM25 deliberately does NOT get these. It has no window, and production feeds
+    it whole chunks (`_bm25_corpus` in retrieval_service). The two legs read
+    different text from the same row, on purpose.
+    """
+    out: List[Document] = []
+    for doc in docs:
+        out.extend(children_of(doc))
+    return out
+
+
 async def evaluate_pipeline(
     dataset: List[Dict[str, Any]],
     corpus_docs: List[Document],
@@ -381,7 +409,9 @@ async def evaluate_pipeline(
     RRF used in production; `fused` is production's weighted two_branch_rrf.
     """
     bm25 = BM25Index(corpus_docs)
-    dense = DenseIndex(corpus_docs, _build_embedder(embedder_mode))
+
+    dense_docs = _dense_corpus(corpus_docs)
+    dense = DenseIndex(dense_docs, _build_embedder(embedder_mode))
 
     legs: Dict[str, Dict[str, Any]] = {
         "bm25_only": _empty_leg(),
@@ -415,7 +445,22 @@ async def evaluate_pipeline(
             bm25.search(query=variant, top_k=top_k * 3, file_filter=file_scope)
             for variant in variants
         ]
-        dense_lists = [dense.search(query=variant, top_k=top_k * 3) for variant in variants]
+        # The dense branch searches WINDOWS, and many of them belong to the same
+        # file, so its candidates are collapsed to one entry per file before being
+        # compared against the BM25 branch — whose corpus is already one entry per
+        # file. Ranking every window and then collapsing gives both branches the
+        # same candidate depth (top_k*3 files), so the only thing this comparison
+        # varies is COVERAGE: before, a file's vector was its first window; now the
+        # file is reachable through any of its windows.
+        #
+        # Leaving the depth uncollapsed would let a depth change masquerade as a
+        # coverage improvement, which is the failure mode this whole harness exists
+        # to prevent. It costs nothing: the vectors are precomputed, so this is a
+        # sort over `len(dense_docs)` similarities.
+        dense_lists = [
+            dedupe_to_parents(dense.search(query=variant, top_k=len(dense_docs)))[: top_k * 3]
+            for variant in variants
+        ]
 
         # ── Each leg, scored independently ───────────────────────────────────
         leg_rankings = {
@@ -447,7 +492,13 @@ async def evaluate_pipeline(
             else:
                 leg["ranks"].append(0.0)
 
-            leg_text = " ".join(d.page_content for d in ranking)
+            # Score symbol recall on what the MODEL would be shown, which is the
+            # whole parent: production retrieves windows and widens them back with
+            # `parent_context` before building the prompt. Scoring the retrieved
+            # text itself would penalise the dense leg for the very narrowing that
+            # lets it escape truncation, and the penalty would look like a
+            # retrieval-quality result.
+            leg_text = " ".join(parent_context(d) for d in ranking)
             leg["symbol_hits"] += sum(1 for s in expected_syms if s in leg_text)
             leg["symbols_expected"] += len(expected_syms)
 
@@ -475,7 +526,7 @@ async def evaluate_pipeline(
         precision_values.append(relevant_count / len(ranked_docs) if ranked_docs else 0.0)
 
         # ── Symbol Coverage ───────────────────────────────────────────────────
-        retrieved_text = " ".join(doc.page_content for doc in ranked_docs)
+        retrieved_text = " ".join(parent_context(doc) for doc in ranked_docs)
         matched_symbols = [sym for sym in expected_syms if sym in retrieved_text]
         symbol_hits += len(matched_symbols)
         total_expected_symbols += len(expected_syms)
@@ -563,6 +614,17 @@ async def evaluate_pipeline(
             "dense + BM25 (weighted two-branch RRF)"
             + (" + cross-encoder reranking" if rerank_enabled else " (reranking disabled)")
         ),
+        # The dense branch indexes windows, so its numbers are not comparable with
+        # runs from before this key existed — those embedded whole files, truncated
+        # at the embedder's window. Recording the counts makes the two kinds of run
+        # tellable apart in the artefact instead of only in the commit message.
+        "dense_corpus": {
+            "files": len(corpus_docs),
+            "windows": len(dense_docs),
+        },
+        # Identifies WHICH source produced these numbers. Two runs from different
+        # commits are not comparable, and without this they look identical.
+        "corpus_sha256": corpus_fingerprint(corpus_docs),
     }
     result["models"] = _model_provenance(embedder_mode)
     return result
@@ -654,6 +716,55 @@ def _is_project_source(path: Path, root: Path) -> bool:
     )
 
 
+def resolve_corpus_dir(cli_value: Optional[str], repo_root: Path) -> Path:
+    """
+    Where to build the corpus from: an explicit pin, or this repo's backend/.
+
+    Split out of `__main__` so the flag has a seam a test can reach. The default
+    has to be derived from `repo_root` rather than the working directory, because
+    the benchmark is run both from the repo root (CI, the docs) and from inside
+    `backend/`, and a corpus that depends on where you stood would be the same class
+    of problem as the one this flag exists to fix.
+    """
+    if cli_value:
+        return Path(cli_value)
+    return repo_root / "backend"
+
+
+def corpus_fingerprint(docs: List[Document]) -> str:
+    """
+    A hash that identifies this exact corpus, so two runs can be told apart.
+
+    WHY THIS IS NEEDED
+    ------------------
+    The corpus is this project's own source. That is deliberate — the benchmark asks
+    answerable questions about real code — but it means the corpus changes whenever
+    the product changes. Add a test file and `bm25_only` moves, not because retrieval
+    changed but because the document set did. Two runs from different commits are
+    therefore not comparable, and nothing in the artifact said so: both carried a
+    hit rate and a `dataset_sha256` for the *queries*, which were identical.
+
+    That is the same failure the per-leg work was about. A metric that moves when
+    the environment moves cannot support a decision, and one that moves when the
+    code moves cannot support a comparison.
+
+    The fix is not to freeze the corpus — it has to track the code to be worth
+    measuring. It is to make the drift visible: `--corpus-dir` pins a checkout so two
+    runs CAN be compared, and this hash records which corpus produced each run so a
+    comparison never rests on an assumption. Same intent as `dense_embedder_mode`.
+
+    Hashes content and relative path, both, because moving a file between packages
+    changes which module a symbol lives in without changing a byte of its text.
+    """
+    digest = hashlib.sha256()
+    for doc in sorted(docs, key=lambda d: d.metadata.get("source", "")):
+        digest.update(doc.metadata.get("source", "").encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(doc.page_content.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def load_corpus(backend_dir: Path) -> List[Document]:
     """Load this project's own Python source as the evaluation corpus."""
     docs = []
@@ -727,7 +838,21 @@ def print_report(result: Dict[str, Any]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SavFlux RAG Benchmark")
-    parser.add_argument("--eval-file", help="Path to external JSON benchmark file")
+    parser.add_argument(
+        "--corpus-dir",
+        help=(
+            "Directory to build the corpus from (default: this repo's backend/). "
+            "The corpus is this project's own source, so it changes whenever the "
+            "code does — which makes runs from different commits incomparable. "
+            "Point this at a pinned checkout to hold the document set still while "
+            "comparing one thing: e.g. a stash of the previous commit, or a second "
+            "checkout. Both runs record evaluation.corpus_sha256, so whether two "
+            "runs are comparable is checkable rather than assumed."
+        ),
+    )
+    parser.add_argument(
+        "--eval-file", help="Path to external JSON benchmark file"
+    )
     parser.add_argument("--top-k", type=int, default=5, help="Top-K candidates to evaluate")
     parser.add_argument("--quiet", action="store_true", help="Only print JSON result (for CI)")
     parser.add_argument("--json-out", help="Write JSON result to this file path")
@@ -760,13 +885,16 @@ if __name__ == "__main__":
     else:
         dataset = BENCHMARK_DATASET
 
-    # Build corpus from backend source
-    backend_dir = Path(__file__).resolve().parent / "backend"
+    # Build corpus from backend source, or from a pinned checkout when asked.
+    backend_dir = resolve_corpus_dir(args.corpus_dir, Path(__file__).resolve().parent)
+    if not backend_dir.is_dir():
+        raise SystemExit(f"--corpus-dir is not a directory: {backend_dir}")
     corpus = load_corpus(backend_dir)
 
     if not args.quiet:
         print(f"\n🔬 SavFlux RAG Benchmark")
-        print(f"   Corpus: {len(corpus)} files from backend/")
+        print(f"   Corpus: {len(corpus)} files from {backend_dir}")
+        print(f"   Corpus sha256: {corpus_fingerprint(corpus)[:16]}")
         print(f"   Queries: {len(dataset)}  |  top_k={args.top_k}")
         print()
 

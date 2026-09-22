@@ -46,9 +46,12 @@ trade is visible rather than accidental.
 
 from __future__ import annotations
 
+from math import ceil
 from typing import Any, Iterable
 
 from langchain_core.documents import Document
+
+from app.services.ast_chunker import MAX_CHUNK_CHARS
 
 # ~256 tokens at 3.5 characters per token, matching the default embedder
 # (all-MiniLM-L6-v2). A test asserts this stays within that window; changing the
@@ -169,6 +172,53 @@ def children_of_all(
     for chunk in chunks:
         out.extend(children_of(chunk, window_chars, overlap_chars))
     return out
+
+
+def max_windows_per_parent(
+    chunk_chars: int = MAX_CHUNK_CHARS,
+    window_chars: int = EMBED_WINDOW_CHARS,
+    overlap_chars: int = CHILD_OVERLAP_CHARS,
+) -> int:
+    """
+    The most windows `children_of` can emit for one chunk.
+
+    WHY THIS IS A BOUND AND NOT A GUESS
+    -----------------------------------
+    Indexed rows are windows, so any caller taking "the top N rows" is now taking
+    the top N rows of something that is not one-per-chunk: N rows can cover as few
+    as N/this distinct chunks. Retrieval used to ask for `CANDIDATE_COUNT` rows and
+    get `CANDIDATE_COUNT` chunks. It kept asking for the same number and silently
+    started getting fewer — the candidate pool thinned, with no error and no metric
+    that would show it.
+
+    The way back is not to pick a fudge factor. `children_of` walks the text in
+    steps of `window_chars - overlap_chars`, so the number of spans it can produce
+    is `ceil(len(text) / step)`, and it may only drop spans, never add them. The
+    longest text it can be handed is `MAX_CHUNK_CHARS` — the AST chunker's ceiling,
+    and also above the generic splitter's `chunk_size`, so it bounds both paths.
+    That makes this an upper bound rather than an estimate, which is what lets the
+    caller multiply instead of hope.
+
+    At the current constants: window 900, overlap 90, step 810, ceiling 3000 →
+    4 windows. `test_max_windows_per_parent_bounds_every_length` checks this against
+    every possible length rather than the endpoints, because the span count is a
+    ceiling and the interesting cases are the ones that just cross a boundary.
+
+    It takes its arguments as parameters so the tests can vary them, and so a future
+    change to the windowing maths has one place to update instead of a scattered
+    multiplier.
+    """
+    if window_chars < 1:
+        raise ValueError(f"window_chars must be >= 1, got {window_chars}")
+    step = window_chars - overlap_chars
+    if step < 1:
+        raise ValueError(
+            f"overlap_chars ({overlap_chars}) must be < window_chars ({window_chars}); "
+            "a step of zero or less never advances and would emit windows forever."
+        )
+    if chunk_chars < 1:
+        raise ValueError(f"chunk_chars must be >= 1, got {chunk_chars}")
+    return max(1, ceil(chunk_chars / step))
 
 
 def parent_context(doc: Document) -> str:
