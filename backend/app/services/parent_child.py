@@ -88,6 +88,51 @@ def parent_id_of(metadata: dict[str, Any]) -> str:
     return f"{metadata.get('source', '')}::{metadata.get('chunk_index', 0)}"
 
 
+def window_spans(
+    text: str,
+    window_chars: int = EMBED_WINDOW_CHARS,
+    overlap_chars: int = CHILD_OVERLAP_CHARS,
+) -> list[tuple[int, int]]:
+    """
+    The (start, end) spans that cover `text`, in order. The ONE definition of this.
+
+    WHY IT IS SHARED
+    ----------------
+    Ingestion slices a chunk to make embed windows; the reranker slices a chunk to
+    score it without truncation. Different reasons, same arithmetic — and two copies
+    of it drift, so the reranker would eventually cut on a boundary the indexer does
+    not and score spans that were never indexed. One function, so "how this text is
+    cut up" means one thing.
+
+    A span is kept only if it reaches further than the span before it. A trailing
+    window can start so late that it adds no text the previous one did not already
+    cover; that would be a near-empty slice whose vector is noise and whose score is
+    noise, while still costing a row or a prediction.
+    """
+    if window_chars < 1:
+        raise ValueError(f"window_chars must be >= 1, got {window_chars}")
+    if overlap_chars < 0 or overlap_chars >= window_chars:
+        raise ValueError(
+            f"overlap_chars must be >= 0 and < window_chars ({window_chars}), "
+            f"got {overlap_chars}. An overlap at or above the window never advances "
+            "and would emit windows forever."
+        )
+    if not text:
+        return []
+    if len(text) <= window_chars:
+        return [(0, len(text))]
+
+    step = window_chars - overlap_chars
+    spans = [
+        (start, min(start + window_chars, len(text)))
+        for start in range(0, len(text), step)
+    ]
+    return [
+        span for index, span in enumerate(spans)
+        if index == 0 or span[1] > spans[index - 1][1]
+    ]
+
+
 def children_of(
     chunk: Document,
     window_chars: int = EMBED_WINDOW_CHARS,
@@ -104,16 +149,10 @@ def children_of(
     The input is never mutated. Chunker output is cached and shared between
     requests, and writing parent bookkeeping onto a cached Document would leak one
     indexing run's metadata into another's.
-    """
-    if window_chars < 1:
-        raise ValueError(f"window_chars must be >= 1, got {window_chars}")
-    if overlap_chars < 0 or overlap_chars >= window_chars:
-        raise ValueError(
-            f"overlap_chars must be >= 0 and < window_chars ({window_chars}), "
-            f"got {overlap_chars}. An overlap at or above the window never advances "
-            "and would emit children forever."
-        )
 
+    Validation lives in `window_spans`, which is where the windowing is defined —
+    one place to change, one place to get wrong.
+    """
     text = chunk.page_content
     source_meta = dict(chunk.metadata)
     pid = parent_id_of(source_meta)
@@ -130,22 +169,9 @@ def children_of(
         "chunk_index": source_meta.get("chunk_index", 0),
     }
 
-    if len(text) <= window_chars:
-        windows = [(0, len(text))]
-    else:
-        step = window_chars - overlap_chars
-        spans = [
-            (start, min(start + window_chars, len(text)))
-            for start in range(0, len(text), step)
-        ]
-        # A trailing window can start so late that it adds no text the previous one
-        # did not already cover. Emitting it would create a near-empty child whose
-        # vector is noise and which costs a row. Keep a span only if it reaches
-        # further than the span before it.
-        windows = [
-            span for index, span in enumerate(spans)
-            if index == 0 or span[1] > spans[index - 1][1]
-        ]
+    # Sliced by the shared definition, so the reranker cutting the same chunk for
+    # scoring cannot land on different boundaries than ingestion indexed.
+    windows = window_spans(text, window_chars, overlap_chars)
 
     children: list[Document] = []
     for index, (start, end) in enumerate(windows):
