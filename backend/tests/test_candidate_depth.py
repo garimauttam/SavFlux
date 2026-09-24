@@ -335,12 +335,28 @@ def test_a_pinned_corpus_dir_is_what_gets_measured(tmp_path):
     assert proc.returncode == 0, proc.stderr[-2000:]
 
     payload = __import__("json").loads(proc.stdout.strip().splitlines()[-1])
-    assert payload["evaluation"]["dense_corpus"]["files"] == 1
+    evaluation = payload["evaluation"]
+    assert evaluation["corpus_shape"] == "chunks"
+    assert evaluation["dense_corpus"]["units"] == 1
+    assert payload["metrics"]["hit_rate_at_k_granularity"] == "file"
+
+    # The unit's `source` is repo-relative ("<harness repo>::only.py"), not the
+    # absolute path, so this hash is the same wherever the corpus is checked out.
+    # Pinned to the shape explicitly rather than to a path string: an absolute path
+    # would make two developers' runs of the same corpus disagree.
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    import eval_rag as _eval_rag
 
     expected = __import__("hashlib").sha256(
-        f"{pinned / 'only.py'}\0def only_function():\n    return 42\n\0".encode()
+        f"{_eval_rag.HARNESS_REPO_URL}::only.py\0"
+        "def only_function():\n    return 42\n\0".encode()
     ).hexdigest()
-    assert payload["evaluation"]["corpus_sha256"] == expected
+    assert evaluation["corpus_sha256"] == expected
+    assert str(pinned) not in __import__("json").dumps(payload), (
+        "the machine's absolute path reached the artefact — the corpus is no longer "
+        "comparable across checkouts"
+    )
 
 
 def test_a_missing_corpus_dir_fails_loudly(tmp_path):

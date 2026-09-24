@@ -62,9 +62,15 @@ def test_the_corpus_excludes_installed_packages(eval_rag_module):
         leaked = [s for s in sources if marker in s]
         assert not leaked, f"{len(leaked)} corpus documents leaked from {marker}: {leaked[:3]}"
 
-    assert len(corpus) < 1000, (
-        f"{len(corpus)} documents is far more than this project has — the exclusion "
-        "list has stopped working"
+    # The bound is relative to the source files, not absolute, because the corpus is
+    # now measured in CHUNKS: one file legitimately yields many units, so a fixed
+    # ceiling would measure the file size distribution rather than the exclusion list.
+    # The defect this catches is a venv leak, which multiplies both together.
+    files = eval_rag_module.project_source_files(REPO_ROOT / "backend")
+    assert files, "no source files found at all"
+    assert len(corpus) < 50 * len(files), (
+        f"{len(corpus)} units from {len(files)} source files is far more than this "
+        "project produces — the exclusion list has stopped working"
     )
 
 
@@ -448,9 +454,13 @@ async def test_the_result_records_that_the_dense_corpus_was_windowed(eval_rag_mo
         embedder_mode="offline",
         rerank_enabled=False,
     )
-    dense_corpus = result["evaluation"]["dense_corpus"]
-    assert dense_corpus["files"] == 1
+    evaluation = result["evaluation"]
+    dense_corpus = evaluation["dense_corpus"]
+    # `units`, not `files`: this counts retrieval units, which are chunks now. The
+    # old key read as a file count and would have kept reading plausibly.
+    assert dense_corpus["units"] == 1
     assert dense_corpus["windows"] > 1
+    assert evaluation["corpus_shape"] == "chunks"
 
 
 # The symbol must live in the parent but NOT in the window that gets retrieved,
