@@ -26,6 +26,11 @@ import logging
 from functools import lru_cache
 from langchain_core.documents import Document
 
+from app.services.parent_child import (
+    parent_context,
+    window_spans,
+)
+
 logger = logging.getLogger(__name__)
 # _reranker_unavailable is NOT a module-level permanent flag.
 # Per-call exception handling falls back to unranked docs for that request only;
@@ -86,6 +91,34 @@ wants its own measurement before landing rather than being bundled here.
 """
 
 
+RERANK_CHARS_PER_TOKEN = 3.5
+"""
+Characters per token, used to size a scoring slice from a token budget.
+
+An approximation, and labelled as one. The exact figure needs the cross-encoder's
+tokenizer, which means loading the model — and this module deliberately does not do
+that at import time (see the lazy import note below). Code tokenizes at roughly 3-4
+characters per token, so the slice this produces may be a little over or under the
+model's real window. That is the right side to err on: an oversized slice is trimmed
+by `max_length` (a small, bounded loss on one slice), while an undersized one would
+needlessly split a passage that would have fit.
+
+`RERANK_WINDOW_CHARS` below is the only thing that consumes this, so there is one
+place to correct if a real measurement replaces the estimate.
+"""
+
+RERANK_WINDOW_CHARS = int(RERANKER_MAX_LENGTH * RERANK_CHARS_PER_TOKEN)
+"""The scoring slice size in characters: 512 tokens at the ratio above, so 1792."""
+
+RERANK_WINDOW_OVERLAP_CHARS = RERANK_WINDOW_CHARS // 10
+"""
+Slice overlap, at the same 10% ratio `parent_child` uses for embed windows (900/90).
+
+The ratio matters, not the number: a fact that straddles a slice boundary must be
+wholly inside at least one slice, or the passage scores as if it were absent.
+"""
+
+
 @lru_cache(maxsize=1)
 def _get_cross_encoder():
     """
@@ -141,15 +174,58 @@ async def rerank(
 
     def _score():
         cross_encoder = _get_cross_encoder()
-        # CrossEncoder expects a list of (query, passage) pairs.
-        # max_length is passed explicitly rather than left to default: see
-        # RERANKER_MAX_LENGTH. Note `doc.page_content`, not the parent text — BM25
-        # candidates carry the full parent here, which is exactly the case that
-        # exceeds the window.
-        pairs = [(query, doc.page_content) for doc in documents]
+
+        # Score the PARENT, not whatever row happened to arrive.
+        #
+        # Dense candidates carry a window; BM25 candidates carry the whole chunk.
+        # Reading `page_content` therefore scored a chunk on ~900 characters if the
+        # dense branch found it and on up to 3000 if it did not — so a chunk's rank
+        # depended on which branch's top-N it happened to land in, which is a
+        # property of the retrieval plumbing rather than of relevance. Reading
+        # `parent_context` makes the score a function of the chunk alone.
+        #
+        # Long parents are sliced rather than truncated. Before, everything past 512
+        # tokens was discarded, so a chunk whose relevance sat in its tail scored as
+        # if the tail did not exist. Slicing is the same fix as the embedder's, in
+        # the same shape, using the same span maths.
+        pairs: list[tuple[str, str]] = []
+        owners: list[int] = []
+        for index, doc in enumerate(documents):
+            text = parent_context(doc)
+            spans = window_spans(
+                text, RERANK_WINDOW_CHARS, RERANK_WINDOW_OVERLAP_CHARS
+            )
+            # An empty document yields no spans; score it rather than dropping it,
+            # so every input keeps a score and none silently disappears from the
+            # ranking.
+            for start, end in spans or [(0, 0)]:
+                pairs.append((query, text[start:end]))
+                owners.append(index)
+
+        if not pairs:
+            return documents[:top_n]
+
+        # ONE predict() call for every slice of every candidate. Per-document calls
+        # would repeat the tokenizer and model overhead once per candidate; batching
+        # keeps the cost proportional to the number of slices rather than to the
+        # number of round trips.
         scores = cross_encoder.predict(pairs, max_length=RERANKER_MAX_LENGTH)
-        # Zip scores with docs, sort by score descending, return top_n docs
-        scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+
+        # Max over a candidate's slices: a passage is as relevant as its most
+        # relevant part, which is what a model reading the whole chunk could find.
+        # Mean would punish a long chunk for having one irrelevant section and sum
+        # would reward length outright.
+        best: dict[int, float] = {}
+        for owner, score in zip(owners, scores):
+            value = float(score)
+            if owner not in best or value > best[owner]:
+                best[owner] = value
+
+        scored = sorted(
+            ((best[index], doc) for index, doc in enumerate(documents)),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
         ranked: list[Document] = []
         for score, doc in scored[:top_n]:
             # Copy before mutating: these Documents come from a module-level BM25

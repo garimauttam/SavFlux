@@ -111,12 +111,15 @@ def test_scoring_still_ranks_and_annotates(monkeypatch):
     assert ranked[0].metadata["chunk_index"] == 0
 
 
-def test_the_pairs_sent_are_query_and_page_content(monkeypatch):
+def test_the_pairs_sent_are_the_query_and_the_documents_parent_text(monkeypatch):
     """
-    Pins what is scored. BM25 candidates carry the FULL parent in `page_content`
-    (see `_bm25_corpus`), which is precisely the input that overflows this window —
-    so if this ever switches to a widened or windowed view, the window constant
-    above is no longer the whole story and this test should be revisited with it.
+    Pins what is scored: the query paired with the document's PARENT text.
+
+    This used to assert `doc.page_content`, which is what the code read before the
+    reranker was made source-agnostic. Those two agree only while a document is
+    short enough to fit one slice — which is why the fixtures here are short, and
+    why this test would have kept passing after the change while describing the old
+    contract. The windowing behaviour is covered in `test_reranker_parent_scoring.py`.
     """
     recorder = _RecordingCrossEncoder()
     monkeypatch.setattr(rr, "_get_cross_encoder", lambda: recorder)
@@ -126,7 +129,8 @@ def test_the_pairs_sent_are_query_and_page_content(monkeypatch):
 
     pairs = recorder.calls[0]["pairs"]
     assert [p[0] for p in pairs] == ["the query", "the query"]
-    assert [p[1] for p in pairs] == [d.page_content for d in docs]
+    # One slice each, because these fixtures fit the scoring window.
+    assert [p[1] for p in pairs] == [rr.parent_context(d) for d in docs]
 
 
 def test_a_document_longer_than_the_window_is_still_scored(monkeypatch):

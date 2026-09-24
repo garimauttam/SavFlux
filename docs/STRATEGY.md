@@ -382,9 +382,44 @@ drifts from the model it was chosen for.
 Worth knowing when reading those numbers: **BM25 candidates carry the full parent** in
 `page_content` (that is what `_bm25_corpus` builds), so they are the inputs that overflow
 this window. Dense candidates are already windows. Windowed reranking — splitting a long
-passage and keeping the best window's score — would recover the lost precision, and is
-deliberately not bundled here because it multiplies rerank cost by the window count and
-wants its own measurement.
+passage and keeping the best window's score — would recover the lost precision, and was
+left out of that change because it multiplies rerank cost by the window count.
+
+**That follow-up is now done, and the defect was worse than truncation.** With small-to-big
+landed, the reranker was comparing scores computed on **different text depending on which
+branch found a chunk**: dense candidates carried a ~900-character window, BM25 candidates
+carried the up-to-3000-character chunk, and `two_branch_rrf` gives dense precedence when both
+matched. Of 880 fused candidates over the benchmark queries, 68% arrived as windows and 32% as
+chunks — and **154 were found by both branches but scored as a window**, because dense's top-N
+happened to include them. So a chunk's rank depended on where one branch's truncation boundary
+fell, which is a property of the retrieval plumbing rather than of relevance.
+
+The reranker now scores `parent_context(doc)` — the chunk, not the row it arrived in — and
+slices a long parent rather than truncating it, through the same `window_spans` the indexer
+uses. A chunk therefore scores identically whichever branch surfaced it.
+
+| | 512-token window (before) | parent, sliced (after) |
+|---|---|---|
+| Chunk scored on | a window if dense found it, a truncated chunk if BM25 did | its own text, always |
+| Relevance sitting in the tail | invisible | found |
+| Rerank pairs, production-shaped corpus | 1590 | 1775 (**1.116×**) |
+| Chunks needing >1 slice | — | 11.6% |
+| Hard cap per chunk | — | 2 slices (3000-char ceiling) |
+
+**One number in that table was wrong first, and how it was wrong is worth keeping.** An
+earlier measurement reported a **9.6×** multiplier with up to 31 slices per candidate. It had
+run over the *harness's* corpus, which is whole files, not chunks. Production chunks are capped
+at `MAX_CHUNK_CHARS`, so the real figure is 1.116× and the real ceiling is 2 slices. The
+harness's whole-file corpus is a pre-existing simplification — `load_corpus` reads files and
+never chunks them — and it means **rerank cost measured in that harness overstates production's
+by an order of magnitude**. Worth knowing before trusting any `fused_reranked` timing from it.
+
+**Known limitation, stated rather than hidden: max-over-windows has a length bias.** A longer
+chunk gets more slices and therefore more chances to match, so max-pooling can slightly favour
+long chunks. It is bounded here because candidates are already chunk-level (≤3000 characters,
+≤2 slices), but it is a real trade. This change makes scoring *consistent*; whether it ranks
+*better* still needs a local run, because the cross-encoder weights cannot be downloaded in the
+build sandbox.
 
 **Why it is still not measured HERE:** this sandbox cannot reach `huggingface.co` (nor
 `hf-mirror.com`), and no weights are cached, so a real before/after comparison is
