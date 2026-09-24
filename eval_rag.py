@@ -44,6 +44,7 @@ from app.services.reranker import RERANK_SCORE_KEY, rerank
 from app.services.query_enhancer import extract_file_scope, local_query_variants
 from app.services.offline_embedder import DenseIndex
 from app.services.parent_child import children_of, dedupe_to_parents, parent_context
+from app.services.ast_chunker import MAX_CHUNK_CHARS
 
 
 # ── Benchmark Dataset ─────────────────────────────────────────────────────────
@@ -333,19 +334,57 @@ def _build_embedder(mode: str):
         ) from exc
 
 
-def _rank_of(ranked_docs: List[Document], target_file: str) -> Optional[int]:
-    """1-based position of the first document from `target_file`, else None."""
+def _unit_matches_file(doc: Document, target_file: str) -> bool:
+    """
+    Whether a retrieval unit belongs to `target_file`.
+
+    ONE definition, because three places ask this question: the rank of the first
+    hit, the precision numerator, and the units-per-file figure the report prints
+    beside the hit rate. Copies of a predicate drift, and this particular drift is
+    invisible — the metric and the number printed next to it would disagree while
+    both looked plausible.
+    """
     needle = target_file.lower()
+    return (
+        needle in doc.metadata.get("file_name", "").lower()
+        or needle in doc.metadata.get("source", "").lower()
+    )
+
+
+def _rank_of(ranked_docs: List[Document], target_file: str) -> Optional[int]:
+    """1-based position of the first unit from `target_file`, else None."""
     for idx, doc in enumerate(ranked_docs, start=1):
-        if needle in doc.metadata.get("file_name", "").lower():
-            return idx
-        if needle in doc.metadata.get("source", "").lower():
+        if _unit_matches_file(doc, target_file):
             return idx
     return None
 
 
 def _empty_leg() -> Dict[str, Any]:
     return {"hits": 0, "ranks": [], "symbol_hits": 0, "symbols_expected": 0}
+
+
+def _units_per_expected_file_stats(counts: List[int]) -> Dict[str, Any]:
+    """
+    How many retrieval units each query's expected file contributed.
+
+    This is the honesty figure beside a file-level hit rate: it says how many
+    chances a "hit" had. A chunk-shaped corpus gives a file many units, so a hit
+    means "one of these landed in top-K", while a miss means none of them did — an
+    asymmetry the hit rate alone hides.
+    """
+    if not counts:
+        return {"min": 0, "median": 0, "p90": 0, "max": 0, "queries_with_no_unit": 0}
+    ordered = sorted(counts)
+    return {
+        "min": ordered[0],
+        "median": ordered[len(ordered) // 2],
+        "p90": ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))],
+        "max": ordered[-1],
+        # A query whose expected file contributed no unit cannot be a hit whatever
+        # the retriever does. That is a property of the corpus, not of retrieval,
+        # and it must not be readable as a quality result.
+        "queries_with_no_unit": sum(1 for c in ordered if c == 0),
+    }
 
 
 def _dense_corpus(docs: List[Document]) -> List[Document]:
@@ -382,6 +421,8 @@ async def evaluate_pipeline(
     verbose: bool = True,
     embedder_mode: str = "model",
     rerank_enabled: bool = True,
+    corpus_shape: str = "chunks",
+    corpus_files: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Evaluates retrieval performance across a benchmark dataset, PER RETRIEVAL LEG.
@@ -427,6 +468,7 @@ async def evaluate_pipeline(
     total_expected_symbols = 0
     latencies: List[float] = []
     precision_values: List[float] = []
+    unit_counts: List[int] = []
 
     query_results = []
 
@@ -434,6 +476,13 @@ async def evaluate_pipeline(
         raw_query = item["query"]
         target_file = item["ground_truth_file"]
         expected_syms = item.get("expected_symbols", [])
+        # How many units of the corpus this query's file contributed — i.e. how many
+        # chances the file-level hit had. Counted with the same predicate the rank
+        # is scored with, so the figure describes the metric beside it.
+        expected_file_units = sum(
+            1 for doc in corpus_docs if _unit_matches_file(doc, target_file)
+        )
+        unit_counts.append(expected_file_units)
 
         query, file_scope = extract_file_scope(raw_query)
 
@@ -518,10 +567,7 @@ async def evaluate_pipeline(
             reciprocal_ranks.append(0.0)
 
         relevant_count = sum(
-            1
-            for doc in ranked_docs
-            if target_file.lower() in doc.metadata.get("file_name", "").lower()
-            or target_file.lower() in doc.metadata.get("source", "").lower()
+            1 for doc in ranked_docs if _unit_matches_file(doc, target_file)
         )
         precision_values.append(relevant_count / len(ranked_docs) if ranked_docs else 0.0)
 
@@ -538,6 +584,7 @@ async def evaluate_pipeline(
             "hit": rank is not None,
             "symbols_matched": len(matched_symbols),
             "symbols_expected": len(expected_syms),
+            "expected_file_units": expected_file_units,
             "latency_ms": round(latency_ms, 1),
         }
         query_results.append(result)
@@ -588,6 +635,11 @@ async def evaluate_pipeline(
         "metrics": {
             "total_queries": total_queries,
             "hit_rate_at_k": round(hit_rate * 100, 2),
+            # What "hit" means. A unit is a chunk, but the predicate is "a unit from
+            # the expected FILE", so this is a file-level metric and is labelled as
+            # one everywhere it is reported — a file-level hit must not be readable
+            # as "the answer was retrieved".
+            "hit_rate_at_k_granularity": "file",
             "mean_reciprocal_rank_mrr": round(mrr, 3),
             "symbol_recall_pct": round(sym_recall * 100, 2),
             "avg_latency_ms": round(avg_latency, 1),
@@ -614,12 +666,19 @@ async def evaluate_pipeline(
             "dense + BM25 (weighted two-branch RRF)"
             + (" + cross-encoder reranking" if rerank_enabled else " (reranking disabled)")
         ),
+        # What ONE retrieval unit is, and how many there are. `units` replaced a key
+        # called `files`, which stopped being true when the corpus became chunks and
+        # would have gone on reading plausibly. This is the key that tells a run
+        # against production's units apart from one against whole files.
+        "corpus_shape": corpus_shape,
+        "corpus_source_files": corpus_files,
+        "units_per_expected_file": _units_per_expected_file_stats(unit_counts),
         # The dense branch indexes windows, so its numbers are not comparable with
         # runs from before this key existed — those embedded whole files, truncated
         # at the embedder's window. Recording the counts makes the two kinds of run
         # tellable apart in the artefact instead of only in the commit message.
         "dense_corpus": {
-            "files": len(corpus_docs),
+            "units": len(corpus_docs),
             "windows": len(dense_docs),
         },
         # Identifies WHICH source produced these numbers. Two runs from different
@@ -673,6 +732,19 @@ def _model_provenance(embedder_mode: str = "model") -> Dict[str, str]:
         provenance["reranker"] = f"<unavailable: {type(exc).__name__}>"
 
     return provenance
+
+
+# The corpus shape: what ONE retrieval unit is. "chunks" is what ingestion writes
+# and therefore what the retriever ranks. "files" is the shape this harness used to
+# measure with, kept so an existing baseline stays reproducible and both shapings can
+# be compared in one run — it is not production's unit and the result says so.
+CORPUS_SHAPES = ("chunks", "files")
+
+# Stands in for the clone URL ingestion stamps. Using it instead of the local
+# absolute path keeps every `source` repo-relative, so a corpus fingerprinted on one
+# machine matches the same corpus checked out at a different path — which is what
+# `corpus_fingerprint`'s docstring has always claimed to do.
+HARNESS_REPO_URL = "local://savflux-eval-corpus"
 
 
 CORPUS_EXCLUDED_DIRS = frozenset({
@@ -765,41 +837,177 @@ def corpus_fingerprint(docs: List[Document]) -> str:
     return digest.hexdigest()
 
 
-def load_corpus(backend_dir: Path) -> List[Document]:
-    """Load this project's own Python source as the evaluation corpus."""
-    docs = []
-    for p in sorted(backend_dir.rglob("*.py")):
-        if not _is_project_source(p, backend_dir):
-            continue
+def project_source_files(backend_dir: Path) -> List[Path]:
+    """This project's own Python files under `backend_dir`, in a stable order."""
+    return [
+        p for p in sorted(backend_dir.rglob("*.py"))
+        if _is_project_source(p, backend_dir)
+    ]
+
+
+def _file_units(files: List[Path]) -> List[Document]:
+    """
+    The old shape: one unit per FILE. Kept for reproducing pre-existing baselines.
+
+    A read failure raises rather than skipping the file. Skipping silently shrinks
+    the corpus, and a smaller corpus produces a perfectly plausible number.
+    """
+    units = []
+    for path in files:
         try:
-            content = p.read_text(encoding="utf-8")
-            docs.append(Document(
-                page_content=content,
-                metadata={"source": str(p), "file_name": p.name},
-            ))
-        except Exception:
-            pass
-    return docs
+            content = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            raise RuntimeError(f"could not read corpus file {path}: {exc}") from exc
+        units.append(Document(
+            page_content=content,
+            metadata={"source": str(path), "file_name": path.name},
+        ))
+    return units
+
+
+def _chunk_units(files: List[Path], source_root: Path) -> List[Document]:
+    """
+    Production's units: one chunk per symbol, built by ingestion's own path.
+
+    Calling `_load_and_split` rather than `chunk_code_file` directly is deliberate.
+    That function is the whole file→chunks path — AST boundaries where a parser
+    exists, the character-splitter fallback where it does not, the content hash and
+    the source IDs. Re-deriving it here would let the benchmark measure a corpus
+    production never builds, which is the defect this function exists to fix.
+
+    One file at a time so a file that contributes nothing is *attributable*. A
+    corpus that quietly drops a file is smaller on one machine than on another, and
+    the run still prints a number.
+    """
+    from app.services.ingestion_service import _load_and_split
+
+    units: List[Document] = []
+    for path in files:
+        if path.stat().st_size == 0:
+            # An empty file has nothing to index and ingestion writes no rows for
+            # it either. Counted, not guessed at: the corpus block reports how many
+            # source files contributed no units.
+            continue
+        produced = _load_and_split(
+            [path], repo_url=HARNESS_REPO_URL, source_root=source_root
+        )
+        if not produced:
+            raise RuntimeError(
+                f"{path} is not empty but produced no retrieval units. The corpus "
+                "would be silently smaller than the source tree — fix the read or "
+                "exclude the file deliberately."
+            )
+        units.extend(produced)
+    return units
+
+
+def _assert_unit_shape(units: List[Document], shape: str) -> None:
+    """
+    Assert the corpus shape instead of trusting it.
+
+    Both checks are loud because both failures are otherwise silent: oversized units
+    quietly make the harness measure a retrieval unit production never ranks, and
+    units without a source make file-level ground truth unreachable while the hit
+    rate still looks like a quality result.
+    """
+    if shape != "chunks":
+        return
+
+    oversized = [d for d in units if len(d.page_content) > MAX_CHUNK_CHARS]
+    if oversized:
+        largest = max(len(d.page_content) for d in oversized)
+        raise RuntimeError(
+            f"{len(oversized)} corpus units exceed MAX_CHUNK_CHARS "
+            f"({MAX_CHUNK_CHARS}); the largest is {largest} characters. Production "
+            "caps a chunk at that size, so these are not the units it ranks."
+        )
+
+    unlabelled = [
+        d for d in units
+        if not d.metadata.get("file_name") or not d.metadata.get("source")
+    ]
+    if unlabelled:
+        raise RuntimeError(
+            f"{len(unlabelled)} corpus units carry no file_name/source. File-level "
+            "ground truth matches on those fields, so such a unit can never be "
+            "counted as a hit."
+        )
+
+
+def load_corpus(backend_dir: Path, shape: str = "chunks") -> List[Document]:
+    """
+    The documents the retriever ranks: the units ingestion writes.
+
+    WHAT CHANGED, AND WHY
+    ---------------------
+    This used to return one Document per FILE, and the dense leg windowed those
+    files. That measured a retrieval path production does not have. Ingestion writes
+    one chunk per symbol, capped at `MAX_CHUNK_CHARS`, and the two-branch retriever
+    ranks those chunks. File units here are 7,021 characters at the median and up to
+    49,937 — a single "document" can be 62 embed windows collapsing back to one
+    parent — while production's largest unit is a 3,000-character chunk with at most
+    four windows.
+
+    The gap was not cosmetic. Measured over the same 44 queries with the same code,
+    changing nothing but this shape moves symbol recall from 82.9% to 66.7% on the
+    BM25 leg and from 89.4% to 82.9% fused. Retrieving a file made every symbol
+    inside it "present", which is why symbol recall tracked hit rate almost exactly
+    at file shape (89.4% vs 81.8%) and separates from it at chunk shape.
+
+    `shape="files"` rebuilds the old corpus: it exists so a stored baseline stays
+    reproducible and so both shapings can be measured in one run. It is not what
+    production indexes, and every result records which shape produced it.
+    """
+    if shape not in CORPUS_SHAPES:
+        raise ValueError(
+            f"unknown corpus shape {shape!r}; expected one of {CORPUS_SHAPES}"
+        )
+
+    files = project_source_files(backend_dir)
+    units = _file_units(files) if shape == "files" else _chunk_units(files, backend_dir)
+    _assert_unit_shape(units, shape)
+    return units
 
 
 def print_report(result: Dict[str, Any]) -> None:
     m = result["metrics"]
+    ev = result.get("evaluation", {})
+    granularity = m.get("hit_rate_at_k_granularity", "file")
+    shape = ev.get("corpus_shape", "unknown")
+    per_file = ev.get("units_per_expected_file") or {}
+    dense = ev.get("dense_corpus") or {}
+    source_files = ev.get("corpus_source_files")
+
+    corpus_line = f"{dense.get('units', '?')} units ({shape})"
+    if source_files:
+        corpus_line += f" from {source_files} source files"
     print()
     print("=" * 60)
     print("         SAVFLUX RAG BENCHMARK REPORT")
     print("=" * 60)
+    print(f"  Corpus               : {corpus_line}")
     print(f"  Total queries        : {m['total_queries']}")
-    print(f"  Hit Rate @ K         : {m['hit_rate_at_k']}%")
+    print(f"  Hit Rate @ K         : {m['hit_rate_at_k']}%"
+          f"   ({granularity}-level)")
     print(f"  Mean Reciprocal Rank : {m['mean_reciprocal_rank_mrr']}")
     print(f"  Symbol Recall        : {m['symbol_recall_pct']}%")
     print(f"  Precision @ K        : {m['precision_at_k_pct']}%")
     print(f"  Avg latency          : {m['avg_latency_ms']} ms/query")
+    if per_file:
+        print(f"  Units per expected file: min {per_file['min']}  "
+              f"median {per_file['median']}  p90 {per_file['p90']}  "
+              f"max {per_file['max']}")
+        print(f"    a {granularity}-level hit means ONE of those units landed in top-K")
+        if per_file.get("queries_with_no_unit"):
+            print(f"    {per_file['queries_with_no_unit']} queries' expected file has "
+                  "NO unit in the corpus — those cannot hit")
     print("=" * 60)
 
     by_leg = m.get("by_leg") or {}
     if by_leg:
         # The table that decides whether an embedder swap is worth a re-index.
-        print("  BY RETRIEVAL LEG           hit@K      MRR   symbols")
+        print(f"  BY RETRIEVAL LEG           hit@K      MRR   symbols"
+              f"   ({granularity}-level hit@K)")
         for name in ("bm25_only", "dense_only", "fused", "fused_reranked"):
             leg = by_leg.get(name)
             if not leg:
@@ -868,6 +1076,18 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--corpus-shape",
+        choices=CORPUS_SHAPES,
+        default="chunks",
+        help=(
+            "What one retrieval unit is. 'chunks' (default) is what ingestion "
+            "writes and what the retriever ranks: one chunk per symbol. 'files' "
+            "is the shape this harness used before — one unit per whole file, up "
+            "to thousands of characters and dozens of embed windows — kept only so "
+            "an older baseline can be reproduced and the two compared in one run."
+        ),
+    )
+    parser.add_argument(
         "--no-rerank",
         action="store_true",
         help=(
@@ -889,12 +1109,17 @@ if __name__ == "__main__":
     backend_dir = resolve_corpus_dir(args.corpus_dir, Path(__file__).resolve().parent)
     if not backend_dir.is_dir():
         raise SystemExit(f"--corpus-dir is not a directory: {backend_dir}")
-    corpus = load_corpus(backend_dir)
+    source_files = project_source_files(backend_dir)
+    corpus = load_corpus(backend_dir, shape=args.corpus_shape)
 
     if not args.quiet:
         print(f"\n🔬 SavFlux RAG Benchmark")
-        print(f"   Corpus: {len(corpus)} files from {backend_dir}")
+        print(f"   Corpus: {len(corpus)} units ({args.corpus_shape})"
+              f" from {len(source_files)} source files in {backend_dir}")
         print(f"   Corpus sha256: {corpus_fingerprint(corpus)[:16]}")
+        if args.corpus_shape == "files":
+            print("   ⚠️  --corpus-shape files: not the unit production indexes;")
+            print("      file-level numbers from this shape read higher. See STRATEGY.md.\n")
         print(f"   Queries: {len(dataset)}  |  top_k={args.top_k}")
         print()
 
@@ -910,6 +1135,8 @@ if __name__ == "__main__":
         verbose=not args.quiet,
         embedder_mode=args.embedder,
         rerank_enabled=not args.no_rerank,
+        corpus_shape=args.corpus_shape,
+        corpus_files=len(source_files),
     ))
 
     if args.json_out:

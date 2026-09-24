@@ -103,6 +103,9 @@ jobs:
                         f'symbols={v[\"symbol_recall_pct\"]:>5.1f}%')
           print(f'  dense leg embedder: {m[\"dense_leg_embedder\"]}')
           print(f'  avg latency: {m[\"avg_latency_ms\"]} ms/query')
+          e = d['evaluation']
+          print('  corpus: ' + str(e['corpus_shape']) + ' shape, '+ str(e['dense_corpus']['units']) + ' units')
+          print('  hit rate is ' + str(m['hit_rate_at_k_granularity']) + '-level (a unit of the expected file)')
           hr = m['hit_rate_at_k']
           if hr < 40:
               print(f'FAIL: Hit Rate {hr}% is below the 40% regression threshold.')

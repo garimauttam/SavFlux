@@ -475,7 +475,13 @@ not on the window that happened to match.
 | `fused` MRR | 0.441 | **0.504** |
 
 `dense_only` gains **+13.6 points** and `fused`'s MRR improves, while BM25 is untouched —
-which is the expected signature, since only the dense corpus changed. One number moved the
+which is the expected signature, since only the dense corpus changed.
+
+**The absolute values in that table are file-shaped and superseded.** The delta it
+describes is still the right conclusion, but the numbers are not comparable with anything
+measured after the corpus became chunk-shaped — see the re-baseline below. Each JSON now
+carries `evaluation.corpus_shape`, so which kind a run is can be read off the artefact
+instead of remembered. One number moved the
 wrong way and is recorded rather than hidden: `fused` symbol recall dipped 88.62 → 87.8,
 a consequence of a different file now ranking into the top-5.
 
@@ -527,6 +533,68 @@ measuring):
 - `--corpus-dir` pins a checkout, so two runs **can** be held still while one thing is
   varied.
 
+**Re-baselined: the unit is a chunk, not a file (issue #15).** The harness built one
+Document per FILE and windowed those files, while production indexes one chunk per symbol.
+File units are 7,021 characters at the median and up to 49,937 — one "document" could be
+62 embed windows collapsing back to a single parent — against production's 3,000-character
+ceiling and at most 4 windows. The harness was measuring file retrieval and reporting it as
+retrieval quality.
+
+Both shapes, same 44 queries, same code, same tree, offline embedder, reranking off — only
+the corpus shape differs:
+
+| Leg | files: hit@5 | files: symbol | chunks: hit@5 | chunks: symbol | Δ symbol |
+|---|---|---|---|---|---|
+| `bm25_only` | 65.91% | 80.49% | 65.91% | **68.29%** | **−12.20** |
+| `dense_only` | 50.00% | 71.54% | 40.91% | **48.78%** | **−22.76** |
+| `fused` | 79.55% | 89.43% | 77.27% | **82.93%** | **−6.50** |
+
+Corpus identity for those runs: chunks `9fc13c45b85dab7a` (1,613 units / 2,408 windows),
+files `781d0d4275cc5b34` (136 units / 1,752 windows).
+
+Two things to read off it:
+
+- **Symbol recall at file shape was nearly redundant with hit rate** (89.43% vs 79.55%).
+  Retrieving a file made every symbol inside it "present", so one measurement was reported
+  under two names. At chunk shape the two separate, and symbol recall becomes the number
+  that answers "would the model be shown the answer".
+- **The lexical leg loses the most of what matters.** Its hit@5 does not move (65.91%)
+  while its symbol recall falls 12.2 points: the metric says "found it" for a file whose
+  relevant function the model is never shown. `bm25_only` involves no embedding model, so
+  those are quality numbers, not plumbing.
+
+**The confound is ruled out.** The obvious objection is that chunking discards what the
+queries need. It does not: of 123 expected-symbol occurrences, 116 appear in the file
+corpus and 116 in the chunk corpus — **0 dropped** — and chunking keeps 97.1% of the text
+(1,302,113 of 1,340,734 characters). The difference is retrieval, not coverage.
+
+**This looks like a regression and is not one.** The previous numbers were measuring an
+easier task; the smaller number is the cost of measuring the real one.
+
+Three consequences, recorded with it:
+
+- `evaluation.corpus_shape` names the shape, `dense_corpus.units` replaced a key called
+  `files` (which stopped being true and would have gone on reading plausibly), and
+  `metrics.hit_rate_at_k_granularity: "file"` labels the headline metric — a unit is a
+  chunk, but the predicate is "a unit **from the expected file**". The report prints the
+  qualifier and `units_per_expected_file`: the number of chances each hit had (min 2,
+  median 12, p90 50, max 53 here). One predicate, `_unit_matches_file`, serves the rank,
+  the precision numerator and that figure, because copies drift invisibly.
+- Units carry a **repo-relative** `source` (`local://savflux-eval-corpus::app/…`) instead
+  of an absolute path, so the same corpus checked out in two directories fingerprints
+  identically. Previously the machine's path was part of the identity, which is the
+  opposite of what a corpus fingerprint is for.
+- **The shape is asserted, not assumed.** `_assert_unit_shape` refuses a corpus containing
+  a unit over `MAX_CHUNK_CHARS` or a unit without `file_name`/`source`, and `_chunk_units`
+  refuses a non-empty file that yields no units. Each of those failures is otherwise
+  silent: a smaller or differently-shaped corpus still prints a plausible number.
+
+```bash
+# reproduce both shapes on one tree
+python eval_rag.py --embedder offline --no-rerank --quiet --corpus-shape chunks --json-out chunks.json
+python eval_rag.py --embedder offline --no-rerank --quiet --corpus-shape files  --json-out files.json
+```
+
 ```bash
 # pin the corpus, then compare one variable at a time
 python eval_rag.py --corpus-dir /pinned/savflux/backend --embedder model --json-out after.json
@@ -558,6 +626,10 @@ to fail when it changes — deliberately.
 
 ### Still open
 
+- **Ground-truth granularity.** `hit_rate_at_k` is file-level, and a file contributes a
+  median of 12 units (max 53), so a *miss* is a strong signal and a *hit* is a weaker one.
+  Symbol- or line-level ground truth needs ranges in the dataset; until then the units
+  figure beside the metric is what keeps the asymmetry visible.
 - **Symbol graph / jump-to-def.** Grammars are loaded and trees are built, so symbol
   extraction is a query away, but `dep_graph.py` is still file-level.
 - **JS/TS detection breadth.** Analysis is still mostly regex; the structural pass covers
