@@ -27,12 +27,12 @@ most semantically related to the user's prompt. The LLM gets dense,
 on-topic context within the same token budget.
 """
 
-import json
 import logging
 from typing import AsyncGenerator, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.services.stream_protocol import error_event, status_event
 from app.core.config import get_settings
 from app.services.llm_factory import get_chat_llm
 from app.services.token_counter import get_token_callback, increment_request
@@ -107,8 +107,7 @@ async def stream_code_write(
     context_text    = ""   # style-reference snippets for generate mode
 
     if context_sources:
-        status_meta = json.dumps({"step": "context"})
-        yield f"__STATUS__Fetching context from {len(context_sources)} file(s)...{status_meta}__STATUS_END__\n"
+        yield status_event(f"Fetching context from {len(context_sources)} file(s)…", step="context")
 
         try:
             from app.services.ingestion_service import _get_vectorstore
@@ -218,15 +217,14 @@ async def stream_code_write(
             )
 
     # ── Step 2: Build mode-specific prompt ────────────────────────────────────
-    status_meta = json.dumps({"step": "generating"})
 
     if mode == "edit":
         if not target_content:
-            yield f"__STATUS__Error: could not read target file{json.dumps({'step': 'error'})}__STATUS_END__\n"
+            yield status_event("Error: could not read target file", step="error")
             yield "❌ Could not retrieve the file content from the vector store. Please re-index the repo."
             return
 
-        yield f"__STATUS__Editing `{target_fname}`...{status_meta}__STATUS_END__\n"
+        yield status_event(f"Editing `{target_fname}`…", step="generating", mode="edit")
 
         context_section = (
             f"\n\n## Style reference from the codebase:\n\n{context_text}"
@@ -243,11 +241,11 @@ async def stream_code_write(
 
     elif mode == "tests":
         if not target_content:
-            yield f"__STATUS__Error: could not read target file{json.dumps({'step': 'error'})}__STATUS_END__\n"
+            yield status_event("Error: could not read target file", step="error")
             yield "❌ Could not retrieve the file content from the vector store. Please re-index the repo."
             return
 
-        yield f"__STATUS__Generating tests for `{target_fname}`...{status_meta}__STATUS_END__\n"
+        yield status_event(f"Generating tests for `{target_fname}`…", step="generating", mode="tests")
 
         style_section = (
             f"\n\n## Existing test files (match this style):\n\n{context_text}"
@@ -272,7 +270,7 @@ async def stream_code_write(
 
     else:
         # generate mode
-        yield f"__STATUS__Generating {language} code...{status_meta}__STATUS_END__\n"
+        yield status_event(f"Generating {language} code…", step="generating", mode="generate")
 
         context_section = (
             f"\n\n## Codebase context — match this style:\n\n{context_text}"
@@ -297,5 +295,4 @@ async def stream_code_write(
             if chunk.content:
                 yield chunk.content
     except Exception as e:
-        err_msg = str(e)[:200]
-        yield f"__ERROR__{err_msg}__ERROR_END__\n"
+        yield error_event(str(e))

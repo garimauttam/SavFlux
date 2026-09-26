@@ -1,10 +1,12 @@
 /**
  * useMultiReview.ts — State and streaming logic for multi-file code review.
  *
- * The multi-review stream adds section delimiters on top of the STATUS protocol:
- *   __SECTION_START__filename__SECTION_END__   → start a new per-file card
- *   __STATUS__...{json}__STATUS_END__          → progress update (same as single review)
- *   everything else                            → review markdown for the current section
+ * The multi-review stream adds section delimiters on top of the shared STATUS
+ * protocol (`lib/stream.ts`, which is also what the agent and the single review
+ * use):
+ *   __SECTION_START__{"id":…,"file_name":…}__SECTION_END__  → start a per-file card
+ *   __STATUS__{json}__STATUS_END__                          → progress + timings
+ *   everything else                                         → review markdown
  *
  * We maintain a `sections` array so the UI can render each file as a collapsible card.
  */
@@ -12,6 +14,7 @@
 import { useState, useCallback } from "react";
 import { IndexedFile } from "../types";
 import { apiFetch } from "../api";
+import { decodeStatus, drainMarkers, flushTail, REVIEW_TAGS } from "../lib/stream";
 
 export interface ReviewSection {
   id: string;
@@ -215,143 +218,93 @@ export function useMultiReview() {
         }));
       };
 
-      while (true) {
+      // One scanner for the whole protocol: `__SECTION_START__` opens a card,
+      // `__STATUS__` moves it, prose appends to it — in stream order, which is what
+      // makes prose arriving *before* a section header land on the previous file
+      // rather than the next one. The hand-rolled version kept three separate
+      // copies of that ordering rule and an index arithmetic (`end + 14 + 1`) for
+      // each marker's length, which is the kind of constant that silently misreads
+      // the moment a marker is added.
+      for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
+        const scan = drainMarkers(buffer, REVIEW_TAGS);
+        buffer = scan.rest;
 
-        // ── ERROR terminal marker ─────────────────────────────────────────────
-        // Surfaced as an in-section error note so the rest of the multi-review
-        // output remains visible (earlier sections are not lost).
-        if (buffer.includes("__ERROR__") && buffer.includes("__ERROR_END__")) {
-          const eStart = buffer.indexOf("__ERROR__");
-          const eEnd   = buffer.indexOf("__ERROR_END__");
-          if (eStart !== -1 && eEnd !== -1) {
-            const errMsg = buffer.slice(eStart + 9, eEnd).trim();
-            buffer = buffer.slice(eEnd + 13 + 1); // consume the marker
+        for (const segment of scan.segments) {
+          if (segment.kind === "text") {
+            if (currentSectionId) appendToSection(currentSectionId, segment.value);
+            continue;
+          }
+
+          if (segment.kind === "section") {
+            const section = parseSectionPayload(segment.payload);
+            currentSectionId = section.id;
+            setState((prev) => ({
+              ...prev,
+              sections: prev.sections.some((item) => item.id === section.id)
+                ? prev.sections
+                : [...prev.sections, { id: section.id, fileName: section.fileName, content: "", status: "pending" }],
+            }));
+            continue;
+          }
+
+          // Surfaced as an in-section note so the rest of the multi-review output
+          // stays visible — one file's failure is not a reason to lose the others.
+          if (segment.kind === "error") {
+            const errMsg = segment.payload.trim();
             const displayMsg = `\n\n> ⚠️ **Error:** ${errMsg || "Server error — response may be incomplete."}`;
             if (currentSectionId) {
-              setState((prev) => ({
-                ...prev,
-                sections: prev.sections.map((s) =>
-                  s.id === currentSectionId
-                    ? { ...s, content: s.content + displayMsg }
-                    : s
-                ),
-              }));
+              appendToSection(currentSectionId, displayMsg);
               updateSectionStatus(currentSectionId, "error", errMsg);
             }
-          }
-        }
-
-        // Process all complete markers in the buffer
-        let changed = true;
-        while (changed) {
-          changed = false;
-
-          // ── Section start marker ───────────────────────────────────────────
-          if (buffer.includes("__SECTION_START__") && buffer.includes("__SECTION_END__")) {
-            const sStart = buffer.indexOf("__SECTION_START__");
-            const sEnd = buffer.indexOf("__SECTION_END__");
-            if (sStart !== -1 && sEnd !== -1 && sEnd > sStart) {
-              // Flush any buffered text to the current section first
-              const textBefore = buffer.slice(0, sStart);
-              if (textBefore.trim() && currentSectionId) {
-                appendToSection(currentSectionId, textBefore);
-              }
-
-              const sectionPayload = parseSectionPayload(buffer.slice(sStart + 17, sEnd)); // strip __SECTION_START__
-              buffer = buffer.slice(sEnd + 15 + 1); // strip __SECTION_END__\n
-              currentSectionId = sectionPayload.id;
-
-              setState((prev) => ({
-                ...prev,
-                sections: prev.sections.some((section) => section.id === sectionPayload.id)
-                  ? prev.sections
-                  : [
-                    ...prev.sections,
-                    { id: sectionPayload.id, fileName: sectionPayload.fileName, content: "", status: "pending" },
-                  ],
-              }));
-              changed = true;
-              continue;
-            }
+            setState((prev) => ({ ...prev, error: errMsg || "Server error — response may be incomplete." }));
+            continue;
           }
 
-          // ── STATUS marker ──────────────────────────────────────────────────
-          if (buffer.includes("__STATUS__") && buffer.includes("__STATUS_END__")) {
-            const start = buffer.indexOf("__STATUS__");
-            const end = buffer.indexOf("__STATUS_END__");
-            if (start !== -1 && end !== -1) {
-              // Flush text before this marker to current section
-              const textBefore = buffer.slice(0, start);
-              if (textBefore && currentSectionId) {
-                appendToSection(currentSectionId, textBefore);
-              }
+          if (segment.kind !== "status") continue;
 
-              const statusText = buffer.slice(start + 10, end);
-              buffer = buffer.slice(end + 14 + 1);
-
-              const jsonMatch = statusText.match(/(\{.*\})$/);
-              const message = jsonMatch
-                ? statusText.slice(0, statusText.lastIndexOf(jsonMatch[0])).trim()
-                : statusText.trim();
-              let meta: StatusMeta = {};
-              if (jsonMatch) {
-                try { meta = JSON.parse(jsonMatch[1]); } catch {}
-              }
-              const statusId = meta.id ?? currentSectionId;
-              if (statusId) {
-                updateSectionStatus(statusId, sectionStatusFromMeta(meta, message), message, {
-                  tier: typeof meta.tier === "string" ? meta.tier : undefined,
-                  cached: meta.cached === true ? true : undefined,
-                });
-              }
-
-              setState((prev) => ({
-                ...prev,
-                currentStep: message,
-                currentFile: meta.file ?? prev.currentFile,
-                totalFiles: meta.total ?? prev.totalFiles,
-                currentMode: meta.mode ?? prev.currentMode,
-                agentSteps: [...prev.agentSteps, { ...meta, message }].slice(-80),
-                // Capture server-side coverage counts from the "coverage" step token
-                ...(meta.step === "coverage" && {
-                  serverLlmCount: meta.llm,
-                  serverStaticCount: meta.static,
-                  serverCoveragePct: meta.pct,
-                  serverCacheHits: meta.cache_hits,
-                }),
-                // ...and the plan from the "planned" token, emitted before any
-                // review so the UI can explain the shape of the run up front.
-                ...(meta.step === "planned" && {
-                  serverPlannedStatic: meta.static_only,
-                  serverBatchedFiles: meta.batched_files,
-                  serverBatchCount: meta.batch_count,
-                  serverModelCalls: meta.model_calls,
-                }),
-              }));
-              changed = true;
-            }
+          const meta: StatusMeta = decodeStatus(segment.payload);
+          const message = typeof meta.message === "string" ? meta.message : "";
+          const statusId = meta.id ?? currentSectionId;
+          if (statusId) {
+            updateSectionStatus(statusId, sectionStatusFromMeta(meta, message), message, {
+              tier: typeof meta.tier === "string" ? meta.tier : undefined,
+              cached: meta.cached === true ? true : undefined,
+            });
           }
-        }
 
-        // Flush plain text that's not a partial marker
-        if (
-          !buffer.includes("__SECTION_START__") &&
-          !buffer.includes("__STATUS__") &&
-          currentSectionId
-        ) {
-          const partialMatch = buffer.match(/_{1,2}(?:S(?:E(?:C(?:T(?:I(?:O(?:N)?)?)?)?)?|T(?:A(?:T(?:U(?:S)?)?)?)?)?)?$/);
-          const splitIdx = partialMatch ? (partialMatch.index ?? buffer.length) : buffer.length;
-          const text = buffer.slice(0, splitIdx);
-          buffer = buffer.slice(splitIdx);
-          if (text) {
-            appendToSection(currentSectionId, text);
-          }
+          setState((prev) => ({
+            ...prev,
+            currentStep: message,
+            currentFile: meta.file ?? prev.currentFile,
+            totalFiles: meta.total ?? prev.totalFiles,
+            currentMode: meta.mode ?? prev.currentMode,
+            agentSteps: [...prev.agentSteps, { ...meta, message }].slice(-80),
+            // Server-side coverage, from the `coverage` token — a count of what a
+            // model actually saw, not what the text looks like it saw…
+            ...(meta.step === "coverage" && {
+              serverLlmCount: meta.llm,
+              serverStaticCount: meta.static,
+              serverCoveragePct: meta.pct,
+              serverCacheHits: meta.cache_hits,
+            }),
+            // …and the plan, from the `planned` token, which arrives before any
+            // review so the UI can explain the shape of the run up front.
+            ...(meta.step === "planned" && {
+              serverPlannedStatic: meta.static_only,
+              serverBatchedFiles: meta.batched_files,
+              serverBatchCount: meta.batch_count,
+              serverModelCalls: meta.model_calls,
+            }),
+          }));
         }
       }
+
+      const tail = flushTail(buffer, REVIEW_TAGS);
+      if (tail && currentSectionId) appendToSection(currentSectionId, tail);
 
       setState((prev) => ({
         ...prev,

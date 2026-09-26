@@ -8,16 +8,46 @@ confirmation — pull-request creation. No model call is made, so runs are free,
 fast, and fully deterministic: the same goal against the same index always
 produces the same report.
 
-The tools themselves live in `app.services.agent_tools`; this module is the
-HTTP surface and the plan that stitches them together.
+The tools themselves live in `app.services.agent_tools`; the step identity,
+timing and argument summaries live in `app.services.agent_run`; this module is
+the HTTP surface and the plan that stitches them together.
 
 Endpoints:
   GET  /agent/tools  — tool catalogue the agent can use
   POST /agent/run    — stream a plan + findings report (SSE-style text)
 
-Stream protocol (same markers as the review stream):
-  __STATUS__{...}__STATUS_END__  → step telemetry for the Agent tab
-  everything else                → markdown report text
+STREAM PROTOCOL
+---------------
+Defined once, in `app.services.stream_protocol`, and shared with the review,
+writer and chat streams:
+
+  __STATUS__{"step": …, "message": …}__STATUS_END__   → telemetry (a step, its
+      arguments, its duration, a bounded preview of what it found)
+  everything else                                     → markdown report text
+
+Event vocabulary for a run, in the order the surface needs them:
+
+  starting     — run_id, mode, goal, plan_steps (each with an id + order), budget
+  reasoning    — one line per decision the planner actually took
+  tool         — step_id + plan_id + a summarised `args` object
+  tool_done    — the same ids, `elapsed_ms`, `ok`, `preview`, plus the tool's own
+                 scalars (`ToolResult.status_data()`)
+  tool_error   — same shape, ok=false
+  tool_skipped — plan_id + a reason ("no auto-fixable findings")
+  cancelled    — emitted when the client hangs up mid-run; lists `interrupted`
+  complete     — snapshot: steps_used, done/failed/skipped, elapsed_ms, truncated
+
+DETERMINISM, AND WHAT IS DELIBERATELY OUTSIDE IT
+------------------------------------------------
+`run_id`, `elapsed_ms` and `t_ms` are volatile by construction — a clock and a
+uuid — and they are quarantined in the telemetry stream. The report and the step
+*sequence* are byte-stable, which is the property the $0 guarantee is actually
+about, and `VOLATILE_STATUS_FIELDS` in the protocol module is the single list of
+what a determinism check may ignore. Nothing that changes a conclusion (which
+tools ran, what they returned, the diff) is allowed to vary between runs.
+
+That split is what lets the UI show a stopwatch without the run becoming
+unreproducible.
 
 PLANNING
 --------
@@ -34,9 +64,8 @@ because someone said "look at the auth flow" is the behaviour that makes agents
 untrustworthy, so the write path is opt-in in both directions.
 """
 
-import json
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -44,16 +73,18 @@ from pydantic import BaseModel, field_validator
 
 from app.api.deps import require_api_key
 from app.limiter import limiter
+from app.services.agent_run import RunRecorder, plan_reasoning, summarize_args
 from app.services.agent_tools import (
     DISPATCH,
     TOOL_CATALOGUE,
     TOOL_NAMES,
     ToolResult,
 )
+from app.services.stream_protocol import error_event, status_event
 
 # Re-exported: `TOOL_CATALOGUE` has lived here since the first version, and the
 # UI reads it from `GET /agent/tools` rather than from Python.
-__all__ = ["TOOL_CATALOGUE", "AgentRunRequest", "router"]
+__all__ = ["TOOL_CATALOGUE", "AgentRunRequest", "build_plan", "router"]
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -76,6 +107,12 @@ _BASE_PLAN = ["retrieve_context", "read_file", "dependency_graph", "blast_radius
 #: is about to rewrite them.
 MAX_READS_INVESTIGATE = 3
 MAX_READS_WRITE = 2
+
+
+def _hit(pattern: re.Pattern, text: str) -> str:
+    """The matched word, so the reasoning line can name the trigger it saw."""
+    match = pattern.search(text or "")
+    return match.group(0) if match else ""
 
 
 def wants_fix(goal: str) -> bool:
@@ -174,8 +211,16 @@ async def list_tools(_: None = Depends(require_api_key)):
 
 
 def _status(step: str, message: str, **extra: object) -> str:
-    payload = {"step": step, "message": message, **extra}
-    return f"__STATUS__{json.dumps(payload)}__STATUS_END__\n"
+    """
+    Marker for one step. Kept as a helper because it is the seam the tests of the
+    wire format poke at, and because `_run_agent` reads better without the module
+    prefix on every line.
+    """
+    return status_event(message, step=step, **extra)
+
+
+async def _never_stop() -> bool:
+    return False
 
 
 # ── The run ───────────────────────────────────────────────────────────────────
@@ -187,19 +232,27 @@ async def _run_agent(
     max_steps: int,
     tools: list[str] | None = None,
     confirm_digest: str | None = None,
+    should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Plan → inspect → (fix → patch → PR) → report. Yields status markers + markdown."""
+    """
+    Plan → inspect → (fix → patch → PR) → report. Yields status markers + markdown.
+
+    `should_stop` is an async predicate checked before every step. The route hands
+    it `Request.is_disconnected`, so the Stop button in the UI — which closes the
+    response body — actually ends the run instead of letting it work through the
+    rest of the plan for a reader that has gone. It is checked *between* steps
+    rather than inside one: a tool is where the cost is, and interrupting one
+    mid-file would leave a half-applied patch to explain.
+    """
     plan = build_plan(goal, tools)
-    steps_taken = 0
-    reports: list[str] = []
+    stop = should_stop or _never_stop
+    recorder = RunRecorder(goal, plan, max_steps)
 
     #: Files this run repaired, in the shape `build_patch` consumes.
     fixed: list[dict] = []
+    reports: list[str] = []
 
-    def budget() -> bool:
-        return steps_taken < max_steps
-
-    async def run_tool(name: str, message: str, **kwargs) -> tuple[list[str], ToolResult | None]:
+    async def run_tool(name: str, message: str, *, note: str = "", **kwargs) -> tuple[list[str], ToolResult | None]:
         """
         Execute one step of the plan inside the budget.
 
@@ -207,41 +260,73 @@ async def _run_agent(
         rather than yielded so this can stay an ordinary coroutine — an async
         generator cannot be delegated to with `yield from`.
         """
-        nonlocal steps_taken
-        if name not in plan or not budget():
+        if name not in plan or not recorder.budget_left:
             return [], None
-        steps_taken += 1
-        markers = [_status("tool", message, tool=name)]
+        handle = recorder.begin(name, note=note)
+        markers = [status_event(
+            message,
+            step="tool",
+            tool=name,
+            step_id=handle.step_id,
+            plan_id=handle.plan_id,
+            args=summarize_args(name, kwargs),
+        )]
         try:
             result = await DISPATCH[name](**kwargs)
         except Exception as exc:  # noqa: BLE001 — one bad tool must not kill the run
             result = ToolResult(name, False, f"{name} failed: {str(exc)[:120]}")
-        markers.append(_status(
-            "tool_done" if result.ok else "tool_error",
+        markers.append(status_event(
             result.message,
-            tool=name,
+            step="tool_done" if result.ok else "tool_error",
+            **recorder.finish(handle, result.ok, result=result),
             **result.status_data(),
         ))
         return markers, result
 
-    yield _status("starting", f"Goal: {goal[:100]}", mode="deterministic",
-                  plan=" → ".join(plan))
+    async def stopped() -> bool:
+        return bool(await stop())
+
+    # ── Opening: the plan and the reasoning behind it ─────────────────────────
+    write_path = "autofix" in plan or "build_patch" in plan
+    read_limit = MAX_READS_WRITE if write_path else MAX_READS_INVESTIGATE
+    yield status_event(f"Goal: {goal[:100]}", **recorder.started_event(extra={
+        "read_limit": read_limit,
+        "repo_url": repo_url or "",
+    }))
+    for line in plan_reasoning(
+        plan=plan,
+        fix_hit=_hit(_FIX_INTENT, goal),
+        pr_hit=_hit(_PR_INTENT, goal),
+        explicit_tools=bool(tools),
+        write_path=write_path,
+        read_limit=read_limit,
+        repo_known=bool(_github_ref(repo_url)),
+        confirmed=bool(confirm_digest),
+    ):
+        yield _status("reasoning", line, kind="plan")
 
     # ── Step 1: retrieve relevant context ─────────────────────────────────────
+    if await stopped():
+        yield _cancelled(recorder)
+        return
+
     markers, retrieval = await run_tool(
         "retrieve_context", "retrieve_context: searching indexed code…", query=goal, repo_url=repo_url
     )
     for marker in markers:
         yield marker
     contexts: list[dict] = (retrieval.data.get("contexts") if retrieval else None) or []
+    if retrieval is None and "retrieve_context" in plan:
+        yield _status("tool_skipped", "retrieve_context: skipped — no step budget left",
+                      **recorder.skip("retrieve_context"))
 
     # ── Step 2: read the top files in full ────────────────────────────────────
-    write_path = "autofix" in plan or "build_patch" in plan
-    read_limit = MAX_READS_WRITE if write_path else MAX_READS_INVESTIGATE
     file_contents: dict[str, str] = {}
-
     seen: set[str] = set()
     for context in contexts:
+        if await stopped():
+            yield _cancelled(recorder)
+            return
         source = context.get("source", "")
         if not source or source in seen or len(file_contents) >= read_limit:
             continue
@@ -255,9 +340,26 @@ async def _run_agent(
         if result and result.ok:
             file_contents[source] = result.data.get("content", "")
 
+    if "read_file" in plan and not file_contents:
+        # Only ever stated when it is true: an empty index and a chunk that carries
+        # no file path are different problems with different fixes, and a reader who
+        # is told "index a repo" while looking at an indexed repo stops trusting the
+        # panel.
+        yield _status(
+            "tool_skipped",
+            ("read_file: skipped — the index returned no chunks to read"
+             if not contexts else
+             "read_file: skipped — the retrieved chunks carry no file path to read"),
+            **recorder.skip("read_file"),
+        )
+
     # ── Step 3: dependency context ────────────────────────────────────────────
     top_source = contexts[0].get("source") if contexts else None
     graph: dict | None = None
+
+    if await stopped():
+        yield _cancelled(recorder)
+        return
 
     markers, graph_result = await run_tool(
         "dependency_graph", "dependency_graph: mapping imports…", repo_url=repo_url
@@ -266,6 +368,11 @@ async def _run_agent(
         yield marker
     if graph_result and graph_result.ok:
         graph = graph_result.data.get("graph")
+
+    if not top_source and "blast_radius" in plan:
+        yield _status("tool_skipped",
+                      "blast_radius: skipped — no target file to trace dependents from",
+                      **recorder.skip("blast_radius"))
 
     if top_source:
         markers, blast = await run_tool(
@@ -280,9 +387,13 @@ async def _run_agent(
     # ── Step 4: verified repairs, worst file first ────────────────────────────
     # Only files the retrieval step actually surfaced are eligible. Rewriting
     # something the user did not ask about is not autonomy, it is a surprise.
+    autofix_attempts: list[bool] = []   # one entry per attempt: did it run cleanly?
     if "autofix" in plan:
         for context in contexts:
-            if not budget():
+            if await stopped():
+                yield _cancelled(recorder)
+                return
+            if not recorder.budget_left:
                 break
             path = _relative_path(context.get("source", ""), repo_url)
             if not path.lower().endswith((".py", ".pyi", ".pyw")):
@@ -295,6 +406,8 @@ async def _run_agent(
             )
             for marker in markers:
                 yield marker
+            if fixed_result is not None:
+                autofix_attempts.append(bool(fixed_result.ok))
             if fixed_result and fixed_result.ok and fixed_result.data.get("fixed"):
                 fixed.append({
                     "path": path,
@@ -305,9 +418,20 @@ async def _run_agent(
                     reports.append(fixed_result.report)
 
         if not fixed:
-            yield _status("tool_skipped",
-                          "autofix: no auto-fixable Python findings in the retrieved files",
-                          tool="autofix")
+            # What to say here is a real question, and getting it wrong is how a
+            # surface starts lying: "nothing to fix" and "the fixer crashed" look
+            # identical to a reader unless they are distinguished, and they want
+            # opposite follow-ups. A failed attempt already produced a red
+            # tool_error row, so the honest move is to add nothing.
+            if not autofix_attempts:
+                yield _status("tool_skipped",
+                              "autofix: nothing retrieved that this tool can repair "
+                              "(Python files only, and retrieval found none)",
+                              **recorder.skip("autofix"))
+            elif all(attempt for attempt in autofix_attempts):
+                yield _status("tool_skipped",
+                              "autofix: no auto-fixable findings in the retrieved files",
+                              **recorder.skip("autofix"))
 
     # ── Step 5: one reviewable patch for everything that was fixed ────────────
     patch: dict | None = None
@@ -326,17 +450,22 @@ async def _run_agent(
             # worth a report section when a run asked for one, and the runner is
             # what knows that.
             reports.append(_patch_section(patch_result))
+    elif "build_patch" in plan and not fixed:
+        yield _status("tool_skipped",
+                      "build_patch: skipped — nothing was repaired, so there is no patch",
+                      **recorder.skip("build_patch"))
 
     # ── Step 6: open a PR — only from a diff, only with confirmation ──────────
     if "create_pr" in plan:
         if not patch:
-            yield _status("tool_skipped",
-                          "create_pr: skipped — no verified patch to open a PR for",
-                          tool="create_pr")
+            yield _status("tool_skipped", "create_pr: skipped — no verified patch to open a PR for",
+                          **recorder.skip("create_pr"))
         elif not _github_ref(repo_url):
-            yield _status("tool_skipped",
-                          "create_pr: skipped — set repo_url to a github.com repo to open a PR",
-                          tool="create_pr")
+            yield _status("tool_skipped", "create_pr: skipped — set repo_url to a github.com repo to open a PR",
+                          **recorder.skip("create_pr"))
+        elif await stopped():
+            yield _cancelled(recorder)
+            return
         else:
             markers, pr = await run_tool(
                 "create_pr", "create_pr: preparing the pull request…",
@@ -350,9 +479,32 @@ async def _run_agent(
                 reports.append(pr.report)
 
     # ── Report ────────────────────────────────────────────────────────────────
+    if await stopped():
+        yield _cancelled(recorder)
+        return
+
     yield _status("writing", "Assembling findings report…")
-    yield _build_report(goal, plan, steps_taken, max_steps, contexts, file_contents, reports)
-    yield _status("complete", "Agent run finished")
+    yield _build_report(goal, plan, recorder, contexts, file_contents, reports)
+    yield status_event("Agent run finished", **recorder.finish_event(ok=True))
+
+
+def _cancelled(recorder: RunRecorder) -> str:
+    """
+    Closing markers for a run the reader abandoned.
+
+    A step that started and never finished is reported as interrupted rather than
+    silently dropped: the difference between "the agent stopped" and "the agent
+    lied about stopping" is whether the open card is still on screen.
+    """
+    return status_event(
+        "Run stopped before the report — the steps below it did not run",
+        step="cancelled",
+        **recorder.snapshot(),
+        interrupted=[
+            {**open_step, "elapsed_ms": recorder.open_ms(open_step["step_id"])}
+            for open_step in recorder.open_steps()
+        ],
+    )
 
 
 def _relative_path(source: str, repo_url: str | None) -> str:
@@ -380,25 +532,38 @@ def _patch_section(result: ToolResult) -> str:
 def _build_report(
     goal: str,
     plan: list[str],
-    steps_taken: int,
-    max_steps: int,
+    recorder: RunRecorder,
     contexts: list[dict],
     file_contents: dict[str, str],
     reports: list[str],
 ) -> str:
-    """Assemble the markdown report. Deterministic: same inputs, same bytes."""
+    """
+    Assemble the markdown report. Deterministic: same inputs, same bytes.
+
+    Deliberately free of timings and run ids: the report is the artifact someone
+    quotes, diffs against a later run, or attaches to a PR. The stopwatch lives in
+    the telemetry markers, which is where a number that must not be reproducible
+    belongs.
+    """
+    snapshot = recorder.snapshot()
     lines = [
         "# Agent Report",
         "",
         f"**Goal:** {goal}",
         "",
-        f"**Steps used:** {steps_taken}/{max_steps} · **Mode:** deterministic ($0, no LLM)",
+        f"**Steps used:** {snapshot['steps_used']}/{snapshot['max_steps']} · "
+        f"**Mode:** deterministic ($0, no LLM)",
         "",
         f"**Plan:** {' → '.join(f'`{name}`' for name in plan)}",
         "",
-        "## Relevant code",
-        "",
     ]
+    if snapshot["truncated"]:
+        lines += [
+            f"> ⚠️ The step budget ({snapshot['max_steps']}) ran out before the plan finished. "
+            "Raise `max_steps` to see the rest.",
+            "",
+        ]
+    lines += ["## Relevant code", ""]
     if contexts:
         for context in contexts[:8]:
             name = context.get("file_name") or context.get("source")
@@ -443,9 +608,33 @@ async def run_agent(request: Request, body: AgentRunRequest,
         )
     # The confirmation token is per-request and never logged: it is the only
     # thing standing between a diff preview and a push.
-    stream = _run_agent(body.goal, body.repo_url, body.max_steps, body.tools, body.confirm_digest)
+    stream = _run_agent(
+        body.goal,
+        body.repo_url,
+        body.max_steps,
+        body.tools,
+        body.confirm_digest,
+        should_stop=request.is_disconnected,
+    )
     return StreamingResponse(
-        stream,
+        _logged(stream, body.goal),
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+async def _logged(stream: AsyncGenerator[str, None], goal: str) -> AsyncGenerator[str, None]:
+    """
+    Forward the run, and turn an unexpected exception into a visible error line.
+
+    Without this, an exception inside the generator arrives as a truncated body
+    with status 200 — the UI shows a half-rendered report and no reason. The
+    failure path is the one place a stream must not be silent.
+    """
+    try:
+        async for chunk in stream:
+            yield chunk
+    except Exception as exc:  # noqa: BLE001 — the stream is the error surface
+        yield error_event(f"agent run failed: {str(exc)[:160]}")
+        # Re-raised after the marker so the server still logs it with a traceback.
+        raise

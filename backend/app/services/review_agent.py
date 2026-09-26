@@ -29,6 +29,8 @@ from langchain_core.tools import tool
 
 from app.core.config import get_settings
 from app.services.llm_factory import get_chat_llm, get_review_llm
+from app.services.agent_run import summarize_args
+from app.services.stream_protocol import error_event, status_event
 from app.services.token_counter import get_token_callback, increment_request
 from app.services.code_analysis import analyze_file
 from app.services.code_analysis.analyzer import build_llm_facts
@@ -94,7 +96,7 @@ async def _strip_think_tags(
                     buffer = buffer[buffer.index("<think>") + len("<think>"):]
                     state = "thinking"
                     if not thinking_announced:
-                        yield f"__STATUS__Reasoning...{json.dumps({'step': 'thinking'})}__STATUS_END__\n"
+                        yield status_event("Reasoning…", step="thinking")
                         thinking_announced = True
                     changed = True
                     continue
@@ -108,7 +110,7 @@ async def _strip_think_tags(
                     # Discard all content before (and including) </think>
                     buffer = buffer[buffer.index("</think>") + len("</think>"):]
                     state = "after"
-                    yield f"__STATUS__Writing review...{json.dumps({'step': 'writing', 'mode': 'fast'})}__STATUS_END__\n"
+                    yield status_event("Writing review…", step="writing", mode="fast")
                     changed = True
                     continue
                 # else: still inside think block.
@@ -136,6 +138,17 @@ async def _strip_think_tags(
         yield buffer
 
 settings = get_settings()
+
+
+def _one_line(text: str) -> str:
+    """First line of a tool result, whitespace-collapsed, for a status preview."""
+    return " ".join((text or "").split())[:160]
+
+
+def _peek(result: object) -> str:
+    """A short, single-line view of a tool result for the finished step."""
+    text = " ".join(str(result or "").split())
+    return text[:80] + ("…" if len(text) > 80 else "") if text else "no output"
 
 
 # ── Tool factory ───────────────────────────────────────────────────────────────
@@ -373,7 +386,7 @@ async def stream_code_review(
         )),
     ]
 
-    yield f"__STATUS__Analyzing `{file_name}`...{json.dumps({'step': 'starting'})}__STATUS_END__\n"
+    yield status_event(f"Analyzing `{file_name}`…", step="starting", mode="agentic")
 
     llm_with_tools = llm.bind_tools(tools)
     max_iters  = 8
@@ -387,14 +400,38 @@ async def stream_code_review(
             response = await llm_with_tools.with_config(callbacks=[get_token_callback()]).ainvoke(messages)
             messages.append(response)
             if response.tool_calls:
-                for tc in response.tool_calls:
-                    yield f"__STATUS__Tool: `{tc['name']}`...{json.dumps({'step': 'tool', 'tool': tc['name']})}__STATUS_END__\n"
+                for index, tc in enumerate(response.tool_calls):
+                    # Same vocabulary the code agent uses: an id that pairs the
+                    # two markers, the arguments the model actually passed, and a
+                    # duration. A review that says "Tool: search_pattern..." with
+                    # no result and no cost is a log line, not a tool card.
+                    step_id = f"{tc['name']}#{index + 1 + iteration * len(response.tool_calls)}"
+                    yield status_event(
+                        f"Tool: `{tc['name']}`…",
+                        step="tool", tool=tc["name"], step_id=step_id,
+                        plan_id=f"plan:{tc['name']}", iteration=iteration + 1,
+                        args=summarize_args(tc["name"], tc.get("args") or {}),
+                    )
                     fn = tool_map.get(tc["name"])
-                    result = await asyncio.to_thread(fn.invoke, tc["args"]) if fn else f"Unknown tool: {tc['name']}"
+                    called_at = time.monotonic()
+                    try:
+                        result = await asyncio.to_thread(fn.invoke, tc["args"]) if fn else f"Unknown tool: {tc['name']}"
+                        ok = fn is not None
+                    except Exception as exc:  # noqa: BLE001 — a failed tool is a fact, not a crash
+                        result, ok = f"{tc['name']} failed: {str(exc)[:120]}", False
+                    yield status_event(
+                        f"{tc['name']}: {_peek(result)}",
+                        step="tool_done" if ok else "tool_error",
+                        tool=tc["name"], step_id=step_id, ok=ok,
+                        elapsed_ms=int((time.monotonic() - called_at) * 1000),
+                        preview=[_one_line(line) for line in str(result).splitlines()[:3]],
+                        preview_more=max(0, len(str(result).splitlines()) - 3),
+                    )
                     messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
             else:
                 # LLM chose not to call tools — write the review now
-                yield f"__STATUS__Writing review...{json.dumps({'step': 'writing'})}__STATUS_END__\n"
+                yield status_event("Writing review…", step="writing", mode="agentic",
+                                   elapsed_ms=int((time.monotonic() - start_time) * 1000))
                 messages.append(HumanMessage(
                     content="Based on your investigation, write the full structured review."
                 ))
@@ -409,7 +446,8 @@ async def stream_code_review(
 
         # Reached max_iters or timed out — force a final generation pass
         # using the tool results already accumulated in `messages`
-        yield f"__STATUS__Writing review (forced)...{json.dumps({'step': 'writing'})}__STATUS_END__\n"
+        yield status_event("Writing review (forced)…", step="writing", mode="agentic",
+                           forced=True, elapsed_ms=int((time.monotonic() - start_time) * 1000))
         messages.append(HumanMessage(
             content=(
                 "Time or iteration limit reached. "
@@ -426,7 +464,7 @@ async def stream_code_review(
         async for token in _strip_think_tags(raw_stream):
             yield token
     except Exception as e:
-        yield f"__ERROR__{str(e)[:200]}__ERROR_END__\n"
+        yield error_event(str(e))
 
 
 # ── Fast review (multi-file batch mode) ───────────────────────────────────────
@@ -457,22 +495,32 @@ async def stream_fast_code_review(
     preview = file_content[:9000]
     trunc   = f"\n[Truncated — {len(file_content)} chars total]" if len(file_content) > 9000 else ""
 
-    yield f"__STATUS__Scanning `{file_name}`...{json.dumps({'step': 'starting', 'mode': 'fast'})}__STATUS_END__\n"
+    yield status_event(f"Scanning `{file_name}`…", step="starting", mode="fast")
 
     try:
         # One AST parse replaces three overlapping regex tools. The analyzer
         # returns proven findings with line numbers, so the model is handed
         # facts to explain rather than patterns to re-derive — which is what
         # closes most of the gap between a 7B local model and a hosted one.
+        analysed_at = time.monotonic()
         analysis = await asyncio.to_thread(analyze_file, file_content, file_name, language)
         verified_facts = build_llm_facts(analysis)
+        analysis_ms = int((time.monotonic() - analysed_at) * 1000)
 
         context_block = (
             f"\n### Cross-file Repo Context\n{repo_context}\n"
             if repo_context else ""
         )
 
-        yield f"__STATUS__Writing review...{json.dumps({'step': 'writing', 'mode': 'fast'})}__STATUS_END__\n"
+        # The split the latency work needs: this is the cost of the deterministic
+        # pre-pass, and everything after it is the model's. The count is reported
+        # without a proven/heuristic split — that threshold belongs to the
+        # analyzer, and a second copy here would be a second definition.
+        yield status_event(
+            f"Writing review… ({len(analysis.findings)} finding(s) from static analysis)",
+            step="writing", mode="fast",
+            analysis_ms=analysis_ms, findings=len(analysis.findings),
+        )
 
         messages = [
             SystemMessage(content=FAST_REVIEW_SYSTEM_PROMPT),
@@ -501,7 +549,7 @@ async def stream_fast_code_review(
             yield token
 
     except Exception as e:
-        yield f"__ERROR__{str(e)[:200]}__ERROR_END__\n"
+        yield error_event(str(e))
 
 
 # ── Batched multi-file review ─────────────────────────────────────────────────

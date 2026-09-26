@@ -132,11 +132,29 @@ def test_the_prompt_truncates_a_long_file_and_says_so():
 
 
 def _coverage_token(output: str) -> dict:
-    for chunk in output.split("__STATUS__"):
-        if '"step": "coverage"' in chunk:
-            payload = chunk.split("...", 1)[1].split("__STATUS_END__", 1)[0]
-            return json.loads(payload)
-    raise AssertionError(f"no coverage token in output:\n{output[:2000]}")
+    """
+    The run's coverage token, decoded with the protocol's own decoder.
+
+    This used to slice the marker text apart on `"step": "coverage"` and `...`,
+    which coupled a behavioural test to the marker's *format* — so the test
+    failed when the format was canonicalised, for a reason that had nothing to do
+    with coverage. Parsing through `decode_status` keeps the assertions about the
+    numbers where they belong.
+    """
+    from app.services.stream_protocol import STATUS_CLOSE, STATUS_OPEN, decode_status
+
+    cursor = 0
+    while True:
+        start = output.find(STATUS_OPEN, cursor)
+        if start == -1:
+            raise AssertionError(f"no coverage token in output:\n{output[:2000]}")
+        end = output.find(STATUS_CLOSE, start)
+        if end == -1:
+            raise AssertionError(f"unterminated status marker:\n{output[max(0, start - 200):start + 400]}")
+        payload = decode_status(output[start + len(STATUS_OPEN):end])
+        if payload.get("step") == "coverage":
+            return payload
+        cursor = end + len(STATUS_CLOSE)
 
 
 def _run(files, batch_impl=None, review_impl=None):

@@ -15,6 +15,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { Message, SourceFile } from "../types";
 import { apiFetch } from "../api";
+import { CHAT_TAGS, decodeStatus, drainMarkers, flushTail } from "../lib/stream";
 
 function generateId(): string {
   return Math.random().toString(36).slice(2, 9);
@@ -140,135 +141,55 @@ export function useChat(
       let answerBuffer = "";
       let generationSteps: string[] = [];
 
-      while (true) {
+      // `lib/stream.ts` is the one scanner, and chat is the consumer that needed
+      // it most. Its previous loop kept three separate copies of "hold back a
+      // partial marker" and finished with a sweep whose last rule —
+      // `_{0,2}(?:STATUS|SOURCES|DIAGNOSTIC)[^\n]*$` — stripped any line containing
+      // the word "status", including one in the answer's own prose. Scanning for
+      // markers as they complete makes that class of bug unreachable: answer text
+      // is never a marker, so it never needs cleaning afterwards.
+      for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const text = decoder.decode(value, { stream: true });
-        buffer += text;
+        buffer += decoder.decode(value, { stream: true });
+        const scan = drainMarkers(buffer, CHAT_TAGS);
+        buffer = scan.rest;
 
-        // Consume protocol markers while keeping ordinary answer text.
-        //
-        // Recognised markers (always stripped from the visible answer):
-        //   __SOURCES__…__SOURCES_END__       → parsed as citation list
-        //   __STATUS__…__STATUS_END__         → shown as generation step label
-        //   __DIAGNOSTIC__…__DIAGNOSTIC_END__ → shown as a retrieval warning
-        //
-        // CHUNK-BOUNDARY SAFETY
-        // The backend sends each marker as one logical line, but TCP/HTTP chunking
-        // can split it anywhere — including in the middle of "__STATUS_END__".
-        // The previous logic only held back partial *start* marker prefixes at the
-        // tail of the buffer. If "__STATUS_END__" itself was split (e.g. the first
-        // chunk ended with "...context\"}__STATUS_" and the next started with
-        // "_END__\n"), the start-marker was already in the buffer with no matching
-        // end-marker, so the inner loop fell through to the "hold partial" path.
-        // But the hold-partial path only scanned for START prefixes — it missed
-        // partial END suffixes, causing the raw marker text to bleed into answerBuffer.
-        //
-        // Fix: also hold back any tail that could be a partial end-marker suffix.
-        // We do this by extending HOLD_PATTERNS to cover both starts AND ends.
-        let changed = true;
-        while (changed) {
-          changed = false;
-
-          // ── SOURCES ──────────────────────────────────────────────────────────
-          const sourceStart = buffer.indexOf("__SOURCES__");
-          const sourceEnd = buffer.indexOf("__SOURCES_END__");
-          if (sourceStart !== -1 && sourceEnd !== -1 && sourceEnd > sourceStart) {
-            answerBuffer += buffer.slice(0, sourceStart);
+        for (const segment of scan.segments) {
+          if (segment.kind === "text") {
+            answerBuffer += segment.value;
+            continue;
+          }
+          if (segment.kind === "sources") {
             try {
-              sources = JSON.parse(buffer.slice(sourceStart + 11, sourceEnd));
-            } catch {}
-            buffer = buffer.slice(sourceEnd + 15).replace(/^\n/, "");
-            changed = true;
-            continue;
-          }
-
-          // ── STATUS ───────────────────────────────────────────────────────────
-          const statusStart = buffer.indexOf("__STATUS__");
-          const statusEnd = buffer.indexOf("__STATUS_END__");
-          if (statusStart !== -1 && statusEnd !== -1 && statusEnd > statusStart) {
-            answerBuffer += buffer.slice(0, statusStart);
-            const statusText = buffer.slice(statusStart + 10, statusEnd);
-            const jsonMatch = statusText.match(/(\{[^}]*\})$/);
-            const stepLabel = jsonMatch
-              ? statusText.slice(0, statusText.lastIndexOf(jsonMatch[0])).trim()
-              : statusText.trim();
-            if (stepLabel) generationSteps = [...generationSteps, stepLabel];
-            buffer = buffer.slice(statusEnd + 14).replace(/^\n/, "");
-            changed = true;
-            continue;
-          }
-
-          // ── DIAGNOSTIC (non-blocking retrieval warning) ───────────────────
-          const diagStart = buffer.indexOf("__DIAGNOSTIC__");
-          const diagEnd = buffer.indexOf("__DIAGNOSTIC_END__");
-          if (diagStart !== -1 && diagEnd !== -1 && diagEnd > diagStart) {
-            answerBuffer += buffer.slice(0, diagStart);
-            const diagText = buffer.slice(diagStart + 14, diagEnd).trim();
-            if (diagText) generationSteps = [...generationSteps, `⚠️ ${diagText}`];
-            buffer = buffer.slice(diagEnd + 18).replace(/^\n/, "");
-            changed = true;
-            continue;
-          }
-
-          // ── Hold partial marker — wait for more data ──────────────────────
-          // Patterns to watch for at the tail of the buffer (both start and end
-          // marker substrings). Any of these appearing at the end means we must
-          // wait for the next chunk before flushing.
-          // Each marker's end-tag can be split at any byte boundary.
-          // We must hold back any tail that is a PREFIX of ANY of these strings —
-          // including forms that start mid-underscore (e.g. "STATUS_END__" after
-          // the opening "__" was already flushed as part of the answer).
-          // Adding the bare forms without leading "__" catches splits like:
-          //   buffer ends with "...{\"step\":\"context\"}_"
-          //   or              "...{\"step\":\"context\"}__STATUS_"
-          //   or              "STATUS_END"  (the __ was in a previous chunk)
-          const HOLD_PATTERNS = [
-            "__STATUS__",     "__STATUS_END__",     "STATUS_END__",     "_STATUS_END__",
-            "__SOURCES__",    "__SOURCES_END__",    "SOURCES_END__",    "_SOURCES_END__",
-            "__DIAGNOSTIC__", "__DIAGNOSTIC_END__", "DIAGNOSTIC_END__", "_DIAGNOSTIC_END__",
-          ];
-
-          // 1. Check for a *complete* start-marker already in buffer whose
-          //    end-marker hasn't arrived yet — hold the whole thing.
-          const startMarkers: Array<{ tag: string; end: string; len: number }> = [
-            { tag: "__STATUS__",     end: "__STATUS_END__",     len: 10 },
-            { tag: "__SOURCES__",    end: "__SOURCES_END__",    len: 11 },
-            { tag: "__DIAGNOSTIC__", end: "__DIAGNOSTIC_END__", len: 14 },
-          ];
-          let heldForEnd = false;
-          for (const { tag, end } of startMarkers) {
-            const si = buffer.indexOf(tag);
-            if (si !== -1 && buffer.indexOf(end, si) === -1) {
-              // Start present but no matching end — hold everything from start
-              answerBuffer += buffer.slice(0, si);
-              buffer = buffer.slice(si);
-              heldForEnd = true;
-              break;
+              const parsed = JSON.parse(segment.payload);
+              if (Array.isArray(parsed)) sources = parsed as SourceFile[];
+            } catch {
+              // A malformed citations block costs the reader their footnote list,
+              // not the answer. Deliberately swallowed, loudly commented.
             }
+            continue;
           }
-          if (heldForEnd) break;
-
-          // 2. Check for a partial pattern at the tail of the buffer.
-          let markerStart = -1;
-          const tail = buffer.slice(-20);
-          for (const pfx of HOLD_PATTERNS) {
-            for (let len = Math.min(pfx.length - 1, tail.length); len > 0; len--) {
-              if (tail.endsWith(pfx.slice(0, len))) {
-                markerStart = buffer.length - len;
-                break;
-              }
-            }
-            if (markerStart !== -1) break;
+          if (segment.kind === "diagnostic") {
+            const note = segment.payload.trim();
+            if (note) generationSteps = [...generationSteps, `⚠️ ${note}`];
+            continue;
           }
-
-          if (markerStart !== -1) {
-            answerBuffer += buffer.slice(0, markerStart);
-            buffer = buffer.slice(markerStart);
-          } else {
-            answerBuffer += buffer;
-            buffer = "";
+          if (segment.kind === "status") {
+            const event = decodeStatus(segment.payload);
+            const label = typeof event.message === "string" && event.message
+              ? event.message
+              : segment.payload.trim();
+            if (label) generationSteps = [...generationSteps, label];
+            continue;
+          }
+          if (segment.kind === "error") {
+            const note = segment.payload.trim();
+            // The answer stops here, so say so inside the message rather than
+            // leaving a half-sentenced reply and no explanation.
+            generationSteps = [...generationSteps, `⚠️ ${note || "The answer was interrupted."}`];
+            continue;
           }
         }
 
@@ -281,30 +202,14 @@ export function useChat(
         );
       }
 
-      // Final flush: strip any residual marker fragments left in `buffer` AND
-      // any orphaned marker text that leaked into `answerBuffer` due to a TCP
-      // chunk boundary splitting an end-tag (e.g. "...context\"}STATUS_END__\n").
-      const stripMarkers = (s: string) =>
-        s
-          // Complete markers (may span multiple lines with [^]*)
-          .replace(/__STATUS__[^]*?__STATUS_END__\n?/g, "")
-          .replace(/__SOURCES__[^]*?__SOURCES_END__\n?/g, "")
-          .replace(/__DIAGNOSTIC__[^]*?__DIAGNOSTIC_END__\n?/g, "")
-          // Orphaned bare end-tags that appear when the __ prefix was already flushed:
-          //   "STATUS_END__"  "_STATUS_END__"  "__STATUS_END__"  (all variations)
-          .replace(/_*STATUS_END__\n?/g, "")
-          .replace(/_*SOURCES_END__\n?/g, "")
-          .replace(/_*DIAGNOSTIC_END__\n?/g, "")
-          // Orphaned partial start marker at end of string
-          .replace(/_{0,2}(?:STATUS|SOURCES|DIAGNOSTIC)[^\n]*$/gm, "");
-
-      const residual = stripMarkers(buffer);
-      const cleanAnswer = stripMarkers(answerBuffer);
+      // What is still held back is prose — unless the server began a marker and
+      // never finished it, which is truncated telemetry and must not be shown.
+      const residual = flushTail(buffer, CHAT_TAGS);
 
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantMessageId
-            ? { ...m, content: (cleanAnswer + residual).trimStart(), isStreaming: false, sources, generationSteps }
+            ? { ...m, content: (answerBuffer + residual).trimStart(), isStreaming: false, sources, generationSteps }
             : m
         )
       );

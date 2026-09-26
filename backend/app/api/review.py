@@ -9,9 +9,14 @@ Endpoints:
   GET    /review/cache   — what the content-hash review cache is holding
   DELETE /review/cache   — drop it (the next review is a cold one)
 
-The review streams have two types of chunks:
-  __STATUS__...text...{"step": "..."}__STATUS_END__  →  progress update (tool running)
-  everything else                                    →  actual review text tokens
+The review streams carry two kinds of chunk, framed by `app.services.stream_protocol`
+— the same protocol the code agent, the writer and chat use:
+  __STATUS__{"step": "...", "message": "..."}__STATUS_END__  →  progress (a stage, a
+      file, a tool call, a per-stage duration) — never part of the answer
+  everything else                                            →  review markdown
+
+Markers are telemetry, so they are what a client renders as a timeline; the prose
+between them is what it renders as the review.
 """
 
 import asyncio
@@ -28,6 +33,7 @@ from pydantic import BaseModel, field_validator
 from app.api.deps import require_api_key
 from app.limiter import limiter
 from app.services.review_agent import stream_code_review, stream_fast_code_review
+from app.services.stream_protocol import is_protocol_token
 from app.services.multi_review_agent import stream_multi_review
 from app.services import review_cache
 from app.services.impact_analyzer import analyze_diff, inline_comments_for_diff
@@ -371,8 +377,9 @@ async def review_pr_webhook(request: Request, body: PRWebhookRequest, _: None = 
         ),
         language="diff",
     ):
-        # Filter out UI status telemetry markers from the stream
-        if not token.startswith("__STATUS__"):
+        # Filter out UI telemetry markers from the stream — the webhook posts one
+        # review body to GitHub, where a marker would be visible to reviewers.
+        if not is_protocol_token(token):
             review_chunks.append(token)
 
     full_review = "".join(review_chunks).strip()

@@ -299,7 +299,11 @@ async def blast_radius(file: str, repo_url: str | None = None,
         "blast_radius",
         True,
         f"blast_radius: {len(impacted)} dependents",
-        data={"file": file, "count": len(impacted)},
+        # `impacted_files` is a list, so `ToolResult.status_data()` keeps it out of
+        # the status line while `agent_run.result_preview` can still name the
+        # dependents on the card. A count alone tells the user the tool ran; the
+        # names are what make the answer checkable.
+        data={"file": file, "count": len(impacted), "impacted_files": list(impacted)},
         report=blast_markdown(file, blast or {}),
     )
 
