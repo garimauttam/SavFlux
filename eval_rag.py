@@ -1,12 +1,31 @@
 """
 eval_rag.py — Automated RAG Evaluation & Benchmarking Suite.
 
-Measures core retrieval and response generation metrics without needing expensive paid API tiers:
-1. Context Hit Rate @ K: Was the ground-truth target file/chunk retrieved in top-K candidates?
-2. Mean Reciprocal Rank (MRR): What was the reciprocal rank (1/rank) of the ground truth?
-3. Retrieval Precision @ K: Ratio of retrieved documents relevant to the query.
-4. Answer Groundedness / Faithfulness (LLM-as-a-judge / Rule-based check).
-5. Symbol Coverage: Did retrieved chunks contain the expected function/class names?
+Runs on free local code only: no paid API tier is needed for any metric here, and the
+default CI invocation (`--embedder offline --no-rerank`) needs no model weights at all.
+
+WHAT IS MEASURED, and at what granularity
+-----------------------------------------
+Retrieval, per leg (`bm25_only`, `dense_only`, `fused`, `fused_reranked`) and for the
+headline pipeline, over the top-K slice of each ranking:
+
+1. Hit Rate @ K — *file level*: any unit of the ground-truth file appears in positions
+   1..K. Answer-key matching is exact (basename, or a directory-qualified path), not a
+   substring, because `tests/test_batch_review.py` is not `app/api/review.py`.
+2. Span Hit Rate @ K / Span MRR / Span Precision — *unit level*: the retrieved unit's own
+   text contains an expected symbol. The stricter pair exists because file-level scoring
+   cannot tell a good retrieval from a lucky one on a chunk corpus.
+3. MRR @ K — mean 1/rank of the first hit at each of those two granularities.
+4. Precision @ K / Span Precision @ K — of the K units, how many were relevant.
+5. Symbol Recall — do the expected names appear in the text the model would have been
+   shown (the retrieved chunks widened to their parents), regardless of position.
+6. Latency, per stage, with the harness's own scoring measured and reported separately so
+   it can be excluded honestly rather than quietly (`harness_ms`).
+
+Answer groundedness / faithfulness is NOT computed here: it needs a generated answer to
+grade, and this harness stops at retrieval. Claiming it in a benchmark that never called
+a model was a category error, and the number that would have been printed for it would
+have described the retrieved text, not the answer.
 
 Usage:
   python eval_rag.py                     # runs full benchmark against self (SavFlux backend code)
@@ -29,7 +48,7 @@ import math
 import os
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Add backend directory to sys.path for direct script execution
 sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
@@ -335,21 +354,128 @@ def _build_embedder(mode: str):
         ) from exc
 
 
+#: Identifies the matching rule, so a run scored under a different rule cannot be
+#: read as a regression or an improvement. Recorded in every artefact.
+GROUND_TRUTH_MATCHING = "exact-basename-v2"
+
+#: Which part of a ranking an `@K` metric is computed over. `top-k-slice-v1` means
+#: positions 1..K and nothing else. Before this, the fused leg was scored over the whole
+#: `top_k * 3`-deep candidate list it hands the reranker, so `hit_rate_at_k` on a
+#: `--no-rerank` run — every CI and offline run — was really hit@3K, and a baseline from
+#: that era is not a trend for a run from this one. Two definitions change together here,
+#: and both are recorded, because "which number moved" is only useful if the artefact
+#: says why.
+METRIC_DEPTH_RULE = "top-k-slice-v1"
+
+#: The definitions that make a quality number mean what its name says. A run's pair is
+#: compared as a unit; see `_measurement_rules_of`.
+MEASUREMENT_RULES = ("ground_truth", "metric_depth")
+
+
 def _unit_matches_file(doc: Document, target_file: str) -> bool:
     """
     Whether a retrieval unit belongs to `target_file`.
 
-    ONE definition, because three places ask this question: the rank of the first
-    hit, the precision numerator, and the units-per-file figure the report prints
-    beside the hit rate. Copies of a predicate drift, and this particular drift is
-    invisible — the metric and the number printed next to it would disagree while
-    both looked plausible.
+    ONE definition, because four places ask this question: the rank of the first hit,
+    the precision numerator, the span rank below, and the units-per-file figure the
+    report prints beside the hit rate. Copies of a predicate drift, and this
+    particular drift is invisible — the metric and the number printed next to it
+    would disagree while both looked plausible.
+
+    EXACT basename, not substring. It used to be `needle in name`, and with
+    `backend/tests/` inside the corpus (which is right — the tests are indexable
+    source, and two queries ask about them) that made four of the dataset's seventeen
+    ground truths match several different files at once. Measured over the corpus at
+    this commit: `review.py` credited `tests/test_batch_review.py` and
+    `tests/test_review.py`, `config.py` credited `tests/test_provider_config.py` and
+    `tests/test_embedding_config.py`, `ingest.py` credited `tests/test_delta_ingest.py`,
+    and `review_agent.py` credited `app/services/multi_review_agent.py` — a genuinely
+    different module. 11 of the 44 queries could be scored a hit by a document that
+    answers nothing about them, which inflates hit rate and MRR and cannot be seen in
+    either number.
+
+    A ground truth that needs to name one of two same-named files carries a directory
+    (`api/review.py`) and is matched as a path suffix; that is the only way to be
+    unambiguous about a corpus that contains `app/__init__.py` and five more of those.
     """
-    needle = target_file.lower()
+    return _ground_truth_matches(*_unit_paths(doc), target_file)
+
+
+def _ground_truth_matches(name: str, source: str, target_file: str) -> bool:
+    """The rule itself, on already-extracted `(basename, source)` strings.
+
+    Split out so the dataset audit can ask the same question of a file path without
+    wrapping it in a fake Document first: one rule, two callers, no fixture-shaped
+    version of it to drift.
+    """
+    needle = str(target_file).replace("\\", "/").strip("/").lower()
+    if "/" in needle:
+        # Qualified: match the path itself, so `api/review.py` is not `app/review.py`.
+        return source == needle or source.endswith("/" + needle)
+    return name == needle or source.endswith("/" + needle)
+
+
+def _unit_paths(doc: Document) -> "tuple[str, str]":
+    """
+    `(basename, source)` for a unit, posix-separated and lowercased.
+
+    Both are needed: `file_name` is what ingestion stamps on every unit, while
+    `source` is the only place a directory lives — and the two corpora this harness
+    can build put different amounts of path in it (absolute for `files`, repo-relative
+    for `chunks`), which is why a qualified ground truth is a SUFFIX rather than a
+    prefix. The metadata fields exist on every unit — `_assert_unit_shape` raises if a
+    chunk corpus ships one without them, precisely because file-level ground truth has
+    nothing else to match on.
+    """
     return (
-        needle in doc.metadata.get("file_name", "").lower()
-        or needle in doc.metadata.get("source", "").lower()
+        str(doc.metadata.get("file_name", "")).lower(),
+        str(doc.metadata.get("source", "")).replace("\\", "/").lower(),
     )
+
+
+def _unit_localizes_answer(doc: Document, target_file: str, symbols: Sequence[str]) -> bool:
+    """
+    Whether this ONE unit is the answer, rather than being from the right file.
+
+    The file-level question above cannot tell a good retrieval from a lucky one: on a
+    chunk corpus, a hit is any one of a file's chunks, so a system that surfaces the
+    file's import block scores identically to one that surfaces the function the user
+    asked about. Requiring an expected symbol inside the unit's own text is what makes
+    the two differ.
+
+    Deliberately the unit's text and NOT `parent_context(unit)`: widening to the whole
+    parent is what production does before building a prompt, and it is also what makes
+    the file-level number meaningless. Scored on the parent, this metric would be the
+    symbol-recall figure again. The consequence is stated where it is reported — a
+    windowed leg can serve the model the right region and still miss here, because the
+    window that matched did not contain the name.
+    """
+    if not symbols:
+        return False
+    if not _unit_matches_file(doc, target_file):
+        return False
+    return any(sym in doc.page_content for sym in symbols)
+
+
+def _rank_of_span(
+    ranked_docs: List[Document], target_file: str, symbols: Sequence[str]
+) -> Optional[int]:
+    """1-based position of the first unit that IS the answer, else None."""
+    for idx, doc in enumerate(ranked_docs, start=1):
+        if _unit_localizes_answer(doc, target_file, symbols):
+            return idx
+    return None
+
+
+def _spannable(dataset: Sequence[Dict[str, Any]]) -> int:
+    """
+    Queries that the span metric can score at all: those naming ≥1 expected symbol.
+
+    Counted separately because a query with no symbols cannot be a span hit, and
+    scoring it as a miss would report "no symbol was retrieved" for a query that never
+    asked for one — the same mistake as reporting an unmeasured stage as 0 ms.
+    """
+    return sum(1 for item in dataset if item.get("expected_symbols"))
 
 
 def _rank_of(ranked_docs: List[Document], target_file: str) -> Optional[int]:
@@ -361,7 +487,15 @@ def _rank_of(ranked_docs: List[Document], target_file: str) -> Optional[int]:
 
 
 def _empty_leg() -> Dict[str, Any]:
-    return {"hits": 0, "ranks": [], "symbol_hits": 0, "symbols_expected": 0}
+    return {
+        "hits": 0,
+        "ranks": [],
+        "span_hits": 0,
+        "span_ranks": [],
+        "span_scored": 0,
+        "symbol_hits": 0,
+        "symbols_expected": 0,
+    }
 
 
 # ── Latency attribution ───────────────────────────────────────────────────────
@@ -444,7 +578,52 @@ QUALITY_METRICS = {
     "mean_reciprocal_rank_mrr": "higher",
     "symbol_recall_pct": "higher",
     "precision_at_k_pct": "higher",
+    # The stricter pair, plus the rate over answerable queries only. Present in the
+    # table so a change in them is visible next to the looser numbers they qualify:
+    # file-level hit rate up while span-level is flat is retrieval getting luckier,
+    # not better.
+    "span_hit_rate_at_k": "higher",
+    "span_mrr": "higher",
+    "span_precision_at_k_pct": "higher",
+    "hit_rate_at_k_answerable": "higher",
 }
+
+#: Which quality metric each measurement rule can move, so a definition change blocks
+#: exactly the rows it invalidates rather than the whole table.
+#:
+#: The matching rule rewrites what counts as being from the right file, so it touches
+#: every file-based metric — but NOT `symbol_recall_pct`, which asks whether a name
+#: appears in the text handed to the model and never consults the predicate. Refusing to
+#: grade that too would turn a careful guard into a blanket "no data", the same mistake
+#: as reporting an unmeasured stage as 0 ms.
+#:
+#: The depth rule is the opposite case: cutting the scored list to K changes what text
+#: symbol recall is computed over, so it invalidates every quality metric (`None`).
+MEASUREMENT_SENSITIVITY = {
+    "ground_truth": frozenset({
+        "hit_rate_at_k",
+        "mean_reciprocal_rank_mrr",
+        "precision_at_k_pct",
+        "hit_rate_at_k_answerable",
+        "span_hit_rate_at_k",
+        "span_mrr",
+        "span_precision_at_k_pct",
+    }),
+    "metric_depth": None,
+}
+
+#: Short names for the verdict column, where "metric_depth" would not fit.
+MEASUREMENT_RULE_LABELS = {"ground_truth": "ground truth", "metric_depth": "depth"}
+
+
+def _changed_rules(key: str, base: Dict[str, str], cur: Dict[str, str]) -> List[str]:
+    """Which rule changes invalidate `key` — empty when the row can be graded."""
+    return [
+        MEASUREMENT_RULE_LABELS[rule]
+        for rule, sensitive in MEASUREMENT_SENSITIVITY.items()
+        if base.get(rule) != cur.get(rule) and (sensitive is None or key in sensitive)
+    ]
+
 
 #: Latency metrics: a bigger number is worse, so the sign convention is inverted.
 LATENCY_METRICS = {
@@ -476,6 +655,26 @@ def compare_results(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[D
     cur_m = current.get("metrics", {})
     rows: List[Dict[str, Any]] = []
 
+    # A missing key is its own value here, not agreement: two runs from before either
+    # rule existed both used substrings and the deep slice, so they ARE comparable with
+    # each other, while either of them against a current run is a definition change
+    # wearing the clothes of a regression.
+    def _measurement_rules_of(result: Dict[str, Any]) -> Dict[str, str]:
+        evaluation = result.get("evaluation") or {}
+        rules: Dict[str, str] = {}
+        for key in MEASUREMENT_RULES:
+            block = evaluation.get(key)
+            # The matching rule was recorded under its own name before `metric_depth`
+            # existed, so look for both spellings rather than calling an old run "unset".
+            if isinstance(block, dict):
+                rules[key] = str(block.get("rule") or block.get("matching") or "unset")
+            else:
+                rules[key] = "unset"
+        return rules
+
+    base_rules = _measurement_rules_of(baseline)
+    cur_rules = _measurement_rules_of(current)
+
     def add(key: str, better: str, before: Any, after: Any) -> None:
         def record(delta: Optional[float], pct: Optional[float], verdict: str) -> None:
             rows.append({"metric": key, "baseline": before, "current": after,
@@ -500,7 +699,18 @@ def compare_results(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[D
         record(delta, round(delta / before * 100, 1), "better" if improved else "WORSE")
 
     for key, better in QUALITY_METRICS.items():
-        add(key, better, base_m.get(key), cur_m.get(key))
+        before, after = base_m.get(key), cur_m.get(key)
+        blocked_by = _changed_rules(key, base_rules, cur_rules)
+        if blocked_by:
+            # The row names which definition moved, because a stricter answer key and a
+            # narrower scored slice are fixed by different things. The numbers stay
+            # visible — each is true of its own run — but the verdict refuses to call
+            # the difference progress.
+            rows.append({"metric": key, "baseline": before, "current": after,
+                         "delta": None, "pct": None, "better": better,
+                         "verdict": "definition changed: " + ", ".join(blocked_by)})
+            continue
+        add(key, better, before, after)
     for key, better in LATENCY_METRICS.items():
         add(key, better, _lookup(base_m, key), _lookup(cur_m, key))
 
@@ -534,6 +744,27 @@ def format_comparison(rows: List[Dict[str, Any]]) -> str:
             f"  {row['metric']:<26} {fmt(row['baseline']):>10} {fmt(row['current']):>10} "
             f"{fmt(row['delta']):>10} {pct:>9}  {row['verdict']}"
         )
+    blocked = [r["metric"] for r in rows if r["verdict"].startswith("definition changed")]
+    if blocked:
+        reasons = sorted({
+            part
+            for row in rows
+            if row["verdict"].startswith("definition changed")
+            for part in row["verdict"].split(": ", 1)[1].split(", ")
+        })
+        listed = ", ".join(blocked[:3]) + (", …" if len(blocked) > 3 else "")
+        lines.append("")
+        lines.append("  Quality rows are not graded: the two runs score different definitions")
+        lines.append(f"  ({len(blocked)} row(s): {listed}). Differing: {' and '.join(reasons)}.")
+        if "ground truth" in reasons:
+            lines.append("  Ground truth: the baseline counted ANY file whose NAME contained the")
+            lines.append("  answer key as a hit, so `tests/test_batch_review.py` satisfied a query")
+            lines.append("  about `api/review.py`; the current run matches the file exactly.")
+        if "depth" in reasons:
+            lines.append("  Depth: the baseline scored an @K metric over the whole candidate list")
+            lines.append("  handed to the reranker (3K deep), which is not hit@K; the current run")
+            lines.append("  counts positions 1..K and lists the deeper position separately.")
+        lines.append("  Neither number is wrong. They are not the same metric.")
     lines.append("")
     lines.append("  Latency is measured on this machine; only compare runs taken on the")
     lines.append("  same corpus, same top_k, and with the reranker in the same state.")
@@ -641,6 +872,11 @@ async def evaluate_pipeline(
 
     hits_at_k = 0
     reciprocal_ranks: List[float] = []
+    span_hits_at_k = 0
+    span_reciprocal_ranks: List[float] = []
+    span_precision_values: List[float] = []
+    answerable_hits: List[bool] = []
+    unanswerable: List[str] = []
     symbol_hits = 0
     total_expected_symbols = 0
     latencies: List[float] = []
@@ -649,6 +885,36 @@ async def evaluate_pipeline(
     unit_counts: List[int] = []
 
     query_results = []
+
+    # ── The dataset is part of the instrument ─────────────────────────────────
+    # Two ways a benchmark query measures nothing, and neither is visible in the
+    # output it produces: a ground truth that matches NO unit in the corpus can never
+    # hit (the query is a guaranteed miss, and hit rate becomes a report on the file
+    # list), and a ground truth that matches units of SEVERAL files credits a document
+    # that answers nothing about the query. The first is reported; the second is a bug
+    # in the dataset and stops the run, because "ambiguous" is not a property of the
+    # code under test but of how the question was written, and a pin to an older
+    # checkout cannot invent a second file with the same basename.
+    corpus_paths = sorted({doc.metadata.get("source", "") for doc in corpus_docs})
+    ambiguous: Dict[str, List[str]] = {}
+    for ground_truth in sorted({item["ground_truth_file"] for item in dataset}):
+        matched = sorted(
+            source
+            for source in corpus_paths
+            if _ground_truth_matches(PurePosixPath(source).name, source, ground_truth)
+        )
+        if len(matched) > 1:
+            ambiguous[ground_truth] = matched
+    if ambiguous:
+        detail = "; ".join(
+            f"{gt} matches {len(files)} files ({', '.join(files[:3])}"
+            + (", …)" if len(files) > 3 else ")")
+            for gt, files in ambiguous.items()
+        )
+        raise RuntimeError(
+            "ambiguous ground truth — qualify it with a directory so it names one "
+            f"file: {detail}"
+        )
 
     for item in dataset:
         raw_query = item["query"]
@@ -718,8 +984,16 @@ async def evaluate_pipeline(
             leg_rankings["fused_reranked"] = leg_rankings["fused"]
         clock.mark("rerank")
 
-        for leg_name, ranking in leg_rankings.items():
+        for leg_name, full_ranking in leg_rankings.items():
             leg = legs[leg_name]
+            # K, and only K. The fused leg is deliberately built `top_k * 3` deep —
+            # production reranks from a longer candidate list — and scoring the hit over
+            # that whole list meant `hit_rate_at_k` with --no-rerank (i.e. every CI and
+            # offline run) measured hit@3K. Measured on the last committed artefact: 8 of
+            # its 35 claimed hits sat at rank 6..13, outside the K the metric is named
+            # after. `rank_in_fused_list` below keeps the deep position where it is
+            # useful as a diagnostic instead of hidden.
+            ranking = full_ranking[:top_k]
             leg_rank = _rank_of(ranking, target_file)
             if leg_rank is not None:
                 leg["hits"] += 1
@@ -727,13 +1001,22 @@ async def evaluate_pipeline(
             else:
                 leg["ranks"].append(0.0)
 
+            if expected_syms:
+                leg["span_scored"] += 1
+                leg_span_rank = _rank_of_span(ranking, target_file, expected_syms)
+                if leg_span_rank is not None:
+                    leg["span_hits"] += 1
+                    leg["span_ranks"].append(1.0 / leg_span_rank)
+                else:
+                    leg["span_ranks"].append(0.0)
+
             # Score symbol recall on what the MODEL would be shown, which is the
             # whole parent: production retrieves windows and widens them back with
             # `parent_context` before building the prompt. Scoring the retrieved
             # text itself would penalise the dense leg for the very narrowing that
             # lets it escape truncation, and the penalty would look like a
             # retrieval-quality result.
-            leg_text = " ".join(parent_context(d) for d in ranking)
+            leg_text = " ".join(parent_context(d) for d in ranking)  # the K the model sees
             leg["symbol_hits"] += sum(1 for s in expected_syms if s in leg_text)
             leg["symbols_expected"] += len(expected_syms)
 
@@ -742,8 +1025,9 @@ async def evaluate_pipeline(
         # own work back. Marked before the total so `product_ms` excludes it.
         clock.mark(HARNESS_STAGE)
 
-        # The headline metrics follow production: fused, then reranked.
-        ranked_docs = leg_rankings["fused_reranked"]
+        # The headline metrics follow production: fused, then reranked, then cut to K.
+        fused_full = leg_rankings["fused_reranked"]
+        ranked_docs = fused_full[:top_k]
 
         latency_ms = clock.product_ms()
         latencies.append(latency_ms)
@@ -758,10 +1042,31 @@ async def evaluate_pipeline(
         else:
             reciprocal_ranks.append(0.0)
 
+        span_rank = _rank_of_span(ranked_docs, target_file, expected_syms)
+        if expected_syms:
+            if span_rank is not None:
+                span_hits_at_k += 1
+                span_reciprocal_ranks.append(1.0 / span_rank)
+            else:
+                span_reciprocal_ranks.append(0.0)
+
         relevant_count = sum(
             1 for doc in ranked_docs if _unit_matches_file(doc, target_file)
         )
         precision_values.append(relevant_count / len(ranked_docs) if ranked_docs else 0.0)
+        span_relevant = sum(
+            1 for doc in ranked_docs if _unit_localizes_answer(doc, target_file, expected_syms)
+        )
+        if expected_syms and ranked_docs:
+            span_precision_values.append(span_relevant / len(ranked_docs))
+
+        if expected_file_units:
+            answerable_hits.append(rank is not None)
+        else:
+            # A query whose file contributed nothing is reported as unanswerable and
+            # kept IN the headline denominator: dropping it would raise the hit rate
+            # of the same retrieval, which is a flattering lie about the instrument.
+            unanswerable.append(target_file)
 
         # ── Symbol Coverage ───────────────────────────────────────────────────
         retrieved_text = " ".join(parent_context(doc) for doc in ranked_docs)
@@ -769,11 +1074,21 @@ async def evaluate_pipeline(
         symbol_hits += len(matched_symbols)
         total_expected_symbols += len(expected_syms)
 
+        deep_rank = _rank_of(fused_full, target_file)
         result = {
             "query": raw_query,
             "target_file": target_file,
             "rank": rank,
             "hit": rank is not None,
+            # Where it landed in the candidate list the reranker was choosing from,
+            # which can be past K. Informational only — no metric reads it — so that a
+            # miss at rank 6 is still distinguishable from a miss at rank 600.
+            "rank_in_fused_list": deep_rank,
+            # The stricter question: not "was the file retrieved" but "was the chunk
+            # that carries the answer retrieved". Absent, not 0, when the query names
+            # no symbols to localise on.
+            "span_rank": span_rank if expected_syms else None,
+            "answerable": bool(expected_file_units),
             "symbols_matched": len(matched_symbols),
             "symbols_expected": len(expected_syms),
             "expected_file_units": expected_file_units,
@@ -788,6 +1103,8 @@ async def evaluate_pipeline(
             print(f"  [{status}] {raw_query[:60]:<60} → {target_file} ({syms})")
 
     total_queries = len(dataset)
+    span_scored = len(span_reciprocal_ranks)
+    answerable_queries = len(answerable_hits)
     hit_rate     = hits_at_k / total_queries if total_queries else 0.0
     mrr          = sum(reciprocal_ranks) / total_queries if total_queries else 0.0
     sym_recall   = symbol_hits / total_expected_symbols if total_expected_symbols else 0.0
@@ -795,9 +1112,15 @@ async def evaluate_pipeline(
 
     def _leg_metrics(leg: Dict[str, Any]) -> Dict[str, Any]:
         n = total_queries or 1
+        scored = leg["span_scored"]
         return {
             "hit_rate_at_k": round(leg["hits"] / n * 100, 2),
             "mean_reciprocal_rank_mrr": round(sum(leg["ranks"]) / n, 3),
+            # None, not 0.0, when no query in the dataset named a symbol: this leg was
+            # not measured at this granularity, and a zero would read as a failure to
+            # localise rather than as an absence of anything to localise on.
+            "span_hit_rate_at_k": round(leg["span_hits"] / scored * 100, 2) if scored else None,
+            "span_mrr": round(sum(leg["span_ranks"]) / scored, 3) if scored else None,
             "symbol_recall_pct": round(
                 leg["symbol_hits"] / leg["symbols_expected"] * 100
                 if leg["symbols_expected"]
@@ -813,6 +1136,8 @@ async def evaluate_pipeline(
         by_leg["fused_reranked"] = {
             "hit_rate_at_k": None,
             "mean_reciprocal_rank_mrr": None,
+            "span_hit_rate_at_k": None,
+            "span_mrr": None,
             "symbol_recall_pct": None,
             "note": "reranking disabled (--no-rerank)",
         }
@@ -820,6 +1145,8 @@ async def evaluate_pipeline(
         by_leg["fused_reranked"] = {
             "hit_rate_at_k": None,
             "mean_reciprocal_rank_mrr": None,
+            "span_hit_rate_at_k": None,
+            "span_mrr": None,
             "symbol_recall_pct": None,
             "note": "cross-encoder unavailable — reranking did not run",
         }
@@ -835,6 +1162,35 @@ async def evaluate_pipeline(
             "hit_rate_at_k_granularity": "file",
             "mean_reciprocal_rank_mrr": round(mrr, 3),
             "symbol_recall_pct": round(sym_recall * 100, 2),
+            # ── The same retrieval, scored at the granularity of an answer ──────
+            # Both numbers are printed because they answer different questions, and
+            # only the pair says whether retrieval is localising or merely lucky:
+            # file-level hit rate counts ANY chunk of the right file, so a retriever
+            # that returns a module's import block is scored as if it had found the
+            # function the user asked about. Span level requires an expected symbol
+            # inside the retrieved unit itself.
+            "span_hit_rate_at_k": round(
+                span_hits_at_k / span_scored * 100, 2
+            ) if span_scored else None,
+            "span_mrr": round(
+                sum(span_reciprocal_ranks) / span_scored, 3
+            ) if span_scored else None,
+            "span_precision_at_k_pct": round(
+                (sum(span_precision_values) / len(span_precision_values)) * 100, 2
+            ) if span_precision_values else None,
+            "span_scored_queries": span_scored,
+            "granularity_note": (
+                "file level = any unit from the ground-truth file; span level = a unit "
+                "from that file whose own text contains an expected symbol, so a "
+                "windowed leg can legitimately serve the model the right region and "
+                "still miss here"
+            ),
+            # The instrument's own health, kept in front of the score it could distort.
+            "answerable_queries": answerable_queries,
+            "unanswerable_queries": len(unanswerable),
+            "hit_rate_at_k_answerable": round(
+                sum(1 for hit in answerable_hits if hit) / answerable_queries * 100, 2
+            ) if answerable_queries else None,
             "avg_latency_ms": round(avg_latency, 1),
             # The distribution, not just the mean: a retrieval path that is 40 ms
             # for 39 queries and 4 s for one has a mean that describes nothing, and
@@ -887,6 +1243,30 @@ async def evaluate_pipeline(
         # Identifies WHICH source produced these numbers. Two runs from different
         # commits are not comparable, and without this they look identical.
         "corpus_sha256": corpus_fingerprint(corpus_docs),
+        "metric_depth": {
+            "rule": METRIC_DEPTH_RULE,
+            "top_k": top_k,
+            "note": (
+                "every @K metric counts positions 1..K of the leg's ranking; the "
+                "candidate list the reranker is choosing from is deeper than that"
+            ),
+        },
+        # Which matching rule produced the file-level numbers. A run scored with the
+        # old substring rule credited `tests/test_batch_review.py` for a query about
+        # `api/review.py`; comparing that run with one scored exactly would read as a
+        # regression caused by the code under test. `compare_results` refuses to grade
+        # quality across a difference here, and treats a missing key as its own value
+        # ("unknown") rather than as agreement.
+        "ground_truth": {
+            "matching": GROUND_TRUTH_MATCHING,
+            "span_metric": "expected symbol inside the retrieved unit",
+            "unanswerable": sorted(set(unanswerable)),
+            "ground_truth_files": len({item["ground_truth_file"] for item in dataset}),
+            # An audit result, not a claim: `evaluate_pipeline` raises if any ground
+            # truth here matched more than one file in the corpus it was given, so a
+            # run that produced this block passed that check.
+            "audit": "each ground truth resolved to exactly one corpus file",
+        },
     }
     result["models"] = _model_provenance(embedder_mode)
     return result
@@ -1191,10 +1571,26 @@ def print_report(result: Dict[str, Any]) -> None:
     print(f"  Corpus               : {corpus_line}")
     print(f"  Total queries        : {m['total_queries']}")
     print(f"  Hit Rate @ K         : {m['hit_rate_at_k']}%"
-          f"   ({granularity}-level)")
+          f"   ({granularity}-level: any chunk of the right file)")
     print(f"  Mean Reciprocal Rank : {m['mean_reciprocal_rank_mrr']}")
+    span_hr = m.get("span_hit_rate_at_k")
+    if span_hr is None:
+        print("  Span Hit Rate @ K    : —   (no query named expected symbols)")
+    else:
+        print(f"  Span Hit Rate @ K    : {span_hr}%"
+              f"   (unit-level: the chunk itself carries the symbol,"
+              f" {m.get('span_scored_queries')}/{m['total_queries']} queries)")
     print(f"  Symbol Recall        : {m['symbol_recall_pct']}%")
     print(f"  Precision @ K        : {m['precision_at_k_pct']}%")
+    answerable = m.get("answerable_queries")
+    unanswerable = m.get("unanswerable_queries") or 0
+    if unanswerable:
+        # Kept in the headline number and called out here: excluding them would raise
+        # the score of unchanged retrieval.
+        rate = m.get("hit_rate_at_k_answerable")
+        print(f"  ⚠️  {unanswerable} of {m['total_queries']} queries' ground truth matches no"
+              f" unit in this corpus, so they cannot hit."
+              + (f"  Over the {answerable} answerable ones: {rate}%." if rate is not None else ""))
     print(f"  Avg latency          : {m['avg_latency_ms']} ms/query")
     stats = m.get("latency_ms") or {}
     if stats.get("p50") is not None:
@@ -1226,18 +1622,20 @@ def print_report(result: Dict[str, Any]) -> None:
     by_leg = m.get("by_leg") or {}
     if by_leg:
         # The table that decides whether an embedder swap is worth a re-index.
-        print(f"  BY RETRIEVAL LEG           hit@K      MRR   symbols"
-              f"   ({granularity}-level hit@K)")
+        print("  BY RETRIEVAL LEG           hit@K      MRR    span@K   symbols"
+              "   (hit@K is file-level)")
         for name in ("bm25_only", "dense_only", "fused", "fused_reranked"):
             leg = by_leg.get(name)
             if not leg:
                 continue
             hit = leg.get("hit_rate_at_k")
             if hit is None:
-                print(f"    {name:<22s} {'—':>6s} {'—':>8s}   {leg.get('note', '')}")
+                print(f"    {name:<22s} {'—':>6s} {'—':>8s} {'—':>8s}   {leg.get('note', '')}")
             else:
+                span = leg.get("span_hit_rate_at_k")
                 print(
                     f"    {name:<22s} {hit:>5.1f}%  {leg['mean_reciprocal_rank_mrr']:>6.3f}"
+                    f"  {f'{span:>6.1f}%' if span is not None else '     —'}"
                     f"  {leg['symbol_recall_pct']:>5.1f}%"
                 )
         print("=" * 60)
