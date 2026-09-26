@@ -17,6 +17,7 @@
 import { useState, useCallback } from "react";
 import { IndexedFile } from "../types";
 import { apiFetch } from "../api";
+import { isAbortError, useStreamStop } from "../lib/cancel";
 import { decodeStatus, drainMarkers, flushTail, REVIEW_TAGS } from "../lib/stream";
 import { applyTiming, EMPTY_TIMINGS, type ReviewTimings } from "../lib/timings";
 
@@ -36,11 +37,21 @@ export interface ReviewState {
   currentMode: string | null;
   error: string | null;
   /**
+   * The run ended because the reader stopped it, not because anything failed.
+   *
+   * Kept separate from `error` because they want opposite wording in the UI: a
+   * stopped review still has the sections it produced, and telling someone their
+   * review failed makes them re-run a run that did exactly what they asked.
+   */
+  stopped: boolean;
+  /**
    * What the server said this review cost, per stage. Empty until a marker that
    * carries timing arrives — the panel renders nothing rather than a zero.
    */
   timings: ReviewTimings;
 }
+
+const STOPPED_STEP = "Stopped — the review was not finished.";
 
 export function useReview() {
   const [state, setState] = useState<ReviewState>({
@@ -50,11 +61,37 @@ export function useReview() {
     currentStep: null,
     currentMode: null,
     error: null,
+    stopped: false,
     timings: EMPTY_TIMINGS,
   });
+  const stopCtl = useStreamStop();
+
+  /**
+   * End the run and say so locally, without waiting for the server.
+   *
+   * The abort kills the reader, so nothing further arrives to explain the gap —
+   * the UI has to draw the stopped state itself rather than wait for a marker it
+   * will never read.
+   */
+  const markStopped = useCallback((message: string) => {
+    setState((prev) => ({
+      ...prev,
+      isReviewing: false,
+      currentStep: message,
+      stopped: true,
+      // A Stop is not a failure, and the previous run's error must not survive it.
+      error: null,
+    }));
+  }, []);
+
+  const stop = useCallback(() => {
+    stopCtl.stop();
+    markStopped(STOPPED_STEP);
+  }, [markStopped, stopCtl]);
 
   const reviewFile = useCallback(async (file: IndexedFile) => {
-    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null, timings: EMPTY_TIMINGS });
+    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null, stopped: false, timings: EMPTY_TIMINGS });
+    const controller = stopCtl.start();
 
     try {
       const response = await apiFetch("/api/v1/review/file", {
@@ -65,6 +102,7 @@ export function useReview() {
           file_name: file.file_name,
           language: file.language,
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -73,23 +111,30 @@ export function useReview() {
       }
 
       await _consumeStream(response);
+      stopCtl.finish();
     } catch (err) {
+      // An abort is the Stop button, and Stop already drew its own state; re-entering
+      // it as an error is how a deliberate stop turns into a red banner telling the
+      // user something broke.
+      if (isAbortError(err) || stopCtl.stopped()) return;
       setState((prev) => ({
         ...prev,
         isReviewing: false,
         error: err instanceof Error ? err.message : "Review failed.",
       }));
     }
-  }, []);
+  }, [stopCtl]);
 
   const reviewPaste = useCallback(async (code: string, language: string, fileName: string) => {
-    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null, timings: EMPTY_TIMINGS });
+    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null, stopped: false, timings: EMPTY_TIMINGS });
+    const controller = stopCtl.start();
 
     try {
       const response = await apiFetch("/api/v1/review/paste", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code, language, file_name: fileName }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -98,14 +143,19 @@ export function useReview() {
       }
 
       await _consumeStream(response);
+      stopCtl.finish();
     } catch (err) {
+      // An abort is the Stop button, and Stop already drew its own state; re-entering
+      // it as an error is how a deliberate stop turns into a red banner telling the
+      // user something broke.
+      if (isAbortError(err) || stopCtl.stopped()) return;
       setState((prev) => ({
         ...prev,
         isReviewing: false,
         error: err instanceof Error ? err.message : "Review failed.",
       }));
     }
-  }, []);
+  }, [stopCtl]);
 
   /**
    * Shared stream consumer — splits STATUS/ERROR markers out of the stream and
@@ -120,6 +170,10 @@ export function useReview() {
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    // Whether the stream said how it ended. A review whose last marker was `writing`
+    // did not finish, so the closing state below is decided by this flag rather than
+    // by the socket closing politely.
+    let terminal = false;
 
     for (;;) {
       const { done, value } = await reader.read();
@@ -135,6 +189,7 @@ export function useReview() {
           continue;
         }
         if (segment.kind === "error") {
+          terminal = true;
           setState((prev) => ({
             ...prev,
             isReviewing: false,
@@ -147,6 +202,14 @@ export function useReview() {
 
         const meta = decodeStatus(segment.payload);
         const message = typeof meta.message === "string" ? meta.message : "";
+        if (meta.step === "complete") terminal = true;
+        // The server can notice a departure the client never announced — a proxy
+        // timing out, a tab closing — and it says so on the stream. Reaching that
+        // marker is a stopped run, not a finished one.
+        if (meta.step === "cancelled") {
+          terminal = true;
+          markStopped(message || STOPPED_STEP);
+        }
         setState((prev) => ({
           ...prev,
           currentStep: message || null,
@@ -159,12 +222,20 @@ export function useReview() {
 
     const tail = flushTail(buffer, REVIEW_TAGS);
     if (tail) setState((prev) => ({ ...prev, review: prev.review + tail }));
-    setState((prev) => ({ ...prev, isReviewing: false, currentStep: null }));
-  }, []);
+    if (!terminal) markStopped("The stream ended before the review finished.");
+    // A finished run has nothing left to say, so its status line clears. A stopped one
+    // keeps the sentence that says where it stopped.
+    else setState((prev) => ({
+      ...prev,
+      isReviewing: false,
+      currentStep: prev.stopped ? prev.currentStep : null,
+    }));
+  }, [markStopped]);
 
   const reset = useCallback(() => {
-    setState({ isReviewing: false, review: "", agentSteps: [], currentStep: null, currentMode: null, error: null, timings: EMPTY_TIMINGS });
-  }, []);
+    stopCtl.stop();
+    setState({ isReviewing: false, review: "", agentSteps: [], currentStep: null, currentMode: null, error: null, stopped: false, timings: EMPTY_TIMINGS });
+  }, [stopCtl]);
 
-  return { ...state, reviewFile, reviewPaste, reset };
+  return { ...state, reviewFile, reviewPaste, reset, stop };
 }

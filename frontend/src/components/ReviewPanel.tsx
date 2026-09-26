@@ -48,6 +48,7 @@ import { IndexedFile } from "../types";
 import { PRReviewPanel } from "./PRReviewPanel";
 import { EvidenceViewer } from "./EvidenceViewer";
 import { ApplyFixPanel } from "./ApplyFixPanel";
+import { StopButton } from "./StopButton";
 import { useReview } from "../hooks/useReview";
 import { useMultiReview, ReviewSection } from "../hooks/useMultiReview";
 
@@ -883,6 +884,10 @@ export function ReviewPanel({
 
   // ── Derived state ─────────────────────────────────────────────────────────
   const isActive = isMulti ? multi.isReviewing : single.isReviewing;
+  const activeStopped = isMulti ? multi.stopped : single.stopped;
+  // The button aborts the request, which is what the server is watching for: the run
+  // stops *costing* something, not just printing.
+  const handleStop = () => (isMulti ? multi.stop() : single.stop());
 
   const canReview = !isActive && (
     tab === "paste"
@@ -1108,6 +1113,11 @@ export function ReviewPanel({
                 : <><Zap className="w-4 h-4" />{buttonLabel()}</>
               }
             </button>
+            {isActive && (
+              <div className="mt-2">
+                <StopButton onClick={handleStop} className="w-full" />
+              </div>
+            )}
           </div>
         </div>
 
@@ -1261,6 +1271,15 @@ export function ReviewPanel({
               {!multi.isReviewing && multi.sections.length > 0 && fixableFiles.length > 0 && (
                 <ApplyFixPanel files={fixableFiles} />
               )}
+            </div>
+          )}
+
+          {/* A stopped run: what arrived stays readable, what did not is named. */}
+          {activeStopped && !isActive && (
+            <div className="p-6 pb-0">
+              <p role="status" className="text-xs text-amber-300/90 bg-amber-500/10 border border-amber-500/25 rounded-lg px-3 py-2">
+                {currentStep || "Stopped — the remaining files were not reviewed."}
+              </p>
             </div>
           )}
 

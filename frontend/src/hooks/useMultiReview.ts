@@ -14,6 +14,7 @@
 import { useState, useCallback } from "react";
 import { IndexedFile } from "../types";
 import { apiFetch } from "../api";
+import { isAbortError, useStreamStop } from "../lib/cancel";
 import { decodeStatus, drainMarkers, flushTail, REVIEW_TAGS } from "../lib/stream";
 import { applyTiming, EMPTY_TIMINGS, type ReviewTimings } from "../lib/timings";
 
@@ -100,6 +101,12 @@ export interface MultiReviewState {
   serverBatchCount?: number;      // how many batched calls that is
   serverModelCalls?: number;      // total model calls planned for this run
   serverCacheHits?: number;       // files answered from the content-hash cache
+  /**
+   * The reader stopped this run. `error` stays null: files that were never reviewed
+   * are a fact about a cancelled run, not a failure to retry, and the sections that
+   * *were* produced stay readable.
+   */
+  stopped: boolean;
   /** Per-stage cost, from the `planned` and `timing` markers. */
   timings: ReviewTimings;
   // Derived accuracy fields (not part of useState, computed from sections)
@@ -118,8 +125,37 @@ export function useMultiReview() {
     totalFiles: 0,
     currentMode: null,
     error: null,
+    stopped: false,
     timings: EMPTY_TIMINGS,
   });
+  const stopCtl = useStreamStop();
+
+  /**
+   * Everything still unreviewed becomes `skipped`, with the reason the caller gives.
+   *
+   * A section left at `pending` after a stop reads as "the queue is still working on
+   * it" forever. Marking it is the difference between a stopped run whose shape a
+   * reader can see and one that looks like it is still coming.
+   */
+  const markSectionsSkipped = useCallback((message: string) => {
+    setState((prev) => ({
+      ...prev,
+      isReviewing: false,
+      stopped: true,
+      error: null,
+      currentStep: message,
+      sections: prev.sections.map((section) =>
+        section.status === "complete" || section.status === "error" || section.content.trim()
+          ? section
+          : { ...section, status: "skipped", statusMessage: message },
+      ),
+    }));
+  }, []);
+
+  const stop = useCallback(() => {
+    stopCtl.stop();
+    markSectionsSkipped("Stopped — the remaining files were not reviewed.");
+  }, [markSectionsSkipped, stopCtl]);
 
   const reviewFiles = useCallback(async (files: IndexedFile[]) => {
     setState({
@@ -137,8 +173,10 @@ export function useMultiReview() {
       totalFiles: files.length,
       currentMode: null,
       error: null,
+      stopped: false,
       timings: EMPTY_TIMINGS,
     });
+    const controller = stopCtl.start();
 
     try {
       const response = await apiFetch("/api/v1/review/multi", {
@@ -151,6 +189,7 @@ export function useMultiReview() {
             language: f.language,
           })),
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -281,6 +320,12 @@ export function useMultiReview() {
             });
           }
 
+          if (meta.step === "cancelled") {
+            // The server's own account of where it stopped, for a departure it
+            // noticed before the client said anything.
+            markSectionsSkipped(message || "Stopped — the remaining files were not reviewed.");
+          }
+
           setState((prev) => ({
             ...prev,
             currentStep: message,
@@ -305,6 +350,7 @@ export function useMultiReview() {
               serverBatchCount: meta.batch_count,
               serverModelCalls: meta.model_calls,
             }),
+            ...(meta.step === "cancelled" && { stopped: true }),
           }));
         }
       }
@@ -315,9 +361,18 @@ export function useMultiReview() {
       setState((prev) => ({
         ...prev,
         isReviewing: false,
-        currentStep: null,
+        // See `useReview`: a stopped run keeps the line that explains where it
+        // stopped, instead of being silenced into looking finished.
+        currentStep: prev.stopped ? prev.currentStep : null,
         sections: prev.sections.map((section) => {
-          if (section.status === "complete" || section.status === "error") return section;
+          // `skipped` is terminal here, and it already carries a reason — the one the
+          // stop or the server gave is better than this fallback, which only knows no
+          // prose arrived.
+          if (
+            section.status === "complete"
+            || section.status === "error"
+            || section.status === "skipped"
+          ) return section;
           if (section.content.trim()) return { ...section, status: "complete" };
           return {
             ...section,
@@ -326,16 +381,21 @@ export function useMultiReview() {
           };
         }),
       }));
+      stopCtl.finish();
     } catch (err) {
+      // The Stop button aborts the fetch, which surfaces here as an AbortError. It is
+      // not a review failure, and the sections have already been marked.
+      if (isAbortError(err) || stopCtl.stopped()) return;
       setState((prev) => ({
         ...prev,
         isReviewing: false,
         error: err instanceof Error ? err.message : "Review failed.",
       }));
     }
-  }, []);
+  }, [stopCtl]);
 
   const reset = useCallback(() => {
+    stopCtl.stop();
     setState({
       isReviewing: false,
       sections: [],
@@ -345,9 +405,10 @@ export function useMultiReview() {
       totalFiles: 0,
       currentMode: null,
       error: null,
+      stopped: false,
       timings: EMPTY_TIMINGS,
     });
-  }, []);
+  }, [stopCtl]);
 
   // Derive completedFiles and totalFileCount from sections — always accurate regardless of
   // React batching, and always excludes the __repo_summary__ section.
@@ -398,5 +459,6 @@ export function useMultiReview() {
     llmReviewedCount: llmCount,
     reviewFiles,
     reset,
+    stop,
   };
 }
