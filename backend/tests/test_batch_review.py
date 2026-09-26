@@ -404,3 +404,207 @@ def test_a_run_without_a_stop_predicate_is_unchanged():
     ]
     # One section per file, plus the repo summary that only a completed run writes.
     assert opened == ["pkg/a.py", "pkg/b.py", "__repo_summary__"], opened
+
+
+def test_a_stop_arriving_mid_flight_still_ends_the_run():
+    """
+    The reader leaves while every in-flight review is still waiting on the model.
+
+    That is the ordinary case — a local model call outlives the patience that makes
+    someone press Stop — and a design where the disconnect is only noticed *between*
+    files cannot serve it: with concurrency 1 and three files, the driver is parked on
+    the one call in flight and never regains control. So the run carries a watcher that
+    cancels the outstanding work; this asserts the queue stayed empty and the call in
+    flight was torn down rather than finished for nobody.
+    """
+    import time as _clock
+
+    from app.services import multi_review_agent as mra
+
+    # Content the planner sends to a model on its own — a file it can settle with the
+    # parser would be routed static, and a static file has no call to cancel.
+    risky = "\n".join([
+        "import requests",
+        "",
+        "def check(token, secret, user):",
+        "    total = 0",
+        "    for part in token.split('.'):",
+        "        if len(part) > 64 and part.startswith('x'):",
+        "            total += sum(ord(c) for c in part)",
+        "    if len(secret) < 8:",
+        "        raise ValueError('short secret')",
+        "    resp = requests.get('http://internal', verify=False)",
+        "    return resp.ok and total < 100",
+    ] * 8)
+    files = [{"file_path": f"pkg/{n}.py", "file_name": f"{n}.py", "language": "py",
+              "content": risky} for n in ("a", "b", "c")]
+    recorder = {"started": [], "cancelled": [], "finished": []}
+    # A one-element box because `collect`'s closure assigns to it and the predicate
+    # reads it; a plain local would need a `nonlocal` in a nested function.
+    started_at = [0.0]
+
+    async def review(file_name, content, language, repo_context="", model_override=""):
+        recorder["started"].append(file_name)
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            recorder["cancelled"].append(file_name)
+            raise
+        recorder["finished"].append(file_name)
+        yield f"model review for {file_name}"
+
+    async def batch(files_slice, repo_context_map=None, model_override=""):
+        names = [info["file_name"] for info in files_slice]
+        recorder["started"].append("batch:" + ",".join(names))
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            recorder["cancelled"].extend(names)
+            raise
+        recorder["finished"].extend(names)
+        for info in files_slice:
+            yield f"## {info['file_name']}"
+
+    settings = SimpleNamespace(
+        review_mode="fast", review_max_full_files=80, review_llm_budget=80,
+        review_concurrency=1, llm_provider="ollama", summary_mixture_models="",
+        review_cache_enabled=False,
+    )
+
+    async def collect():
+        async def stopping():
+            return _clock.monotonic() - started_at[0] > 0.05
+
+        class _DeadLLM:
+            def astream(self, messages):
+                async def gen():
+                    raise RuntimeError("summary disabled in tests")
+                    yield ""
+                return gen()
+
+            def with_config(self, **_):
+                return self
+
+        with patch.object(mra, "stream_fast_code_review", review), \
+             patch.object(mra, "stream_code_review", review), \
+             patch.object(mra, "stream_batch_code_review", batch), \
+             patch.object(mra, "get_settings", lambda: settings), \
+             patch.object(mra, "get_chat_llm", lambda *a, **k: _DeadLLM()):
+            started_at[0] = _clock.monotonic()
+            return "".join([tok async for tok in mra.stream_multi_review(
+                files, should_stop=stopping,
+            )])
+
+    async def run_with_timeout():
+        # The timeout is the assertion in disguise: without the watcher this test
+        # would sit through a 30-second fake model call before failing.
+        return await asyncio.wait_for(collect(), 5.0)
+
+    out = asyncio.run(run_with_timeout())
+
+    # One call was allowed in flight by the semaphore; the other two never started.
+    assert recorder["started"] == ["a.py"], recorder["started"]
+    assert recorder["cancelled"] == ["a.py"], recorder["cancelled"]
+    assert recorder["finished"] == []
+    # Nothing was published after the stop, and nothing claimed to have finished.
+    assert "__SECTION_START__" not in out
+    assert '"complete"' not in out
+
+
+def test_a_consumer_that_dies_while_reviews_are_open_releases_the_model():
+    """
+    The task reading the stream is cancelled mid-await, and the model is let go.
+
+    This is the shape a real disconnect takes on a server: Starlette can abandon a
+    streaming response's generator instead of unwinding it, and an abandoned frame runs
+    no `finally` of mine — which is why the run also hangs its teardown on the consumer
+    *task* finishing. The reviews are detached tasks (that is what lets six of them
+    share two semaphore slots) and detached tasks outlive the frame that made them, so
+    "the response ended" is not the same statement as "the work stopped".
+
+    Here the consumer is ours to cancel, so the effect is measured rather than assumed:
+    the file in flight is torn down, and the two behind it never start.
+    """
+    import time as _clock
+
+    from app.services import multi_review_agent as mra
+
+    risky = "\n".join([
+        "import requests",
+        "",
+        "def check(token, secret):",
+        "    total = 0",
+        "    for part in token.split('.'):",
+        "        if len(part) > 64:",
+        "            total += 1",
+        "    resp = requests.get('http://internal', verify=False)",
+        "    return resp.ok and total < 100",
+        "",
+    ] * 10)
+    files = [{"file_path": f"pkg/{n}.py", "file_name": f"{n}.py", "language": "py",
+              "content": risky} for n in ("a", "b", "c")]
+    recorder = {"started": [], "ended": [], "finished": []}
+
+    async def review(file_name, content, language, repo_context="", model_override=""):
+        recorder["started"].append(file_name)
+        try:
+            await asyncio.sleep(30)
+        finally:
+            recorder["ended"].append(file_name)
+        recorder["finished"].append(file_name)
+        yield f"model review for {file_name}"
+
+    async def batch(files_slice, repo_context_map=None, model_override=""):
+        for info in files_slice:
+            await review(info["file_name"], "", "", "", "")
+            yield f"## {info['file_name']}"
+
+    settings = SimpleNamespace(
+        review_mode="fast", review_max_full_files=80, review_llm_budget=80,
+        review_concurrency=1, llm_provider="ollama", summary_mixture_models="",
+        review_cache_enabled=False,
+    )
+
+    async def scenario():
+        async def pull():
+            async for _chunk in mra.stream_multi_review(files):
+                pass
+
+        class _DeadLLM:
+            def astream(self, messages):
+                async def gen():
+                    raise RuntimeError("summary disabled in tests")
+                    yield ""
+                return gen()
+
+            def with_config(self, **_):
+                return self
+
+        with patch.object(mra, "stream_fast_code_review", review), \
+             patch.object(mra, "stream_code_review", review), \
+             patch.object(mra, "stream_batch_code_review", batch), \
+             patch.object(mra, "get_settings", lambda: settings), \
+             patch.object(mra, "get_chat_llm", lambda *a, **k: _DeadLLM()):
+            consumer = asyncio.create_task(pull())
+            deadline = _clock.monotonic() + 2.0
+            while not recorder["started"] and _clock.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            consumer.cancel()
+            try:
+                await consumer
+            except asyncio.CancelledError:
+                pass
+            # Bounded wait for the cancellation to be delivered, so a run that leaves
+            # its work suspended fails here instead of hanging the suite.
+            deadline = _clock.monotonic() + 1.0
+            while (len(recorder["ended"]) < len(recorder["started"])
+                   and _clock.monotonic() < deadline):
+                await asyncio.sleep(0.01)
+
+        return dict(recorder)
+
+    out = asyncio.run(scenario())
+
+    assert out["started"] == ["a.py"], out["started"]
+    assert out["ended"] == ["a.py"], f"in-flight review left running: {out}"
+    assert out["finished"] == [], f"a cancelled consumer still completed a review: {out}"
