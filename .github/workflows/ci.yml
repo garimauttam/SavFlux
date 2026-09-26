@@ -121,9 +121,9 @@ jobs:
           path: eval_results.json
           retention-days: 30
 
-  # ── Frontend: TypeScript type-check ─────────────────────────────────────────
+  # ── Frontend: TypeScript type-check + unit tests ────────────────────────────
   frontend-typecheck:
-    name: Frontend TypeScript
+    name: Frontend TypeScript + Tests
     runs-on: ubuntu-latest
 
     defaults:
@@ -146,3 +146,10 @@ jobs:
 
       - name: TypeScript type-check
         run: npx tsc --noEmit
+
+      # The UI has its own suite (vitest + jsdom): the tab strip, section
+      # reachability, and the light-theme invariants. Type-checking alone could
+      # not see the defect that motivated it — 17 tabs in a strip that clipped
+      # the last five off-screen compiles perfectly.
+      - name: Frontend unit tests
+        run: npm test

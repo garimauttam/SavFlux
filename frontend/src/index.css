@@ -62,3 +62,63 @@ html:not(.dark) .divide-gray-700 > :not([hidden]) ~ :not([hidden]) { border-colo
 html:not(.dark) .placeholder-gray-500::placeholder { color: #94a3b8 !important; }
 html:not(.dark) ::-webkit-scrollbar-thumb { background: #cbd5e1; }
 html:not(.dark) ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* `hover:text-white` was never remapped: 31 controls use it on a neutral gray
+ * surface, so in light mode their label turned pure white on white on hover —
+ * the text visibly vanished under the cursor. Those surfaces are remapped to
+ * slate-100/200 above, so the hover label has to go dark with them. */
+html:not(.dark) .hover\:text-white:hover { color: #0f172a !important; }
+
+/* ── Light theme: action buttons keep their white label ──────────────────
+ * The remap above rewrites `.text-white` to near-black, which is right for
+ * body text on a white surface and wrong for the 20 classNames that put
+ * `text-white` on a saturated background, across 13 shades (Agent "Run",
+ * Diff "Compare", "Apply fix", "Open PR", the chat send arrow). Those were
+ * designed with a white label, and the remap was measurably worse: on
+ * bg-purple-600 the contrast drops from 5.38:1 to 3.32:1, below WCAG AA
+ * (4.5:1).
+ *
+ * The shade list below is not decorative — src/test/lightTheme.test.ts scans
+ * every .tsx for `text-white` on a saturated background and fails if a shade
+ * used there is missing here (or is listed here but used nowhere). It caught
+ * Code Writer's `bg-green-600` Generate button, which a hand-written list had
+ * missed; the list is derived from the components, not remembered.
+ */
+html:not(.dark) :is(
+  .bg-amber-600,
+  .bg-blue-500, .bg-blue-600,
+  .bg-cyan-600,
+  .bg-emerald-500, .bg-emerald-600,
+  .bg-green-600,
+  .bg-pink-500, .bg-pink-600,
+  .bg-purple-600,
+  .bg-red-500,
+  .bg-violet-500, .bg-violet-600
+).text-white,
+html:not(.dark) :is(
+  .bg-amber-600,
+  .bg-blue-500, .bg-blue-600,
+  .bg-cyan-600,
+  .bg-emerald-500, .bg-emerald-600,
+  .bg-green-600,
+  .bg-pink-500, .bg-pink-600,
+  .bg-purple-600,
+  .bg-red-500,
+  .bg-violet-500, .bg-violet-600
+) .text-white {
+  color: #ffffff !important;
+}
+
+/* ── Scrollable strip with no visible scrollbar ────────────────────────────
+ * The section strip scrolls because 17 tabs do not fit beside the sidebar; a
+ * 6px scrollbar under a 44px row is noise, and the prev/next arrows are the
+ * affordance. Keyboard and wheel scrolling still work — this hides the track,
+ * it does not disable scrolling.
+ */
+.scrollbar-none {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}

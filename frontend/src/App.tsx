@@ -8,8 +8,7 @@
  *   repo selector + clear button) and ChatWindow (for scoped retrieval)
  */
 
-import React, { useState, useEffect, useCallback } from "react";
-import { MessageSquare, Zap, Wand2, Network, Bot, Activity, Building2, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell, Terminal, History } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
 import { IngestPanel } from "./components/IngestPanel";
 import { ChatWindow } from "./components/ChatWindow";
 import { ReviewPanel } from "./components/ReviewPanel";
@@ -29,10 +28,12 @@ import NotificationsPanel from "./components/NotificationsPanel";
 import SlashCommandsPanel from "./components/SlashCommandsPanel";
 import TimeMachinePanel from "./components/TimeMachinePanel";
 import { ThemeToggle } from "./components/ThemeToggle";
+import { TabBar } from "./components/TabBar";
 import { MetricsBar } from "./components/MetricsBar";
 import { ShareView } from "./components/ShareView";
 import { CommandPalette, ShortcutsHelp } from "./components/CommandPalette";
 import { IndexedFile, IndexedRepo } from "./types";
+import { DEFAULT_TAB, SHORTCUT_BY_KEY, TABS, type Tab } from "./navigation";
 import { OPEN_FILE_EVENT, openFileAt, parseOpenFileDetail } from "./lib/openFile";
 import { apiFetch } from "./api";
 
@@ -48,19 +49,29 @@ function saveActiveRepo(url: string | null): void {
   } catch {}
 }
 
-type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff" | "notifications" | "slash" | "history";
-
+/**
+ * Share route — https://savflux.app/s/{id} (P1 #5.5).
+ *
+ * The early return used to sit above the workspace's hooks. React only
+ * tolerates that because a share URL never turns into the app mid-session; the
+ * moment the path can change (client-side routing, a "back to app" link on the
+ * share page) the hook count changes between renders and React throws. This
+ * component owns no hooks, so the workspace's hook order can no longer depend
+ * on the route.
+ */
 function App() {
-  // Share route — https://savflux.app/s/{id} (P1 #5.5)
   const isShareRoute = (() => {
     try { return window.location.pathname.startsWith("/s/"); } catch { return false; }
   })();
-  if (isShareRoute) return <ShareView />;
+  return isShareRoute ? <ShareView /> : <Workspace />;
+}
+
+function Workspace() {
   const [indexedFiles, setIndexedFiles] = useState<IndexedFile[]>([]);
   const [indexedRepos, setIndexedRepos] = useState<IndexedRepo[]>([]);
   const [activeRepoUrl, setActiveRepoUrl] = useState<string | null>(loadActiveRepo);
   const [activeRepoUrls, setActiveRepoUrls] = useState<string[]>([]); // multi-repo cross-search
-  const [activeTab, setActiveTab] = useState<Tab>("chat");
+  const [activeTab, setActiveTab] = useState<Tab>(DEFAULT_TAB);
   // Source path of the file the user double-clicked in the graph — used to
   // pre-select it in the Review panel when navigating graph → review
   const [reviewTargetSource, setReviewTargetSource] = useState<string | null>(null);
@@ -157,6 +168,22 @@ function App() {
         setPaletteOpen((v) => !v);
         return;
       }
+      // A pending `g` sequence outranks every single-key shortcut below.
+      // Two sections are named by a key that is itself a shortcut — `g g` for
+      // Dep. Graph and `g /` for Slash — and both used to be swallowed by the
+      // branches underneath: the `g` arm reset the prefix instead of consuming
+      // it, and `/` opened the palette. Neither tab could be reached by its
+      // documented shortcut.
+      if (gPressed && !isInput && !isPaletteOpen && !isHelpOpen && !e.metaKey && !e.ctrlKey) {
+        const pending = SHORTCUT_BY_KEY[e.key.toLowerCase()];
+        gPressed = false;
+        if (gTimer) { window.clearTimeout(gTimer); gTimer = null; }
+        if (pending) {
+          e.preventDefault();
+          setActiveTab(pending);
+          return;
+        }
+      }
       // "/" to open palette when not typing
       if (!isInput && e.key === "/" && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
@@ -170,21 +197,14 @@ function App() {
         setHelpOpen(true);
         return;
       }
-      // g sequence: g then c/r/g/h/a/w
+      // Start a `g` sequence. Consumed above, so this arm only ever sees a
+      // leading `g`. The shortcut map is derived from TABS, so a new section
+      // gets its `g`+key from its own entry instead of a second edit here.
       if (e.key === "g" && !isInput && !e.metaKey && !e.ctrlKey) {
         gPressed = true;
         if (gTimer) window.clearTimeout(gTimer);
         gTimer = window.setTimeout(() => { gPressed = false; }, 800);
         return;
-      }
-      if (gPressed && !isInput) {
-        const map: Record<string, typeof activeTab> = { c: "chat", r: "review", w: "write", g: "graph", h: "health", o: "org", a: "agent", n: "analytics", p: "prompts", s: "snippets", y: "activity", b: "bulk", e: "explorer", d: "diff", i: "notifications", "/": "slash", t: "history" };
-        const tab = map[e.key.toLowerCase()];
-        if (tab) {
-          e.preventDefault();
-          setActiveTab(tab);
-          gPressed = false;
-        }
       }
     };
     window.addEventListener("keydown", handler);
@@ -192,27 +212,8 @@ function App() {
       window.removeEventListener("keydown", handler);
       if (gTimer) window.clearTimeout(gTimer);
     };
-  }, [isPaletteOpen, isHelpOpen, activeTab]);
+  }, [isPaletteOpen, isHelpOpen]);
 
-  const tabs: { id: Tab; label: string; Icon: React.ElementType; color: string }[] = [
-    { id: "chat",   label: "Chat",         Icon: MessageSquare, color: "text-blue-400"   },
-    { id: "review", label: "Code Review",  Icon: Zap,           color: "text-yellow-400" },
-    { id: "write",  label: "Code Writer",  Icon: Wand2,         color: "text-green-400"  },
-    { id: "graph",  label: "Dep. Graph",   Icon: Network,       color: "text-purple-400" },
-    { id: "health", label: "Health",       Icon: Activity,      color: "text-emerald-400"},
-    { id: "org",    label: "Org",          Icon: Building2,     color: "text-cyan-400"   },
-    { id: "analytics", label: "Analytics", Icon: BarChart3,    color: "text-indigo-400" },
-    { id: "prompts",   label: "Prompts",    Icon: Bookmark,     color: "text-amber-400"  },
-    { id: "snippets",  label: "Snippets",   Icon: Code2,        color: "text-violet-400" },
-    { id: "activity",  label: "Activity",   Icon: Clock,        color: "text-teal-400"   },
-    { id: "bulk",      label: "Bulk",       Icon: Layers,       color: "text-blue-400"   },
-    { id: "explorer",  label: "Explorer",   Icon: FolderTree,   color: "text-amber-400"  },
-    { id: "diff",      label: "Diff",       Icon: GitCompare,   color: "text-pink-400"   },
-    { id: "notifications", label: "Inbox",  Icon: Bell,         color: "text-blue-400"   },
-    { id: "slash",       label: "Slash",    Icon: Terminal,     color: "text-emerald-400"},
-    { id: "history",     label: "History",  Icon: History,      color: "text-teal-400"   },
-    { id: "agent",  label: "Agent",        Icon: Bot,           color: "text-pink-400"   },
-  ];
 
   return (
     <div className="flex h-screen bg-gray-950 text-white overflow-hidden">
@@ -227,22 +228,11 @@ function App() {
       />
 
       <div className="flex flex-col flex-1 overflow-hidden">
-        <div className="flex items-center border-b border-gray-700 bg-gray-900 px-4 gap-1">
-          {tabs.map(({ id, label, Icon, color }) => (
-            <button
-              key={id}
-              onClick={() => setActiveTab(id)}
-              className={`flex items-center gap-1.5 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-                activeTab === id
-                  ? `${color} border-current`
-                  : "text-gray-500 border-transparent hover:text-gray-300"
-              }`}
-            >
-              <Icon className="w-4 h-4" />
-              {label}
-            </button>
-          ))}
-          <div className="ml-auto flex items-center gap-2">
+        <div className="flex items-center gap-1 border-b border-gray-700 bg-gray-900 pl-2 pr-4">
+          {/* 17 sections do not fit on a laptop: the strip scrolls and exposes
+              prev/next arrows instead of clipping the tail off-screen. */}
+          <TabBar tabs={TABS} activeTab={activeTab} onSelect={setActiveTab} />
+          <div className="ml-auto flex shrink-0 items-center gap-2">
             <button
               onClick={() => setPaletteOpen(true)}
               title="Command palette (⌘K)"
@@ -254,7 +244,12 @@ function App() {
           </div>
         </div>
 
-        <div className="flex-1 overflow-hidden">
+        <div
+          className="flex-1 overflow-hidden"
+          role="tabpanel"
+          id={`savflux-panel-${activeTab}`}
+          aria-labelledby={`savflux-tab-${activeTab}`}
+        >
           {activeTab === "chat" && (
             <ChatWindow
               activeRepoUrl={activeRepoUrl}
