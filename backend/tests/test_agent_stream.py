@@ -24,11 +24,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.api.agent import MAX_READS_INVESTIGATE, MAX_READS_WRITE, _run_agent, build_plan
+from app.api.agent import (
+    MAX_EXCERPT_CHARS,
+    MAX_LISTED_RELEVANCE,
+    MAX_READS_INVESTIGATE,
+    MAX_READS_WRITE,
+    _run_agent,
+    build_plan,
+)
 from app.services.agent_run import RunRecorder, plan_reasoning, result_preview, summarize_args
 from app.services.agent_tools import ToolResult
 from app.services.stream_protocol import MAX_STATUS_BYTES, STATUS_CLOSE, STATUS_OPEN, decode_status
@@ -506,3 +514,65 @@ def test_every_planned_step_is_accounted_for_even_with_an_empty_index():
     # that produced it above (empty retrieval here, not a crash).
     assert all("skipped —" in m["message"] for m in skipped)
     assert "No indexed chunks matched" in report
+
+
+# ── The report and the transcript must not disagree ────────────────────────────
+
+
+def _section(report: str, name: str) -> str:
+    body = report.split(f"## {name}\n", 1)[1]
+    return body.split("\n## ")[0].split("\n---\n")[0]
+
+
+def test_report_excerpts_are_exactly_the_files_the_run_read():
+    """
+    Three reads, three excerpts, in read order — and the two files retrieval matched
+    but the run did not read are named as a count, not left out quietly.
+
+    The report is the artifact someone pastes into a PR, so its coverage claim has
+    to survive a reader comparing it against the transcript. Slicing the excerpts to
+    a fixed number made a 3-read run quote 2 files and say nothing, which reads as
+    "the agent found nothing else" when the truth is "the plan stopped early".
+    """
+    pairs = tuple((f"def f{i}():\n    return {i}\n", f"pkg/mod{i}.py", f"mod{i}.py") for i in range(5))
+    markers, report = _collect("investigate how the review budget picks files", pairs=pairs)
+
+    heads = re.findall(r"^### `(.+?)`", _section(report, "Key excerpts"), re.M)
+    assert heads == [f"mod{i}.py" for i in range(MAX_READS_INVESTIGATE)]
+
+    starts = [m for m in markers if m["step"] == "tool" and m["tool"] == "read_file"]
+    read_names = [m["message"].split(": ", 1)[1] for m in starts]
+    assert read_names == heads
+
+    note = _section(report, "Key excerpts")
+    assert f"{5 - MAX_READS_INVESTIGATE} retrieved file(s) were not read" in note
+    # The lie this guards is a *silently* narrowed claim, so the note must not
+    # promise a knob that does not exist.
+    assert "max_steps" not in note.split("retrieved file(s)")[1]
+
+
+def test_a_cut_relevance_list_says_it_was_cut():
+    """Ten matched, eight are listed, and the report says both numbers."""
+    pairs = tuple((f"def f{i}():\n    return {i}\n", f"pkg/mod{i}.py", f"mod{i}.py") for i in range(10))
+    _, report = _collect("investigate how the review budget picks files", pairs=pairs)
+
+    listed = re.findall(r"^- `(.+?)`", _section(report, "Relevant code"), re.M)
+    assert len(listed) == MAX_LISTED_RELEVANCE
+    assert f"showing the top {MAX_LISTED_RELEVANCE} of 10" in _section(report, "Relevant code")
+
+
+def test_a_long_file_is_cut_with_the_size_of_the_cut_stated():
+    """
+    An excerpt that ends mid-file must be marked, in chars. A fenced block that just
+    stops is read as the whole file by everyone who has ever been burned by one.
+    """
+    long = "x = 1\n" * 600  # 3600 chars, over the 2000-char excerpt bound
+    _, report = _collect(
+        "investigate the long file",
+        pairs=((long, "pkg/long.py", "long.py"),),
+    )
+
+    section = _section(report, "Key excerpts")
+    assert "more chars not shown" in section
+    assert f"[{len(long) - MAX_EXCERPT_CHARS} more chars not shown]" in section
+    assert len(long) > MAX_EXCERPT_CHARS

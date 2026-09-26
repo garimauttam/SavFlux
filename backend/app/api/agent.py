@@ -107,6 +107,13 @@ _BASE_PLAN = ["retrieve_context", "read_file", "dependency_graph", "blast_radius
 #: is about to rewrite them.
 MAX_READS_INVESTIGATE = 3
 MAX_READS_WRITE = 2
+# Report shape. `MAX_EXCERPT_CHARS` bounds one file's quote; the relevance list is
+# bounded by count because a report someone pastes into a PR cannot be 60 lines of
+# filenames. Both bounds are stated in the report itself when they bite — a cut that
+# is not mentioned reads as "this is everything", which is the one thing a review
+# artifact must never claim.
+MAX_EXCERPT_CHARS = 2000
+MAX_LISTED_RELEVANCE = 8
 
 
 def _hit(pattern: re.Pattern, text: str) -> str:
@@ -565,19 +572,43 @@ def _build_report(
         ]
     lines += ["## Relevant code", ""]
     if contexts:
-        for context in contexts[:8]:
+        for context in contexts[:MAX_LISTED_RELEVANCE]:
             name = context.get("file_name") or context.get("source")
             lines.append(f"- `{name}` ({context.get('language', '?')})")
+        if len(contexts) > MAX_LISTED_RELEVANCE:
+            lines.append("")
+            lines.append(
+                f"_{len(contexts) - MAX_LISTED_RELEVANCE} more matched "
+                f"(showing the top {MAX_LISTED_RELEVANCE} of {len(contexts)})._"
+            )
     else:
         lines.append("_No indexed chunks matched. Index a repo first._")
 
     lines += ["", "## Key excerpts", ""]
     if file_contents:
-        for source, content in list(file_contents.items())[:2]:
+        # The excerpts *are* the evidence, so they are exactly the set of files this
+        # run read, in the order it read them. This used to slice the read set to a
+        # fixed two, which made the artifact disagree with the transcript: three reads
+        # on the timeline, two quotations in the report, and no line anywhere saying
+        # a third file was dropped.
+        for source, content in file_contents.items():
             lines.append(f"### `{source.split('/')[-1]}`")
             lines.append("```")
-            lines.append(content[:2000])
+            lines.append(content[:MAX_EXCERPT_CHARS])
+            if len(content) > MAX_EXCERPT_CHARS:
+                lines.append(f"… [{len(content) - MAX_EXCERPT_CHARS} more chars not shown]")
             lines.append("```")
+            lines.append("")
+        read = len(file_contents)
+        unread = len({c.get("source") for c in contexts if c.get("source")}) - read
+        if unread > 0:
+            # No remedy is offered, because there is none to offer: the read limit is
+            # a property of the plan, not a request field. Saying "raise max_steps"
+            # here would send a reader to a knob that changes nothing.
+            lines.append(
+                f"_{unread} retrieved file(s) were not read — a run of this plan reads "
+                f"{read}. The list above is everything retrieval matched._"
+            )
             lines.append("")
     else:
         lines.append("_No full files could be reconstructed._")
