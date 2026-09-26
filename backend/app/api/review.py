@@ -233,7 +233,11 @@ async def review_indexed_file(request: Request, body: ReviewFileRequest, _: None
         raise HTTPException(status_code=500, detail=str(e))
 
     return StreamingResponse(
-        review_fn(body.file_name, content, body.language),
+        # The disconnect is the only cancellation signal a streaming response gets,
+        # and forwarding it is what turns Stop from "the output went quiet" into "the
+        # model was let go". Both review modes take the same keyword, so the choice of
+        # function above does not change what cancellation means.
+        review_fn(body.file_name, content, body.language, should_stop=request.is_disconnected),
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -265,7 +269,7 @@ async def review_pasted_code(request: Request, body: ReviewPasteRequest, _: None
     )
 
     return StreamingResponse(
-        review_fn(body.file_name, body.code, body.language),
+        review_fn(body.file_name, body.code, body.language, should_stop=request.is_disconnected),
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -351,7 +355,10 @@ async def review_multiple_files(request: Request, body: ReviewMultiRequest, _: N
         )
 
     return StreamingResponse(
-        stream_multi_review(file_dicts),
+        # The reader's disconnect is the only cancellation signal a streaming
+        # response gets, and forwarding it is what makes Stop stop spending model
+        # time rather than just hiding the output.
+        stream_multi_review(file_dicts, should_stop=request.is_disconnected),
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

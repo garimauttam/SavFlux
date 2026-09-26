@@ -157,12 +157,12 @@ def _coverage_token(output: str) -> dict:
         cursor = end + len(STATUS_CLOSE)
 
 
-def _run(files, batch_impl=None, review_impl=None):
+def _run(files, batch_impl=None, review_impl=None, should_stop=None, concurrency=2):
     from app.services import multi_review_agent as mra
 
     settings = SimpleNamespace(
         review_mode="fast", review_max_full_files=80, review_llm_budget=1,
-        review_concurrency=2, llm_provider="ollama", summary_mixture_models="",
+        review_concurrency=concurrency, llm_provider="ollama", summary_mixture_models="",
         review_cache_enabled=True,
     )
 
@@ -189,7 +189,9 @@ def _run(files, batch_impl=None, review_impl=None):
              patch.object(mra, "stream_batch_code_review", batch_impl or batch), \
              patch.object(mra, "get_settings", return_value=settings), \
              patch.object(mra, "get_chat_llm", lambda *a, **k: _DeadLLM()):
-            return "".join([tok async for tok in mra.stream_multi_review(files)])
+            return "".join([tok async for tok in mra.stream_multi_review(
+                files, should_stop=should_stop,
+            )])
 
     return asyncio.run(collect())
 
@@ -253,3 +255,152 @@ def test_coverage_reports_cache_hits_without_calling_them_misses(isolated_data_d
     assert second["llm"] == 4                     # and still counted as reviewed
     assert second["static"] == 0
     assert second["pct"] == 100
+
+
+# ── Stop: a run the reader abandoned must stop costing the model ───────────────
+
+
+def _markers_of(text: str) -> list[dict]:
+    from app.services.stream_protocol import STATUS_CLOSE, STATUS_OPEN, decode_status
+
+    markers, cursor = [], 0
+    while True:
+        start = text.find(STATUS_OPEN, cursor)
+        if start == -1:
+            return markers
+        end = text.find(STATUS_CLOSE, start)
+        markers.append(decode_status(text[start + len(STATUS_OPEN):end]))
+        cursor = end + len(STATUS_CLOSE)
+
+
+def _stopped(name: str):
+    """A file whose review is armed to stop the run as soon as it has been seen."""
+
+    return name
+
+
+def test_a_run_stopped_before_it_starts_reviews_nothing_and_says_so(isolated_data_dir):
+    """
+    `should_stop` true from the first check: zero model calls, one cancelled marker.
+
+    The claim being pinned is the expensive one. A Stop that only stops *printing*
+    leaves every queued file's model call running to completion on a machine with no
+    budget, which is the opposite of why the button exists — so the workers consult
+    the predicate before doing work, not only before describing it.
+    """
+    files = [{"file_path": f"pkg/{n}.py", "file_name": f"{n}.py", "language": "py",
+              "content": ORDINARY} for n in ("a", "b", "c", "d")]
+    calls: list[str] = []
+
+    async def review(file_name, content, language, repo_context="", model_override=""):
+        calls.append(file_name)
+        yield f"model review for {file_name}"
+
+    async def always_stopped():
+        return True
+
+    out = _run(files, review_impl=review, should_stop=always_stopped)
+    markers = _markers_of(out)
+
+    assert calls == [], f"a stopped run made {len(calls)} model calls"
+    cancelled = [m for m in markers if m["step"] == "cancelled"]
+    assert len(cancelled) == 1
+    assert cancelled[0]["published"] == 0 and cancelled[0]["not_reviewed"] == 4
+    assert cancelled[0]["files_skipped"] == ["a.py", "b.py", "c.py", "d.py"]
+    assert "were not reviewed" in cancelled[0]["message"]
+    # No sections were opened: half a repo review is not a review.
+    assert "__SECTION_START__" not in out
+
+
+def test_files_queued_behind_a_stop_never_reach_the_model(isolated_data_dir):
+    """
+    Concurrency 1, three files, the stop armed by the first review's completion.
+
+    Only the file already in flight does any work; the two still waiting on the
+    semaphore must bail at their own check. With the guard only in the driver's loop,
+    this test would see three calls and one published section — the version of Stop
+    that looks like a cancellation and behaves like a bill.
+    """
+    # `auth.py` carries security-sensitive constructs, which is what the planner
+    # reads as "worth a call of its own"; the other two go into a shared batch
+    # request. Both paths are counted, because "the model was not called again" has to
+    # be true of the batch path too or the test proves nothing about a 60-file repo.
+    files = [
+        {"file_path": "pkg/auth.py", "file_name": "auth.py", "language": "py",
+         "content": ORDINARY + "\nimport hashlib\nhashlib.md5(b'x')\n"},
+        {"file_path": "pkg/b.py", "file_name": "b.py", "language": "py", "content": ORDINARY},
+        {"file_path": "pkg/c.py", "file_name": "c.py", "language": "py", "content": ORDINARY},
+    ]
+    calls: list[str] = []
+    state = {"armed": False}
+
+    async def review(file_name, content, language, repo_context="", model_override=""):
+        calls.append(f"single:{file_name}")
+        state["armed"] = True
+        yield f"model review for {file_name}"
+
+    async def batch(files_slice, repo_context_map=None, model_override=""):
+        calls.append(f"batch:{len(files_slice)}")
+        for info in files_slice:
+            yield block(info["file_name"], f"## {info['file_name']}")
+
+    async def stopping():
+        return state["armed"]
+
+    out = _run(files, review_impl=review, batch_impl=batch, should_stop=stopping, concurrency=1)
+    markers = _markers_of(out)
+
+    assert calls == ["single:auth.py"], f"expected one in-flight call, got {calls}"
+    cancelled = next(m for m in markers if m["step"] == "cancelled")
+    # `published` counts sections the reader was actually given. auth.py's review was
+    # paid for and finished, but the reader had gone, so it is not something anyone
+    # received — and the marker's whole job is to say what is missing.
+    assert cancelled["files_skipped"] == ["auth.py", "b.py", "c.py"]
+    assert cancelled["not_reviewed"] == 3
+    assert cancelled["published"] == 0
+    assert "model review for a.py" not in out
+
+
+def test_a_stopped_run_is_not_reported_as_a_set_of_failures():
+    """
+    Cancellation is a state, not an error, and must not wear error clothing.
+
+    The tempting implementation routes a stop through the same fallback path as a
+    provider failure, which would mark every unreviewed file "static analysis shown —
+    model call failed". A reader then hunts for a broken model that was never the
+    problem, and the run's coverage numbers become wrong in the interesting
+    direction.
+    """
+    files = [{"file_path": f"pkg/{n}.py", "file_name": f"{n}.py", "language": "py",
+              "content": ORDINARY} for n in ("a", "b", "c")]
+
+    async def always_stopped():
+        return True
+
+    out = _run(files, should_stop=always_stopped)
+    markers = _markers_of(out)
+
+    assert "__ERROR__" not in out
+    assert not any(m["step"] in ("tool_error",) for m in markers)
+    assert "Static analysis shown" not in out
+    assert not any(m["step"] == "coverage" for m in markers), "a stopped run has no coverage to report"
+
+
+def test_a_run_without_a_stop_predicate_is_unchanged():
+    """The default path must not gain a cancelled marker or a lost section."""
+    from app.services.stream_protocol import SECTION_CLOSE, SECTION_OPEN
+
+    files = [{"file_path": f"pkg/{n}.py", "file_name": f"{n}.py", "language": "py",
+              "content": ORDINARY} for n in ("a", "b")]
+
+    out = _run(files)
+    markers = _markers_of(out)
+
+    assert not any(m["step"] == "cancelled" for m in markers)
+    # One section per file, plus the repo summary that only a completed run writes.
+    opened = [
+        json.loads(line.split(SECTION_OPEN)[1].split(SECTION_CLOSE)[0])["id"]
+        for line in out.splitlines() if line.startswith(SECTION_OPEN)
+    ]
+    # One section per file, plus the repo summary that only a completed run writes.
+    assert opened == ["pkg/a.py", "pkg/b.py", "__repo_summary__"], opened

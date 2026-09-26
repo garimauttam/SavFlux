@@ -28,7 +28,9 @@ on-topic context within the same token budget.
 """
 
 import logging
-from typing import AsyncGenerator, Literal
+import time
+from contextlib import aclosing
+from typing import AsyncGenerator, Awaitable, Callable, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -41,6 +43,12 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 WriteMode = Literal["generate", "edit", "tests"]
+
+#: How often an in-flight generation asks whether anyone is still listening.
+#: Checking every token would call into Starlette's receive once per token; checking
+#: never would ignore a Stop for the whole generation. 32 tokens is the compromise:
+#: the worst case is a fraction of a second of work nobody reads.
+_STOP_CHECK_EVERY = 32
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
@@ -86,9 +94,17 @@ async def stream_code_write(
     file_name: str,
     context_sources: list[str],
     mode: WriteMode = "generate",
+    should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Stream generated/edited/tested code.
+
+    `should_stop` (the route wires it to `Request.is_disconnected`) is consulted
+    before the context read, before the model is asked, and then every
+    `_STOP_CHECK_EVERY` tokens. A generation nobody is waiting for is the most
+    expensive thing this product can do on a machine whose whole selling point is
+    that it costs nothing, so an abandoned write should end within a few tokens
+    rather than running to its natural conclusion.
 
     Args:
         prompt:          User's description of what to build/change/test.
@@ -99,14 +115,43 @@ async def stream_code_write(
                          target file; remaining are style references.
         mode:            "generate" | "edit" | "tests"
     """
+    async def _never_stopped() -> bool:
+        return False
+
+    stop = should_stop or _never_stopped
+    started_at = time.monotonic()
+
+    def cancelled(message: str, **fields) -> str:
+        """
+        The closing marker for a run the reader abandoned.
+
+        A stopped write is reported as a stop, not an error, and the only number it
+        carries is the elapsed time of the run that really happened — no stage that
+        never finished is given a duration.
+        """
+        return status_event(
+            message, step="cancelled", mode=mode,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            **fields,
+        )
+
     increment_request("write")
     llm = get_chat_llm(streaming=True).with_config(callbacks=[get_token_callback()])
+
+    if await stop():
+        yield cancelled("Write stopped before it started — no context read, no model call")
+        return
 
     # ── Step 1: Fetch file content from ChromaDB ──────────────────────────────
     target_content  = ""   # full content of the file being edited/tested
     context_text    = ""   # style-reference snippets for generate mode
 
     if context_sources:
+        if await stop():
+            # The vector-store read is a database round-trip per source; it is worth
+            # skipping for a reader who is gone, and its result would be thrown away.
+            yield cancelled("Write stopped before the context read", sources=len(context_sources))
+            return
         yield status_event(f"Fetching context from {len(context_sources)} file(s)…", step="context")
 
         try:
@@ -285,14 +330,32 @@ async def stream_code_write(
         system = GENERATE_SYSTEM_PROMPT
 
     # ── Step 3: Stream the response ───────────────────────────────────────────
+    if await stop():
+        # The single most valuable check in this function: the prompt is built, the
+        # model would now be handed a full generation, and nobody is left to read it.
+        yield cancelled("Write stopped before the model call — nothing was generated")
+        return
+
     messages = [
         SystemMessage(content=system),
         HumanMessage(content=user_message),
     ]
 
+    # `aclosing` matters: breaking out of an `async for` leaves the provider's HTTP
+    # stream to be closed whenever the garbage collector feels like it, which on
+    # this box can be long after the run is meant to be over.
+    tokens = 0
     try:
-        async for chunk in llm.astream(messages):
-            if chunk.content:
-                yield chunk.content
+        async with aclosing(llm.astream(messages)) as stream:
+            async for chunk in stream:
+                if chunk.content:
+                    tokens += 1
+                    yield chunk.content
+                if tokens % _STOP_CHECK_EVERY == 0 and await stop():
+                    yield cancelled(
+                        f"Write stopped after {tokens} token(s) — the file is incomplete",
+                        tokens=tokens, incomplete=True,
+                    )
+                    return
     except Exception as e:
         yield error_event(str(e))

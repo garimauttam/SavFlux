@@ -8,6 +8,8 @@ Covers the two most critical security + correctness properties:
   4. Valid paste starts streaming (SSE format check)
 """
 
+import inspect
+
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -109,3 +111,75 @@ def test_review_paste_valid_code_streams(client):
     body = response.text
     assert "__STATUS__" in body
     assert "Bugs & Risks" in body
+
+
+# ── Stop handshake: the routes must forward the reader's disconnect ────────────
+#
+# The services take a `should_stop` predicate and refuse to spend a model call once
+# it says the reader is gone — but that is dead code unless the route hands them the
+# one signal FastAPI has for it. These three tests pin the wiring, because a
+# cancellation that exists only in the service layer has never been observed by a
+# user: the button works exactly as far as the request goes.
+
+def _disconnect_probe(client, url: str, payload: dict, target: str):
+    """Call `url` with a captured streaming function and return what it received."""
+    seen: dict = {}
+
+    async def fake(*args, **kwargs):
+        seen.update(kwargs)
+        if False:
+            yield ""
+
+    with patch(target, side_effect=fake):
+        response = client.post(url, json=payload)
+
+    assert response.status_code == 200, response.text
+    return seen
+
+
+def test_review_paste_forwards_the_readers_disconnect(client):
+    """`/review/paste` must pass `should_stop`, or Stop only stops the printing."""
+    seen = _disconnect_probe(
+        client, "/api/v1/review/paste",
+        {"code": "def hello(): pass", "file_name": "test.py", "language": "python"},
+        "app.api.review.stream_fast_code_review",
+    )
+
+    assert callable(seen.get("should_stop")), f"no predicate forwarded: {sorted(seen)}"
+    # Not just any callable: it has to be the async disconnect check, since awaiting
+    # a sync callable inside the stream would block the event loop the stream runs on.
+    assert inspect.iscoroutinefunction(seen["should_stop"])
+
+
+def test_review_file_forwards_the_readers_disconnect(client, tmp_path):
+    """`/review/file` shares the call site, so it shares the guarantee."""
+    target = tmp_path / "sample.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    seen = _disconnect_probe(
+        client, "/api/v1/review/file",
+        {"file_path": str(target), "file_name": "sample.py", "language": "python"},
+        "app.api.review.stream_fast_code_review",
+    )
+
+    assert callable(seen.get("should_stop"))
+
+
+def test_review_multi_forwards_the_readers_disconnect(client, tmp_path):
+    """
+    The repo-wide review is where cancellation pays: N files, N model calls.
+
+    The multi route had no `Request` in hand for its streaming body at all — the
+    disconnect is threaded through `stream_multi_review`, and this is what catches a
+    refactor that drops the keyword while the service keeps its parameter.
+    """
+    first = tmp_path / "a.py"
+    first.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    seen = _disconnect_probe(
+        client, "/api/v1/review/multi",
+        {"files": [{"file_path": str(first), "file_name": "a.py", "language": "py"}]},
+        "app.api.review.stream_multi_review",
+    )
+
+    assert callable(seen.get("should_stop"))

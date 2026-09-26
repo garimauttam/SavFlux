@@ -54,7 +54,7 @@ review reported was "it finished".
 import asyncio
 import logging
 import re
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -557,8 +557,39 @@ def _deterministic_repo_summary(
 
 # ── Main entry point ───────────────────────────────────────────────────────────
 
+async def _reap(tasks: list[asyncio.Task]) -> None:
+    """
+    Cancel what is still running and wait for it, rather than abandoning it.
+
+    A generator that returns leaves its tasks pending, and asyncio then either runs
+    the very model calls the Stop was meant to avoid or logs "Task was destroyed but
+    it is pending" — so cancellation has to be awaited to count as done. The
+    exceptions are swallowed on purpose: a `CancelledError` from a worker a reader
+    stopped is not a failure to report anywhere.
+    """
+    pending = [task for task in tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _cancelled_marker(files: list[dict], streamed: set[int], started_at: float) -> str:
+    """The closing marker for a review a reader stopped."""
+    missing = [files[idx].get("file_name", "?") for idx in range(len(files)) if idx not in streamed]
+    return status_event(
+        f"Stopped — {len(missing)} of {len(files)} file(s) were not reviewed",
+        step="cancelled",
+        elapsed_ms=int((_time.monotonic() - started_at) * 1000),
+        published=len(streamed),
+        not_reviewed=len(missing),
+        files_skipped=missing,
+    )
+
+
 async def stream_multi_review(
     files: list[dict],
+    should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Stream a planned, batched, cached review of multiple files.
@@ -572,7 +603,31 @@ async def stream_multi_review(
     Every model result is cached under a key derived from the file content, the
     model and the planner version, so re-reviewing an unchanged file costs a
     dictionary lookup instead of a call. Cache hits are labelled in the output.
+
+    `should_stop` is an async predicate checked before every model call and between
+    streamed sections; the route hands it `Request.is_disconnected`, so closing the
+    tab ends the run instead of paying for it. The saving is the point — a 60-file
+    repo review is minutes of a local model's time, and the browser has already gone.
+    Files that were never started are named in a closing `cancelled` marker rather
+    than left as blank sections, which is what separates "stopped here" from
+    "reviewed nothing and said nothing".
     """
+    async def _never_stopped() -> bool:
+        return False
+
+    stop = should_stop or _never_stopped
+    # Set once the reader is known to be gone. The workers check this flag as well
+    # as the predicate: after a Stop, `is_disconnected` stays true, but a task that
+    # is already past its check must not start a *second* model call, and a cached
+    # lookup should not be paid for either.
+    abandoned = False
+    #: Indexes whose section has been yielded — the "what did you actually review"
+    #: set the closing marker counts against the plan.
+    streamed: set[int] = set()
+
+    async def stopping() -> bool:
+        return abandoned or await stop()
+
     settings     = get_settings()
     n            = len(files)
     review_mode  = getattr(settings, "review_mode", "fast")
@@ -682,6 +737,8 @@ async def stream_multi_review(
 
     # ── Phase 1+2: static work and model work ─────────────────────────────────
     async def run_static(idx: int) -> list[tuple[int, str, bool, str | None]]:
+        if await stopping():
+            return []
         cached = _cache_read(idx, "static")
         if cached is not None:
             return [(idx, cached + _provenance(idx, "static"), True, None)]
@@ -690,6 +747,8 @@ async def stream_multi_review(
         return [(idx, text, False, None)]
 
     async def run_single(idx: int) -> list[tuple[int, str, bool, str | None]]:
+        if await stopping():
+            return []
         cached = _cache_read(idx, "single")
         if cached is not None:
             return [(idx, cached + _provenance(idx, "single"), True, None)]
@@ -704,6 +763,11 @@ async def stream_multi_review(
 
         queued_at = _time.monotonic()
         async with semaphore:
+            # The check belongs here, not only at entry: a file that queued behind
+            # the semaphore for two minutes has had two chances to be cancelled, and
+            # the call it is about to make is the expensive one.
+            if await stopping():
+                return []
             waited_ms = int((_time.monotonic() - queued_at) * 1000)
             route = plan.of(idx).route
             model_override = "" if route == ROUTE_FULL else route
@@ -765,6 +829,8 @@ async def stream_multi_review(
         return [(idx, text, False, reason or "model unavailable")]
 
     async def run_batch(batch_id: str) -> list[tuple[int, str, bool, str | None]]:
+        if await stopping():
+            return []
         batch = plan.batches[batch_id]
         members = [files[i] for i in batch.indexes]
         names = [m["file_name"] for m in members]
@@ -790,6 +856,8 @@ async def stream_multi_review(
 
         queued_at = _time.monotonic()
         async with semaphore:
+            if await stopping():
+                return []
             waited_ms = int((_time.monotonic() - queued_at) * 1000)
             tokens: list[str] = []
 
@@ -860,6 +928,11 @@ async def stream_multi_review(
     # Batches resolve into several file sections from one completed task.
     for coro in asyncio.as_completed(tasks):
         results = await coro
+        if await stopping():
+            abandoned = True
+            await _reap(tasks)
+            yield _cancelled_marker(files, streamed, started_at)
+            return
         for idx, review_text, was_cached, fallback_reason in results:
             file_info = files[idx]
             file_name = file_info["file_name"]
@@ -867,6 +940,7 @@ async def stream_multi_review(
             dispatch  = plan.of(idx)
 
             yield _section_payload(file_info)
+            streamed.add(idx)
 
             if was_cached:
                 cache_hits.add(idx)

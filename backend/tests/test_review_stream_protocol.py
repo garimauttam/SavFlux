@@ -418,3 +418,144 @@ def test_a_review_cut_off_by_the_clock_says_so():
     assert done[0]["forced"] is True
     assert done[0]["iterations"] == 8, "the ceiling it hit, not a made-up number"
     assert any(m["step"] == "writing" and m.get("forced") for m in markers)
+
+
+# ── Cancellation: a reader who leaves must stop costing the model ──────────────
+
+
+class _CountingLLM(_FakeLLM):
+    """The same fake, but it records whether a generation was ever started."""
+
+    def __init__(self, replies):
+        super().__init__(replies)
+        self.streams = 0
+        self.calls = 0
+
+    # The agentic path binds tools; a fake that cannot is a fake of the fast path.
+    def bind_tools(self, _tools):
+        return self
+
+    async def astream(self, messages):
+        self.streams += 1
+        for reply in self._replies:
+            yield _Chunk(reply)
+
+    async def ainvoke(self, _messages):
+        self.calls += 1
+        return SimpleNamespace(content="", tool_calls=[])
+
+
+async def _stopped():
+    return True
+
+
+def test_a_stopped_fast_review_never_starts_the_model():
+    """
+    `should_stop` true at the model boundary: the fake is never entered.
+
+    The static analysis still reports its cost, because it finished and that number
+    is true; the marker is `cancelled`, not `complete`, because a review nobody read
+    is not a review that happened. Asserting `streams == 0` is the whole test — the
+    version that only stops printing would pass every other assertion here.
+    """
+    from app.services import review_agent
+
+    llm = _CountingLLM(["## Score\n9"])
+    with patch.object(review_agent, "get_review_llm", lambda *_a, **_k: llm):
+        out = asyncio.run(_drive(review_agent.stream_fast_code_review(
+            "auth.py", ORDINARY, "python", should_stop=_stopped,
+        )))
+    markers, prose = _markers_and_prose(out)
+
+    assert llm.streams == 0
+    assert not any(m["step"] == "complete" for m in markers)
+    cancelled = next(m for m in markers if m["step"] == "cancelled")
+    assert cancelled["mode"] == "fast" and cancelled["stopped_before_model"] is True
+    assert isinstance(cancelled["analysis_ms"], int)
+    assert "findings" in cancelled and "llm_ms" not in cancelled
+    assert prose.strip() == ""
+
+
+def test_a_stopped_agentic_review_does_not_run_an_iteration():
+    """
+    The deep review's loop is up to eight model calls, and Stop must end all of them.
+
+    `ainvoke` never being called is the claim: the guard sits at the top of the loop,
+    not at the end, so a disconnect arriving between rounds is honoured before the
+    next round starts rather than after it finishes.
+    """
+    from app.services import review_agent
+
+    llm = _CountingLLM(["## Score\n9"])
+    with patch.object(review_agent, "get_review_llm", lambda *_a, **_k: llm):
+        out = asyncio.run(_drive(review_agent.stream_code_review(
+            "net.py", ORDINARY, "python", should_stop=_stopped,
+        )))
+    markers, _prose = _markers_and_prose(out)
+
+    assert llm.calls == 0 and llm.streams == 0
+    assert not any(m["step"] == "complete" for m in markers)
+    cancelled = next(m for m in markers if m["step"] == "cancelled")
+    assert cancelled["mode"] == "agentic"
+    assert cancelled["iterations"] == 0 and cancelled["tools_run"] == 0
+    assert cancelled["max_iterations"] == 8
+
+
+def test_a_stop_between_rounds_reports_the_work_that_actually_ran():
+    """
+    One round with a real tool, then the reader leaves.
+
+    The marker has to say `iterations: 1, tools_run: 1` — the round finished and the
+    tool executed. `tool_calls`, the field the completion marker carries, counts what
+    the model *asked for*, which on this path is the same number by accident; a
+    cancelled run reports executed work under its own name so the two can never be
+    quietly merged.
+    """
+    from app.services import review_agent
+
+    asked = {"n": 0}
+
+    class _ToolHappyLLM(_CountingLLM):
+        async def ainvoke(self, _messages):
+            asked["n"] += 1
+            return SimpleNamespace(content="", tool_calls=[{
+                "name": "get_function_list", "args": {}, "id": f"call-{asked['n']}",
+            }])
+
+    llm = _ToolHappyLLM([])
+    # The predicate is consulted once per round and once per tool, so the third
+    # question is the top of round 2 — the point at which a Stop arrives "between
+    # rounds" with round 1 fully behind it.
+    seen = {"i": 0}
+
+    async def stopping():
+        seen["i"] += 1
+        return seen["i"] > 2
+
+    with patch.object(review_agent, "get_review_llm", lambda *_a, **_k: llm):
+        out = asyncio.run(_drive(review_agent.stream_code_review(
+            "net.py", ORDINARY, "python", should_stop=stopping,
+        )))
+    markers, _prose = _markers_and_prose(out)
+
+    assert asked["n"] == 1, "the loop kept asking the model after the reader left"
+    assert llm.streams == 0, "a cancelled deep review still wrote a review"
+    cancelled = next(m for m in markers if m["step"] == "cancelled")
+    assert cancelled["iterations"] == 1
+    assert cancelled["tools_run"] == 1
+    done = [m for m in markers if m["step"] == "tool_done"]
+    assert len(done) == 1 and done[0]["tool"] == "get_function_list"
+
+
+def test_a_review_with_no_stop_predicate_is_unchanged():
+    """No predicate means no cancellation and no cancelled marker, in either mode."""
+    from app.services import review_agent
+
+    for name, kwargs in (("auth.py", {}), ("net.py", {})):
+        with patch.object(review_agent, "get_review_llm", lambda *_a, **_k: _CountingLLM(["## Score\n9"])):
+            fn = (review_agent.stream_fast_code_review if name == "auth.py"
+                  else review_agent.stream_code_review)
+            out = asyncio.run(_drive(fn(name, ORDINARY, "python", **kwargs)))
+        markers, _prose = _markers_and_prose(out)
+        assert not any(m["step"] == "cancelled" for m in markers)
+        assert any(m["step"] == "complete" for m in markers)

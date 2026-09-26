@@ -22,7 +22,7 @@ import asyncio
 import json
 import re
 import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -354,17 +354,40 @@ Overall score with one-line reasoning. Base it on the metrics above.\
 
 # ── Agentic review (single-file deep mode) ────────────────────────────────────
 
+def _review_cancelled(file_name: str, mode: str, started_at: float, **facts) -> str:
+    """
+    The marker for a review whose reader went away.
+
+    It is not a `complete` marker, and that distinction is the whole point: a review
+    that stopped after two of eight iterations produced no verdict, and a client told
+    otherwise would show an empty review as a finished one and count the run as a
+    success. The only duration it carries is the elapsed wall time of the run that
+    really happened; stages that never ran are absent, not zero.
+    """
+    return status_event(
+        f"Review stopped: `{file_name}`",
+        step="cancelled", mode=mode,
+        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+        **facts,
+    )
+
+
 async def stream_code_review(
     file_name: str,
     file_content: str,
     language: str = "",
     repo_context: str = "",
     model_override: str = "",
+    should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     ReAct-loop agentic review. Used for single-file deep reviews.
     Each file costs 3–9 LLM calls but produces the most thorough output.
     """
+    async def _never_stopped() -> bool:
+        return False
+
+    stop = should_stop or _never_stopped
     increment_request("review")
     llm           = get_review_llm(model_override, streaming=False)
     streaming_llm = get_review_llm(model_override, streaming=True)
@@ -411,10 +434,23 @@ async def stream_code_review(
             iterations=iterations, tool_calls=tool_calls, forced=forced,
         )
 
+    # Tools actually executed, as opposed to `tool_calls`, which counts the ones the
+    # model asked for. A cancelled run reports what ran, and the two numbers differ.
+    tools_run = 0
+
     try:
         for iteration in range(max_iters):
             if time.monotonic() - start_time > max_secs:
                 break  # fall through to forced final generation
+            if await stop():
+                # The saving this guard exists for: every remaining round of this
+                # loop is another model call on a machine the user just walked away
+                # from, and the loop runs up to eight of them.
+                yield _review_cancelled(
+                    file_name, "agentic", start_time,
+                    iterations=iteration, tools_run=tools_run, max_iterations=max_iters,
+                )
+                return
             response = await llm_with_tools.with_config(callbacks=[get_token_callback()]).ainvoke(messages)
             messages.append(response)
             if response.tool_calls:
@@ -433,6 +469,15 @@ async def stream_code_review(
                     )
                     fn = tool_map.get(tc["name"])
                     called_at = time.monotonic()
+                    if await stop():
+                        # A tool is a repo read or a grep, not a model call, so this
+                        # is about not paying for the *next* round rather than about
+                        # saving seconds.
+                        yield _review_cancelled(
+                            file_name, "agentic", start_time,
+                            iterations=iteration, tools_run=tools_run, max_iterations=max_iters,
+                        )
+                        return
                     try:
                         result = await asyncio.to_thread(fn.invoke, tc["args"]) if fn else f"Unknown tool: {tc['name']}"
                         ok = fn is not None
@@ -446,6 +491,7 @@ async def stream_code_review(
                         preview=[_one_line(line) for line in str(result).splitlines()[:3]],
                         preview_more=max(0, len(str(result).splitlines()) - 3),
                     )
+                    tools_run += 1
                     messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
             else:
                 # LLM chose not to call tools — write the review now
@@ -498,6 +544,7 @@ async def stream_fast_code_review(
     language: str = "",
     repo_context: str = "",
     model_override: str = "",
+    should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Low-latency review: parallel deterministic tools → single LLM streaming pass.
@@ -506,6 +553,10 @@ async def stream_fast_code_review(
     per batch by multi_review_agent. It tells the LLM which other files import
     this one, what it exports, and which types/services it depends on — enabling
     cross-file findings without reviewing every file with the LLM.
+
+    `should_stop` is consulted once, immediately before the model is asked. This path
+    makes a single call, so there is no queue to drain — but a review nobody is waiting
+    for still occupies the model that the next user needs.
 
     model_override: if non-empty, routes the LLM call to a specific Ollama model
     (set by the LLM router in multi_review_agent based on the file's triage score).
@@ -521,6 +572,11 @@ async def stream_fast_code_review(
     yield status_event(f"Scanning `{file_name}`…", step="starting", mode="fast")
 
     started_at = time.monotonic()
+
+    async def _never_stopped() -> bool:
+        return False
+
+    stop = should_stop or _never_stopped
 
     try:
         # One AST parse replaces three overlapping regex tools. The analyzer
@@ -564,6 +620,15 @@ async def stream_fast_code_review(
                 "Say 'None found' for any section that is clean."
             )),
         ]
+
+        if await stop():
+            # The static analysis ran and is reported, because it finished. What must
+            # not happen is the call that follows it.
+            yield _review_cancelled(
+                file_name, "fast", started_at,
+                analysis_ms=analysis_ms, findings=len(analysis.findings), stopped_before_model=True,
+            )
+            return
 
         raw_stream = (
             chunk.content
