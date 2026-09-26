@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -33,7 +34,7 @@ from pathlib import Path
 # Add backend directory to sys.path for direct script execution
 sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence
 from langchain_core.documents import Document
 from app.services.hybrid_retriever import (
     BM25Index,
@@ -363,6 +364,182 @@ def _empty_leg() -> Dict[str, Any]:
     return {"hits": 0, "ranks": [], "symbol_hits": 0, "symbols_expected": 0}
 
 
+# ── Latency attribution ───────────────────────────────────────────────────────
+#
+# The harness used to print one `avg_latency_ms` per query, measured from a single
+# `t0` at the top of the loop. Two things were wrong with that. It could not answer
+# the only question a latency number is for — *which stage* moved — so a reranker
+# regression and a query-expansion regression looked identical. And the window it
+# measured ended after the leg-scoring code, which joins every retrieved chunk back
+# into parent text to check symbol coverage: work the harness does and production
+# never does. The published latency therefore included the scoring of the benchmark,
+# and the more legs you added, the "slower" retrieval got.
+#
+# So: one clock per query, one mark per stage, and the scoring stage measured under
+# its own name so it can be excluded honestly rather than quietly.
+
+#: The one stage that is not product work. Measured so it can be reported and left
+#: out of the totals, never folded into them.
+HARNESS_STAGE = "score"
+
+
+class _StageClock:
+    """Wall time per named stage of one query's retrieval, in milliseconds."""
+
+    def __init__(self) -> None:
+        self._at = time.monotonic()
+        self._ms: Dict[str, float] = {}
+
+    def mark(self, stage: str) -> None:
+        """Close `stage`: everything since the previous mark belongs to it."""
+        now = time.monotonic()
+        self._ms[stage] = self._ms.get(stage, 0.0) + (now - self._at) * 1000
+        self._at = now
+
+    def as_dict(self) -> Dict[str, float]:
+        return {stage: round(ms, 2) for stage, ms in self._ms.items()}
+
+    def product_ms(self) -> float:
+        return round(sum(ms for stage, ms in self._ms.items() if stage != HARNESS_STAGE), 2)
+
+
+def _percentile(values: Sequence[float], pct: float) -> Optional[float]:
+    """
+    Nearest-rank percentile, no interpolation.
+
+    Deliberately not numpy-style interpolated percentiles: a benchmark number should
+    be a sample that actually happened, and with ~40 queries interpolation invents a
+    latency no query ever paid. Returns None for no samples, so a caller cannot read
+    "no data" as "zero".
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(pct / 100 * len(ordered)) - 1))
+    return round(ordered[index], 2)
+
+
+def _latency_stats(values: Sequence[float]) -> Dict[str, Any]:
+    if not values:
+        return {"avg": None, "p50": None, "p95": None, "max": None, "samples": 0}
+    return {
+        "avg": round(sum(values) / len(values), 2),
+        "p50": _percentile(values, 50),
+        "p95": _percentile(values, 95),
+        "max": round(max(values), 2),
+        "samples": len(values),
+    }
+
+
+def _stage_stats(samples: Sequence[Dict[str, float]]) -> Dict[str, Dict[str, Any]]:
+    """Per-stage stats over the same queries as the total, dominant stage first."""
+    names = sorted({stage for sample in samples for stage in sample})
+    stats = {name: _latency_stats([s[name] for s in samples if name in s]) for name in names}
+    return dict(sorted(stats.items(), key=lambda item: -(item[1]["p50"] or 0)))
+
+
+#: Headline quality metrics, with the direction that counts as an improvement.
+QUALITY_METRICS = {
+    "hit_rate_at_k": "higher",
+    "mean_reciprocal_rank_mrr": "higher",
+    "symbol_recall_pct": "higher",
+    "precision_at_k_pct": "higher",
+}
+
+#: Latency metrics: a bigger number is worse, so the sign convention is inverted.
+LATENCY_METRICS = {
+    "avg_latency_ms": "lower",
+    "latency_ms.p50": "lower",
+    "latency_ms.p95": "lower",
+}
+
+
+def _lookup(nested: Dict[str, Any], dotted: str) -> Any:
+    node: Any = nested
+    for part in dotted.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def compare_results(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Stage-by-stage and metric-by-metric deltas between two runs.
+
+    A single "latency went up 8%" is not actionable; "fuse went up 340%, everything
+    else flat" is. Quality and latency are reported in the same table because a
+    speedup that costs recall is not a speedup, and the harness is the place where
+    that trade is supposed to be visible.
+    """
+    base_m = baseline.get("metrics", {})
+    cur_m = current.get("metrics", {})
+    rows: List[Dict[str, Any]] = []
+
+    def add(key: str, better: str, before: Any, after: Any) -> None:
+        def record(delta: Optional[float], pct: Optional[float], verdict: str) -> None:
+            rows.append({"metric": key, "baseline": before, "current": after,
+                         "delta": delta, "pct": pct, "better": better, "verdict": verdict})
+
+        if before is None or after is None:
+            # Absent in one file and present in the other: a metric added in this
+            # version, not a change. Saying "new baseline" would read as a result.
+            record(None, None, "no data")
+            return
+
+        delta = round(after - before, 3)
+        if delta == 0:
+            record(0.0, 0.0, "flat")
+            return
+        improved = delta > 0 if better == "higher" else delta < 0
+        if not before:
+            # A change out of (or into) a zero is a real change with no percentage.
+            # Dividing by zero to get "-100%" would be worse than saying nothing.
+            record(delta, None, ("better" if improved else "WORSE") + " from zero")
+            return
+        record(delta, round(delta / before * 100, 1), "better" if improved else "WORSE")
+
+    for key, better in QUALITY_METRICS.items():
+        add(key, better, base_m.get(key), cur_m.get(key))
+    for key, better in LATENCY_METRICS.items():
+        add(key, better, _lookup(base_m, key), _lookup(cur_m, key))
+
+    base_stages = base_m.get("stage_ms") or {}
+    cur_stages = cur_m.get("stage_ms") or {}
+    for stage in sorted(set(base_stages) | set(cur_stages)):
+        add(f"stage:{stage}", "lower",
+            _lookup(base_stages.get(stage) or {}, "p50"),
+            _lookup(cur_stages.get(stage) or {}, "p50"))
+    return rows
+
+
+def format_comparison(rows: List[Dict[str, Any]]) -> str:
+    """
+    A fixed-width table, because this output is read in a terminal and pasted into a
+    PR. The columns are separated by a space each — the first version of this packed
+    them edge to edge and the delta ran into the current value in the render.
+    """
+    lines = ["", "=" * 78, "         SAVFLUX BENCHMARK — DELTA vs BASELINE", "=" * 78]
+    lines.append(f"  {'metric':<26} {'baseline':>10} {'current':>10} {'delta':>10} {'change':>9}  verdict")
+    lines.append("  " + "-" * 74)
+
+    def fmt(value: Any) -> str:
+        if value is None:
+            return "—"
+        return f"{value:.3f}" if isinstance(value, float) else str(value)
+
+    for row in rows:
+        pct = "—" if row["pct"] is None else f"{row['pct']:+.1f}%"
+        lines.append(
+            f"  {row['metric']:<26} {fmt(row['baseline']):>10} {fmt(row['current']):>10} "
+            f"{fmt(row['delta']):>10} {pct:>9}  {row['verdict']}"
+        )
+    lines.append("")
+    lines.append("  Latency is measured on this machine; only compare runs taken on the")
+    lines.append("  same corpus, same top_k, and with the reranker in the same state.")
+    return "\n".join(lines)
+
+
 def _units_per_expected_file_stats(counts: List[int]) -> Dict[str, Any]:
     """
     How many retrieval units each query's expected file contributed.
@@ -467,6 +644,7 @@ async def evaluate_pipeline(
     symbol_hits = 0
     total_expected_symbols = 0
     latencies: List[float] = []
+    stage_samples: List[Dict[str, float]] = []
     precision_values: List[float] = []
     unit_counts: List[int] = []
 
@@ -484,16 +662,17 @@ async def evaluate_pipeline(
         )
         unit_counts.append(expected_file_units)
 
+        clock = _StageClock()
         query, file_scope = extract_file_scope(raw_query)
-
-        t0 = time.monotonic()
 
         # Same cheap query-variant strategy production uses, on both branches.
         variants = list(local_query_variants(query))
+        clock.mark("plan")
         bm25_lists = [
             bm25.search(query=variant, top_k=top_k * 3, file_filter=file_scope)
             for variant in variants
         ]
+        clock.mark("lexical")
         # The dense branch searches WINDOWS, and many of them belong to the same
         # file, so its candidates are collapsed to one entry per file before being
         # compared against the BM25 branch — whose corpus is already one entry per
@@ -510,6 +689,10 @@ async def evaluate_pipeline(
             dedupe_to_parents(dense.search(query=variant, top_k=len(dense_docs)))[: top_k * 3]
             for variant in variants
         ]
+        # Embedding the query is part of `dense`, not its own stage: with the
+        # offline embedder it is a hash, and reporting it separately would be a
+        # number that describes the fake model rather than anything a user pays.
+        clock.mark("dense")
 
         # ── Each leg, scored independently ───────────────────────────────────
         leg_rankings = {
@@ -519,6 +702,8 @@ async def evaluate_pipeline(
             # which would give BM25 N× the weight for N query variants.
             "fused": two_branch_rrf(dense_lists, bm25_lists, top_n=top_k * 3),
         }
+
+        clock.mark("fuse")
 
         if rerank_enabled:
             inner_reranked = await rerank(query, leg_rankings["fused"], top_n=top_k)
@@ -531,6 +716,7 @@ async def evaluate_pipeline(
             leg_rankings["fused_reranked"] = inner_reranked
         else:
             leg_rankings["fused_reranked"] = leg_rankings["fused"]
+        clock.mark("rerank")
 
         for leg_name, ranking in leg_rankings.items():
             leg = legs[leg_name]
@@ -551,11 +737,17 @@ async def evaluate_pipeline(
             leg["symbol_hits"] += sum(1 for s in expected_syms if s in leg_text)
             leg["symbols_expected"] += len(expected_syms)
 
+        # Everything above this line that is not scoring is retrieval a user pays
+        # for; everything between the leg loop and here is the harness reading its
+        # own work back. Marked before the total so `product_ms` excludes it.
+        clock.mark(HARNESS_STAGE)
+
         # The headline metrics follow production: fused, then reranked.
         ranked_docs = leg_rankings["fused_reranked"]
 
-        latency_ms = (time.monotonic() - t0) * 1000
+        latency_ms = clock.product_ms()
         latencies.append(latency_ms)
+        stage_samples.append(clock.as_dict())
 
         # ── Hit Rate & MRR ────────────────────────────────────────────────────
         rank = _rank_of(ranked_docs, target_file)
@@ -585,7 +777,8 @@ async def evaluate_pipeline(
             "symbols_matched": len(matched_symbols),
             "symbols_expected": len(expected_syms),
             "expected_file_units": expected_file_units,
-            "latency_ms": round(latency_ms, 1),
+            "latency_ms": latency_ms,
+            "stage_ms": clock.as_dict(),
         }
         query_results.append(result)
 
@@ -643,6 +836,16 @@ async def evaluate_pipeline(
             "mean_reciprocal_rank_mrr": round(mrr, 3),
             "symbol_recall_pct": round(sym_recall * 100, 2),
             "avg_latency_ms": round(avg_latency, 1),
+            # The distribution, not just the mean: a retrieval path that is 40 ms
+            # for 39 queries and 4 s for one has a mean that describes nothing, and
+            # the tail is what a user notices.
+            "latency_ms": _latency_stats(latencies),
+            "stage_ms": _stage_stats(stage_samples),
+            "harness_ms": _latency_stats([s.get(HARNESS_STAGE, 0.0) for s in stage_samples]),
+            "latency_scope": (
+                "retrieval, fusion and reranking per query; excludes harness-side "
+                "symbol scoring, which is reported separately as `harness_ms`"
+            ),
             "precision_at_k_pct": round(
                 (sum(precision_values) / len(precision_values) if precision_values else 0.0) * 100,
                 2,
@@ -993,6 +1196,23 @@ def print_report(result: Dict[str, Any]) -> None:
     print(f"  Symbol Recall        : {m['symbol_recall_pct']}%")
     print(f"  Precision @ K        : {m['precision_at_k_pct']}%")
     print(f"  Avg latency          : {m['avg_latency_ms']} ms/query")
+    stats = m.get("latency_ms") or {}
+    if stats.get("p50") is not None:
+        print(f"                       p50 {stats['p50']} ms · p95 {stats['p95']} ms · "
+              f"max {stats['max']} ms  (product stages only)")
+    stages = m.get("stage_ms") or {}
+    shown = [(name, stage) for name, stage in stages.items()
+             if name != HARNESS_STAGE and stage.get("p50") is not None]
+    if shown:
+        total = sum(stage["p50"] for _, stage in shown) or 1.0
+        print("  Where the time goes    :")
+        for name, stage in shown:
+            share = stage["p50"] / total * 100
+            bar = "█" * max(1, int(share / 4))
+            print(f"      {name:<8} {bar:<26} p50 {stage['p50']:>7} ms  ({share:.0f}%)")
+    harness = (m.get("harness_ms") or {}).get("p50")
+    if harness is not None:
+        print(f"      (scoring the legs adds {harness} ms/query, not counted above)")
     if per_file:
         print(f"  Units per expected file: min {per_file['min']}  "
               f"median {per_file['median']}  p90 {per_file['p90']}  "
@@ -1097,6 +1317,26 @@ if __name__ == "__main__":
             "few-second run into several minutes and corrupts the latency metric."
         ),
     )
+    parser.add_argument(
+        "--compare",
+        metavar="BASELINE.json",
+        help=(
+            "Print the per-stage and per-metric delta against a previous run's "
+            "--json-out file. A total alone cannot tell a reranker regression from a "
+            "query-expansion one, which is the difference between two fixes."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-regression",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Exit 1 when p50 or p95 latency grew by more than PCT percent versus "
+            "--compare. Off by default: these numbers come from one machine, and a "
+            "laptop with a compiler running will exceed any fixed threshold. Treat a "
+            "threshold here as a smoke gate, not as a benchmark."
+        ),
+    )
     args = parser.parse_args()
 
     # Load dataset
@@ -1141,6 +1381,29 @@ if __name__ == "__main__":
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(result, indent=2))
+
+    rows = None
+    if args.compare:
+        baseline_path = Path(args.compare)
+        if not baseline_path.is_file():
+            raise SystemExit(f"--compare: no such file: {baseline_path}")
+        rows = compare_results(json.loads(baseline_path.read_text()), result)
+        print(format_comparison(rows))
+
+    if args.fail_on_regression is not None:
+        if not rows:
+            raise SystemExit("--fail-on-regression needs --compare to diff against")
+        threshold = args.fail_on_regression
+        offenders = [
+            row for row in rows
+            if row["metric"] in LATENCY_METRICS
+            and row["pct"] is not None
+            and row["pct"] > threshold
+        ]
+        if offenders:
+            for row in offenders:
+                print(f"  ⚠️  {row['metric']}: {row['pct']:+.1f}% (limit {threshold}%)")
+            raise SystemExit(1)
 
     if args.quiet:
         print(json.dumps(result))
