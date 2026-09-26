@@ -18,8 +18,6 @@ import { useLiveElapsed } from "./agent/AgentRunHeader";
 import { TimingBreakdown } from "./agent/TimingBreakdown";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
   Loader2,
   ChevronDown,
@@ -51,6 +49,7 @@ import { ApplyFixPanel } from "./ApplyFixPanel";
 import { StopButton } from "./StopButton";
 import { useReview } from "../hooks/useReview";
 import { useMultiReview, ReviewSection } from "../hooks/useMultiReview";
+import { CodeHighlight } from "../lib/highlight";
 
 interface ReviewPanelProps {
   indexedFiles: IndexedFile[];
@@ -519,14 +518,12 @@ const reviewMdComponents: React.ComponentProps<typeof ReactMarkdown>["components
       return (
         <div className="my-2 rounded-lg overflow-hidden border border-gray-700">
           <div className="px-3 py-1 bg-gray-900 border-b border-gray-700 text-xs text-gray-500 font-mono">{match[1]}</div>
-          <SyntaxHighlighter
-            style={vscDarkPlus}
+          <CodeHighlight
             language={match[1]}
-            PreTag="div"
             customStyle={{ margin: 0, borderRadius: 0, fontSize: "12px", background: "#0d1117" }}
           >
             {String(children).replace(/\n$/, "")}
-          </SyntaxHighlighter>
+          </CodeHighlight>
         </div>
       );
     }
@@ -1215,9 +1212,9 @@ export function ReviewPanel({
                       code({ className, children }: any) {
                         const match = /language-(\w+)/.exec(className || "");
                         return match ? (
-                          <SyntaxHighlighter style={vscDarkPlus} language={match[1]} PreTag="div" className="rounded-lg text-xs">
+                          <CodeHighlight language={match[1]} className="rounded-lg text-xs">
                             {String(children).replace(/\n$/, "")}
-                          </SyntaxHighlighter>
+                          </CodeHighlight>
                         ) : (
                           <code className="bg-gray-800 text-purple-300 px-1.5 py-0.5 rounded text-xs font-mono">{children}</code>
                         );

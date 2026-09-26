@@ -14,8 +14,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { diffLines, Change } from "diff";
 import {
   Wand2,
@@ -40,6 +38,7 @@ import { IndexedFile } from "../types";
 import { useCodeWriter } from "../hooks/useCodeWriter";
 import { StopButton } from "./StopButton";
 import { apiFetch } from "../api";
+import { CodeHighlight } from "../lib/highlight";
 
 interface CodeWriterPanelProps {
   indexedFiles: IndexedFile[];
@@ -832,15 +831,13 @@ export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
                                 </span>
                                 <CopyButton text={codeText} />
                               </div>
-                              <SyntaxHighlighter
-                                style={vscDarkPlus}
+                              <CodeHighlight
                                 language={match[1]}
-                                PreTag="div"
                                 className="!mt-0 !rounded-none text-xs"
                                 customStyle={{ margin: 0, borderRadius: 0 }}
                               >
                                 {codeText}
-                              </SyntaxHighlighter>
+                              </CodeHighlight>
                             </div>
                           ) : (
                             <code className={`px-1.5 py-0.5 rounded text-xs font-mono bg-gray-800 ${activeMode.color}`}>{children}</code>
