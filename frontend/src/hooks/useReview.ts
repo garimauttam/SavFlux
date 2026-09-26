@@ -18,6 +18,7 @@ import { useState, useCallback } from "react";
 import { IndexedFile } from "../types";
 import { apiFetch } from "../api";
 import { decodeStatus, drainMarkers, flushTail, REVIEW_TAGS } from "../lib/stream";
+import { applyTiming, EMPTY_TIMINGS, type ReviewTimings } from "../lib/timings";
 
 export interface AgentStep {
   tool?: string;
@@ -34,6 +35,11 @@ export interface ReviewState {
   currentStep: string | null;   // what the agent is doing right now
   currentMode: string | null;
   error: string | null;
+  /**
+   * What the server said this review cost, per stage. Empty until a marker that
+   * carries timing arrives — the panel renders nothing rather than a zero.
+   */
+  timings: ReviewTimings;
 }
 
 export function useReview() {
@@ -44,10 +50,11 @@ export function useReview() {
     currentStep: null,
     currentMode: null,
     error: null,
+    timings: EMPTY_TIMINGS,
   });
 
   const reviewFile = useCallback(async (file: IndexedFile) => {
-    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null });
+    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null, timings: EMPTY_TIMINGS });
 
     try {
       const response = await apiFetch("/api/v1/review/file", {
@@ -76,7 +83,7 @@ export function useReview() {
   }, []);
 
   const reviewPaste = useCallback(async (code: string, language: string, fileName: string) => {
-    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null });
+    setState({ isReviewing: true, review: "", agentSteps: [], currentStep: "Starting review...", currentMode: null, error: null, timings: EMPTY_TIMINGS });
 
     try {
       const response = await apiFetch("/api/v1/review/paste", {
@@ -100,13 +107,6 @@ export function useReview() {
     }
   }, []);
 
-  /**
-   * Shared stream consumer — parses STATUS markers out of the stream
-   * and routes them to agentSteps; everything else goes to `review`.
-   *
-   * Wrapped in useCallback so it has a stable reference and can safely
-   * be listed as a dependency if reviewFile/reviewPaste ever need it.
-   */
   /**
    * Shared stream consumer — splits STATUS/ERROR markers out of the stream and
    * routes them to agentSteps; the prose between them is the review.
@@ -152,6 +152,7 @@ export function useReview() {
           currentStep: message || null,
           currentMode: typeof meta.mode === "string" ? meta.mode : prev.currentMode,
           agentSteps: [...prev.agentSteps, { ...meta, message }].slice(-40),
+          timings: applyTiming(prev.timings, meta),
         }));
       }
     }
@@ -162,7 +163,7 @@ export function useReview() {
   }, []);
 
   const reset = useCallback(() => {
-    setState({ isReviewing: false, review: "", agentSteps: [], currentStep: null, currentMode: null, error: null });
+    setState({ isReviewing: false, review: "", agentSteps: [], currentStep: null, currentMode: null, error: null, timings: EMPTY_TIMINGS });
   }, []);
 
   return { ...state, reviewFile, reviewPaste, reset };

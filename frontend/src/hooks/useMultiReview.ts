@@ -15,6 +15,7 @@ import { useState, useCallback } from "react";
 import { IndexedFile } from "../types";
 import { apiFetch } from "../api";
 import { decodeStatus, drainMarkers, flushTail, REVIEW_TAGS } from "../lib/stream";
+import { applyTiming, EMPTY_TIMINGS, type ReviewTimings } from "../lib/timings";
 
 export interface ReviewSection {
   id: string;
@@ -99,6 +100,8 @@ export interface MultiReviewState {
   serverBatchCount?: number;      // how many batched calls that is
   serverModelCalls?: number;      // total model calls planned for this run
   serverCacheHits?: number;       // files answered from the content-hash cache
+  /** Per-stage cost, from the `planned` and `timing` markers. */
+  timings: ReviewTimings;
   // Derived accuracy fields (not part of useState, computed from sections)
   reviewAccuracy?: number;      // 0–100: % of file sections with real LLM review
   llmReviewedCount?: number;    // absolute count of LLM-reviewed files
@@ -115,6 +118,7 @@ export function useMultiReview() {
     totalFiles: 0,
     currentMode: null,
     error: null,
+    timings: EMPTY_TIMINGS,
   });
 
   const reviewFiles = useCallback(async (files: IndexedFile[]) => {
@@ -133,6 +137,7 @@ export function useMultiReview() {
       totalFiles: files.length,
       currentMode: null,
       error: null,
+      timings: EMPTY_TIMINGS,
     });
 
     try {
@@ -283,6 +288,7 @@ export function useMultiReview() {
             totalFiles: meta.total ?? prev.totalFiles,
             currentMode: meta.mode ?? prev.currentMode,
             agentSteps: [...prev.agentSteps, { ...meta, message }].slice(-80),
+            timings: applyTiming(prev.timings, meta),
             // Server-side coverage, from the `coverage` token — a count of what a
             // model actually saw, not what the text looks like it saw…
             ...(meta.step === "coverage" && {
@@ -339,6 +345,7 @@ export function useMultiReview() {
       totalFiles: 0,
       currentMode: null,
       error: null,
+      timings: EMPTY_TIMINGS,
     });
   }, []);
 

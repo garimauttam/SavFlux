@@ -392,6 +392,24 @@ async def stream_code_review(
     max_iters  = 8
     max_secs   = 90
     start_time = time.monotonic()
+    tool_calls = 0
+
+    def _agentic_done(*, iterations: int, forced: bool) -> str:
+        """
+        The review's own account of what it spent.
+
+        Every number here is measured inside this generator, so it excludes the
+        browser's own latency and includes the parts a reader cannot see from the
+        text: how many ReAct iterations ran, how many tools were called, whether
+        the loop was cut short by the time limit rather than finished. Without it
+        "the deep review is slow" has no answer to "slow because of what".
+        """
+        return status_event(
+            f"Review done: `{file_name}`",
+            step="complete", mode="agentic",
+            elapsed_ms=int((time.monotonic() - start_time) * 1000),
+            iterations=iterations, tool_calls=tool_calls, forced=forced,
+        )
 
     try:
         for iteration in range(max_iters):
@@ -400,6 +418,7 @@ async def stream_code_review(
             response = await llm_with_tools.with_config(callbacks=[get_token_callback()]).ainvoke(messages)
             messages.append(response)
             if response.tool_calls:
+                tool_calls += len(response.tool_calls)
                 for index, tc in enumerate(response.tool_calls):
                     # Same vocabulary the code agent uses: an id that pairs the
                     # two markers, the arguments the model actually passed, and a
@@ -442,6 +461,7 @@ async def stream_code_review(
                 )
                 async for token in _strip_think_tags(raw_stream):
                     yield token
+                yield _agentic_done(iterations=iteration + 1, forced=False)
                 return
 
         # Reached max_iters or timed out — force a final generation pass
@@ -463,6 +483,9 @@ async def stream_code_review(
         )
         async for token in _strip_think_tags(raw_stream):
             yield token
+        # Reached the iteration/time ceiling: the review still shipped, but only a
+        # `forced` flag tells a reader the model was cut off rather than done.
+        yield _agentic_done(iterations=max_iters, forced=True)
     except Exception as e:
         yield error_event(str(e))
 
@@ -496,6 +519,8 @@ async def stream_fast_code_review(
     trunc   = f"\n[Truncated — {len(file_content)} chars total]" if len(file_content) > 9000 else ""
 
     yield status_event(f"Scanning `{file_name}`…", step="starting", mode="fast")
+
+    started_at = time.monotonic()
 
     try:
         # One AST parse replaces three overlapping regex tools. The analyzer
@@ -547,6 +572,17 @@ async def stream_fast_code_review(
         )
         async for token in _strip_think_tags(raw_stream):
             yield token
+
+        # `elapsed_ms` is this file's whole review; `analysis_ms` is the part that
+        # cost no model at all. The split is the point: on a small local model the
+        # deterministic pre-pass is often a tenth of the run, and a single total
+        # hides both that fact and the opportunity.
+        yield status_event(
+            f"Review done: `{file_name}`",
+            step="complete", mode="fast",
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            analysis_ms=analysis_ms, findings=len(analysis.findings),
+        )
 
     except Exception as e:
         yield error_event(str(e))

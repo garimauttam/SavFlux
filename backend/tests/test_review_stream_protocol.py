@@ -311,3 +311,110 @@ def test_stage_markers_reach_the_chat_stream_in_order():
     assert [p.get("prev_step") for p in payloads[1:]] == [
         "planning", "dense-search", "lexical-search", "reranking", "generation",
     ]
+
+
+def test_a_fast_review_ends_by_saying_what_it_cost():
+    """
+    One `complete` per review, with the split a reader needs.
+
+    The single-file path used to stop mid-sentence: the stream sent `writing` and
+    then text, so "how long did that review take" had no answer from the server —
+    a browser could only measure its own wall clock, which includes the browser. And
+    a total alone is not a diagnosis: `analysis_ms` is the parser, `elapsed_ms` minus
+    it is the model.
+    """
+    markers, prose = _fast_review(["## 🐛 Bugs & Risks\nOne.", ""])
+
+    complete = [m for m in markers if m["step"] == "complete"]
+    assert len(complete) == 1, "a review reports one total, not one per stage"
+    done = complete[0]
+    writing = next(m for m in markers if m["step"] == "writing")
+
+    assert done["mode"] == "fast"
+    assert done["elapsed_ms"] >= done["analysis_ms"] >= 0
+    # One definition of "how many findings": the total repeats the count the writing
+    # marker published rather than recounting it.
+    assert done["findings"] == writing["findings"]
+    assert "auth.py" in done["message"]
+    # A duration is telemetry, so it lives in a marker. The review text a reader
+    # copies into a PR must not grow a timing line.
+    assert " ms" not in prose
+
+
+def test_a_review_that_did_not_finish_reports_no_duration():
+    """
+    An error is not a slow success. If the exception path emitted a `complete`
+    marker, a panel would show a duration for a review that never arrived, and the
+    harness would average it in.
+    """
+    from app.services import review_agent
+
+    class _ExplodingLLM(_FakeLLM):
+        async def astream(self, _messages):
+            raise RuntimeError("model went away")
+            yield  # pragma: no cover — keeps this an async generator
+
+    with patch.object(review_agent, "get_review_llm", lambda *_a, **_k: _ExplodingLLM(["x"])):
+        out = asyncio.run(_drive(review_agent.stream_fast_code_review(
+            "auth.py", "def f():\n    return 1\n", "python",
+        )))
+
+    assert "__ERROR__" in out
+    assert 'step": "complete"' not in out, "a crashed review must not report a total"
+
+
+def test_the_agentic_path_reports_iterations_and_tool_calls():
+    """
+    A deep review's cost is iterations × tools, and the marker says both. This is
+    also the only place a reader can see that the ReAct loop stopped early: `forced`
+    is what distinguishes "it decided to write" from "it ran out of time".
+    """
+    from app.services import review_agent
+
+    class _AgenticLLM(_FakeLLM):
+        def bind_tools(self, _tools):
+            return self
+
+        async def ainvoke(self, _messages):
+            return SimpleNamespace(content="", tool_calls=[])
+
+    llm = _AgenticLLM(["## Score\n7"])
+    with patch.object(review_agent, "get_review_llm", lambda *_a, **_k: llm):
+        out = asyncio.run(_drive(review_agent.stream_code_review("net.py", ORDINARY, "python")))
+
+    markers, prose = _markers_and_prose(out)
+    done = [m for m in markers if m["step"] == "complete"]
+
+    assert len(done) == 1
+    assert done[0]["mode"] == "agentic"
+    assert done[0]["iterations"] == 1 and done[0]["tool_calls"] == 0
+    assert done[0]["forced"] is False
+    assert "## Score" in prose
+
+
+def test_a_review_cut_off_by_the_clock_says_so():
+    """Same marker, different meaning: forced=True, and the full iteration count."""
+    from app.services import review_agent
+
+    stamps = iter(range(0, 10 ** 6, 100))  # every reading is 100 s later than the last
+    clock = SimpleNamespace(monotonic=lambda: next(stamps))
+
+    class _AgenticLLM(_FakeLLM):
+        def bind_tools(self, _tools):
+            return self
+
+        async def ainvoke(self, _messages):
+            raise AssertionError("the time ceiling was already past")
+
+    llm = _AgenticLLM(["## Score\n6"])
+    with patch.object(review_agent, "get_review_llm", lambda *_a, **_k: llm), \
+            patch.object(review_agent, "time", clock):
+        out = asyncio.run(_drive(review_agent.stream_code_review("net.py", ORDINARY, "python")))
+
+    markers, _ = _markers_and_prose(out)
+    done = [m for m in markers if m["step"] == "complete"]
+
+    assert len(done) == 1
+    assert done[0]["forced"] is True
+    assert done[0]["iterations"] == 8, "the ceiling it hit, not a made-up number"
+    assert any(m["step"] == "writing" and m.get("forced") for m in markers)
