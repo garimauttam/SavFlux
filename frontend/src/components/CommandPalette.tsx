@@ -12,10 +12,11 @@
  */
 
 import React, { useEffect, useMemo, useState } from "react";
-import { Search, MessageSquare, Zap, Wand2, Network, Bot, Activity, FileCode, Database, HelpCircle, BarChart3, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell, Terminal, History } from "lucide-react";
+import { Search, Activity, FileCode, Database, HelpCircle, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell, Terminal } from "lucide-react";
 import { IndexedFile, IndexedRepo } from "../types";
-
-type Tab = "chat" | "review" | "write" | "graph" | "health" | "org" | "agent" | "analytics" | "prompts" | "snippets" | "activity" | "bulk" | "explorer" | "diff" | "notifications" | "slash" | "history";
+// Sections come from navigation.ts, the same list the tab strip renders, so a
+// palette entry can no longer disagree with the tab it opens.
+import { TABS, type Tab } from "../navigation";
 
 interface Props {
   open: boolean;
@@ -65,25 +66,9 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
     const items: Item[] = [];
 
     // Tabs
-    const tabDefs: { id: Tab; label: string; icon: React.ElementType; keys: string }[] = [
-      { id: "chat", label: "Chat", icon: MessageSquare, keys: "g c" },
-      { id: "review", label: "Code Review", icon: Zap, keys: "g r" },
-      { id: "write", label: "Code Writer", icon: Wand2, keys: "g w" },
-      { id: "graph", label: "Dep. Graph", icon: Network, keys: "g g" },
-      { id: "health", label: "Health", icon: Activity, keys: "g h" },
-      { id: "org", label: "Org", icon: Database, keys: "g o" },
-      { id: "analytics", label: "Analytics", icon: BarChart3, keys: "g n" },
-      { id: "prompts", label: "Prompts", icon: Bookmark, keys: "g p" },
-      { id: "snippets", label: "Snippets", icon: Code2, keys: "g s" },
-      { id: "activity", label: "Activity", icon: Clock, keys: "g y" },
-      { id: "bulk", label: "Bulk", icon: Layers, keys: "g b" },
-      { id: "explorer", label: "Explorer", icon: FolderTree, keys: "g e" },
-      { id: "diff", label: "Diff", icon: GitCompare, keys: "g d" },
-      { id: "notifications", label: "Inbox", icon: Bell, keys: "g i" },
-      { id: "slash", label: "Slash", icon: Terminal, keys: "g /" },
-      { id: "agent", label: "Agent", icon: Bot, keys: "g a" },
-      { id: "history", label: "History", icon: History, keys: "g t" },
-    ];
+    // Built from TABS: label, icon, order and shortcut all come from the
+    // section list the tab strip renders.
+    const tabDefs = TABS.map((t) => ({ id: t.id, label: t.label, icon: t.Icon, keys: `g ${t.shortcut}` }));
     tabDefs.forEach((t) => {
       const score = q ? fuzzyScore(q, `${t.label} ${t.id} ${t.keys}`) : 10;
       if (score >= 0) items.push({ id: `tab:${t.id}`, label: `Go to ${t.label}`, sub: t.keys, score: score + 5, icon: t.icon, action: () => { onSetActiveTab(t.id); onClose(); } });
