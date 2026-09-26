@@ -28,9 +28,16 @@ a model was a category error, and the number that would have been printed for it
 have described the retrieved text, not the answer.
 
 Usage:
-  python eval_rag.py                     # runs full benchmark against self (SavFlux backend code)
+  python eval_rag.py --embedder offline --no-rerank   # what CI runs; no weights, no network, $0
+  python eval_rag.py --embedding-model sentence-transformers/all-MiniLM-L6-v2 --no-rerank
+      # a real local embedder baseline, from cached weights only
   python eval_rag.py --eval-file file.json  # load external JSON benchmark dataset
-  python eval_rag.py --top-k 10 --quiet    # machine-readable JSON output
+  python eval_rag.py --top-k 10 --quiet     # machine-readable JSON output
+
+Every way to run it is free: with `LLM_PROVIDER=openai` the embedder the product uses IS a
+paid API, and a corpus is ~1,800 calls not one, so `--embedder model` refuses a paid
+embedder instead of inheriting it. `--embedding-model NAME` (local weights) or
+`LLM_PROVIDER=ollama` are the ways to get a real model's numbers.
 
 WHY 40+ QUERIES?
   - 5 queries isn't statistically meaningful — a lucky cache hit inflates the numbers.
@@ -321,19 +328,35 @@ BENCHMARK_DATASET: List[Dict[str, Any]] = [
 
 # ── Evaluation Engine ─────────────────────────────────────────────────────────
 
-def _build_embedder(mode: str):
+def _build_embedder(mode: str, model_pin: Optional[str] = None):
     """
-    Return the embedder the dense leg will use.
+    Return the embedder the dense leg will use — local weights or nothing.
 
     `offline` is the deterministic hashing embedder: no download, no network, and
     therefore runnable in CI. Its similarities are lexical, so numbers from it prove
     the dense path *works* and say nothing about retrieval quality.
 
-    `model` is whatever `EMBEDDING_MODEL` names, i.e. what production uses. It needs
-    the weights available locally. There is deliberately NO silent fallback to the
-    offline embedder: a quality number that quietly came from a lexical stand-in is
-    worse than a failure, because it looks like evidence.
+    `model` is what production uses, and `--embedding-model NAME` pins a candidate
+    model by name (index and query must then be understood as using that one model).
+    Both need the weights available locally. There is deliberately NO silent fallback
+    to the offline embedder: a quality number that quietly came from a lexical stand-in
+    is worse than a failure, because it looks like evidence.
+
+    The refusal below is not a style rule. `--embedder model` is the CLI default,
+    `python eval_rag.py` is the documented way to run it, and the configured provider
+    for the paid path is a setting a laptop already has — so "use whatever the product
+    uses" would embed ~1,800 corpus units through a paid embedding API. SavFlux is a
+    $0 product; the benchmark may not be the thing that spends money. Both checks are
+    kept, in this order: the provider gate before anything is imported or constructed,
+    and the type check on the object actually returned, because the gate describes the
+    factory's branching and the type is the factory's behaviour.
     """
+    if mode == "offline" and model_pin:
+        raise ValueError(
+            "--embedding-model names a real model; --embedder offline is the lexical "
+            "stand-in. Pick one — a run cannot claim a model it never loaded."
+        )
+
     if mode == "offline":
         from app.services.offline_embedder import OfflineEmbedder
 
@@ -342,16 +365,64 @@ def _build_embedder(mode: str):
     if mode != "model":
         raise ValueError(f"unknown embedder mode {mode!r}; expected 'offline' or 'model'")
 
-    from app.services.llm_factory import get_embedding_fn
+    from app.services.llm_factory import (
+        LOCAL_EMBEDDING_PROVIDERS,
+        build_local_embeddings,
+        get_embedding_fn,
+    )
+
+    if model_pin:
+        try:
+            return build_local_embeddings(model_pin)
+        except Exception as exc:  # noqa: BLE001 - any load failure is actionable here
+            raise RuntimeError(_embedder_load_error(model_pin, exc)) from exc
+
+    from app.core.config import get_settings
 
     try:
-        return get_embedding_fn()
-    except Exception as exc:  # noqa: BLE001 - any load failure is actionable here
+        provider = get_settings().llm_provider
+    except Exception as exc:  # pragma: no cover - unreadable config is still not permission to pay
         raise RuntimeError(
-            f"Could not load the configured embedding model: {type(exc).__name__}: {exc}.\n"
-            "Run with --embedder offline for a plumbing-only check that needs no "
-            "weights, or install the model (needs access to huggingface.co)."
+            f"Cannot read LLM_PROVIDER to decide whether the configured embedder is "
+            f"local ({type(exc).__name__}: {exc}); refusing to build one that might "
+            "not be. Pass --embedding-model NAME to pin a local model by name."
         ) from exc
+    if provider not in LOCAL_EMBEDDING_PROVIDERS:
+        raise RuntimeError(
+            f"LLM_PROVIDER={provider!r} embeds through a paid API, and this benchmark "
+            f"will not spend money on 1,800+ corpus units. Run with "
+            f"--embedding-model <name> for any local model, or LLM_PROVIDER=ollama to "
+            f"use the configured one, or --embedder offline for the plumbing-only "
+            f"check that needs no weights at all."
+        )
+
+    try:
+        embedder = get_embedding_fn()
+    except Exception as exc:  # noqa: BLE001 - any load failure is actionable here
+        raise RuntimeError(_embedder_load_error(None, exc)) from exc
+
+    module = type(embedder).__module__.lower()
+    if "openai" in module or "azure" in module or "cohere" in module or "vertexai" in module:
+        raise RuntimeError(
+            f"The configured embedder is {type(embedder).__name__} from "
+            f"{type(embedder).__module__}, which is a paid API. The benchmark refuses "
+            "it whatever LLM_PROVIDER says — pass --embedding-model <name> for a local "
+            "model, or --embedder offline for the no-weights plumbing check."
+        )
+    return embedder
+
+
+def _embedder_load_error(model_pin: Optional[str], exc: BaseException) -> str:
+    """The one error text for 'the weights are not here', naming every free way out."""
+    named = f"--embedding-model {model_pin}" if model_pin else "the configured EMBEDDING_MODEL"
+    return (
+        f"Could not load {named}: {type(exc).__name__}: {exc}.\n"
+        "The weights have to be available locally: fetch them once with access to "
+        "huggingface.co (or an Ollama model), or point HF_HOME at a cache that already "
+        "has them. Run with --embedder offline for a plumbing-only check that needs no "
+        "weights — but its numbers are lexical, not a quality result, and the artefact "
+        "says so."
+    )
 
 
 #: Identifies the matching rule, so a run scored under a different rule cannot be
@@ -723,6 +794,11 @@ def compare_results(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[D
     return rows
 
 
+def _dense_windows(result: Dict[str, Any]) -> int:
+    """How many units the dense leg embedded, or 0 when the run predates the count."""
+    return (result.get("evaluation", {}).get("dense_corpus", {}) or {}).get("windows", 0)
+
+
 def format_comparison(rows: List[Dict[str, Any]]) -> str:
     """
     A fixed-width table, because this output is read in a terminal and pasted into a
@@ -829,6 +905,7 @@ async def evaluate_pipeline(
     verbose: bool = True,
     embedder_mode: str = "model",
     rerank_enabled: bool = True,
+    embedder_pin: Optional[str] = None,
     corpus_shape: str = "chunks",
     corpus_files: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -860,7 +937,15 @@ async def evaluate_pipeline(
     bm25 = BM25Index(corpus_docs)
 
     dense_docs = _dense_corpus(corpus_docs)
-    dense = DenseIndex(dense_docs, _build_embedder(embedder_mode))
+    # `DenseIndex.__init__` is where every window is embedded, so the clock brackets the
+    # construction. A model that is 10x better at retrieval and takes 40 minutes to index
+    # is still not what a $0 laptop tool ships with, and nothing else here would say so.
+    embed_started = time.perf_counter()
+    dense = DenseIndex(dense_docs, _build_embedder(embedder_mode, embedder_pin))
+    embed_index_ms = round((time.perf_counter() - embed_started) * 1000.0, 2)
+    embed_units_per_second = (
+        round(len(dense_docs) / (embed_index_ms / 1000.0), 2) if embed_index_ms > 0 else None
+    )
 
     legs: Dict[str, Dict[str, Any]] = {
         "bm25_only": _empty_leg(),
@@ -1207,11 +1292,21 @@ async def evaluate_pipeline(
                 2,
             ),
             "by_leg": by_leg,
+            # The label names the model when one was pinned, because "configured model"
+            # cannot tell two baselines apart after the fact.
             "dense_leg_embedder": (
                 "offline-hashing (NOT a quality model)"
                 if embedder_mode == "offline"
-                else "configured model"
+                else (f"local model {embedder_pin} (pinned)"
+                      if embedder_pin else "configured model")
             ),
+            # Embedding the corpus is what a real model makes expensive, so the harness
+            # times it. Deliberately outside the per-query latency rows: an index build
+            # happens once per re-index, and mixing the two would make a slower embedder
+            # look like slower retrieval. Also why a unit rate is reported — an absolute
+            # time says nothing about the size of the corpus it was paid over.
+            "embed_index_ms": embed_index_ms,
+            "embed_units_per_second": embed_units_per_second,
         },
         "query_breakdown": query_results,
     }
@@ -1268,11 +1363,11 @@ async def evaluate_pipeline(
             "audit": "each ground truth resolved to exactly one corpus file",
         },
     }
-    result["models"] = _model_provenance(embedder_mode)
+    result["models"] = _model_provenance(embedder_mode, embedder_pin)
     return result
 
 
-def _model_provenance(embedder_mode: str = "model") -> Dict[str, str]:
+def _model_provenance(embedder_mode: str = "model", embedder_pin: Optional[str] = None) -> Dict[str, str]:
     """
     Record WHICH models produced these numbers.
 
@@ -1305,6 +1400,13 @@ def _model_provenance(embedder_mode: str = "model") -> Dict[str, str]:
             provenance["embedder_batch_size"] = str(s.embedding_batch_size)
     except Exception as exc:  # pragma: no cover - config must never break a report
         provenance["embedder"] = f"<unavailable: {type(exc).__name__}>"
+
+    if embedder_pin:
+        # A pinned candidate is not the configured model, and a reader has to be able to
+        # tell the two apart: the settings block above describes what production would use,
+        # so say plainly that this run overrode it.
+        provenance["embedder"] = embedder_pin
+        provenance["embedder_source"] = "pinned by --embedding-model, not the configured model"
 
     # The reranker is a module constant, not a setting — read it, don't guess it.
     try:
@@ -1609,6 +1711,13 @@ def print_report(result: Dict[str, Any]) -> None:
     harness = (m.get("harness_ms") or {}).get("p50")
     if harness is not None:
         print(f"      (scoring the legs adds {harness} ms/query, not counted above)")
+    embed_ms = m.get("embed_index_ms")
+    embed_rate = m.get("embed_units_per_second")
+    if embed_ms is not None:
+        rate = f" · {embed_rate:,.0f} units/s" if embed_rate else ""
+        print(f"  Dense index build      : {embed_ms:,.0f} ms for "
+              f"{_dense_windows(result):,} windows{rate} — what a heavier embedder "
+              "costs once per re-index, which per-query latency cannot show")
     if per_file:
         print(f"  Units per expected file: min {per_file['min']}  "
               f"median {per_file['median']}  p90 {per_file['p90']}  "
@@ -1680,6 +1789,20 @@ if __name__ == "__main__":
         "--eval-file", help="Path to external JSON benchmark file"
     )
     parser.add_argument("--top-k", type=int, default=5, help="Top-K candidates to evaluate")
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Pin a LOCAL embedding model by name or path for the dense leg (e.g. "
+            "sentence-transformers/all-MiniLM-L6-v2) instead of the configured "
+            "EMBEDDING_MODEL, so two embedder baselines can be compared on one corpus. "
+            "The weights must already be cached (HF_HOME or an Ollama model): nothing is "
+            "downloaded at score time and a paid embedding API is never called, whatever "
+            "LLM_PROVIDER says. Index and query both use this model, so a Chroma index "
+            "built with a different one has to be rebuilt."
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="Only print JSON result (for CI)")
     parser.add_argument("--json-out", help="Write JSON result to this file path")
     parser.add_argument(
@@ -1772,6 +1895,7 @@ if __name__ == "__main__":
         top_k=args.top_k,
         verbose=not args.quiet,
         embedder_mode=args.embedder,
+        embedder_pin=args.embedding_model,
         rerank_enabled=not args.no_rerank,
         corpus_shape=args.corpus_shape,
         corpus_files=len(source_files),
