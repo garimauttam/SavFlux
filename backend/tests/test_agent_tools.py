@@ -470,12 +470,57 @@ def test_agent_skips_the_pr_when_no_github_repo_is_known(client, indexed_net_py,
 
 
 def test_agent_run_stays_deterministic(client, indexed_net_py, no_push):
-    """Same goal, same index, same bytes — that is the $0 guarantee."""
-    first = _run_stream(client, goal="fix the weak hash in the cache layer",
-                        repo_url="https://github.com/octo/demo")
-    second = _run_stream(client, goal="fix the weak hash in the cache layer",
-                         repo_url="https://github.com/octo/demo")
-    assert first == second
+    """
+    Same goal, same index, same bytes — for everything that is a conclusion.
+
+    Split in two because a run now also carries a stopwatch and a run id, which
+    are volatile *by construction*: `elapsed_ms` measures real work, and refusing
+    to report it to make a string reproducible would be the tail wagging the dog.
+
+    So the guarantee is stated where it actually matters:
+      * the report — the artifact someone quotes or attaches — is byte-identical,
+        with no exclusions at all;
+      * the telemetry is identical once the fields the protocol itself declares
+        volatile are dropped, which is what keeps a step's identity, arguments and
+        outcome pinned while allowing its duration to vary.
+
+    The last assertion is what stops this test from passing by the telemetry being
+    empty: the volatile fields must be present in the raw stream to be excluded.
+    """
+    from app.services.stream_protocol import (
+        VOLATILE_STATUS_FIELDS,
+        deterministic_view,
+    )
+
+    def split(text: str) -> tuple[list[dict], str]:
+        markers, report = [], text
+        cursor = 0
+        while True:
+            start = report.find("__STATUS__", cursor)
+            if start == -1:
+                break
+            end = report.find("__STATUS_END__", start)
+            if end == -1:
+                break
+            markers.append(json.loads(report[start + 10:end]))
+            report = report[:start] + report[end + len("__STATUS_END__"):]
+            cursor = start
+        return markers, report
+
+    goal = "fix the weak hash in the cache layer"
+    first = _run_stream(client, goal=goal, repo_url="https://github.com/octo/demo")
+    second = _run_stream(client, goal=goal, repo_url="https://github.com/octo/demo")
+
+    first_markers, first_report = split(first)
+    second_markers, second_report = split(second)
+
+    assert first_report == second_report
+    assert [deterministic_view(m) for m in first_markers] == [
+        deterministic_view(m) for m in second_markers
+    ]
+    assert {"run_id", "elapsed_ms"} <= VOLATILE_STATUS_FIELDS
+    assert any("elapsed_ms" in marker for marker in first_markers)
+    assert any("run_id" in marker for marker in first_markers)
 
 
 # ── indexed_content lookup ladder ─────────────────────────────────────────────

@@ -332,19 +332,21 @@ async def test_the_units_per_file_count_uses_the_rank_s_own_predicate(eval_rag_m
     """
     The number printed beside the hit rate must describe the hit rate's predicate.
 
-    File-level matching accepts a substring and falls back to `source`. A count that
-    used exact `file_name` equality would agree with it on an obvious fixture and
-    disagree on a real one — a target of "limiter.py" against
-    "rate_limiter.py", or a unit whose `source` carries the match.
+    Matching has two accepted paths — the unit's own `file_name`, or a `target.py`
+    ending its `source` — and one that was removed: a substring. The fixture is built
+    so that a second definition inside the code would disagree with this test on each
+    of the three, including the one that must now NOT count.
 
-    The expectation is derived from the module's own predicate, so a second
-    definition inside the code disagrees with this test rather than being confirmed
-    by it.
+    The expectation is derived from the module's own predicate rather than hardcoded,
+    so this stays a test about agreement even as the rule itself moves.
+
     """
     corpus = [
         Document(page_content="def a():\n    return 1\n",
                  metadata={"source": "r::target.py", "file_name": "target.py"}),
-        # Matches only as a substring of file_name.
+        # Matches only as a SUBSTRING of a longer name. Under the old rule this was a
+        # hit, which is how `review.py` came to be credited for
+        # `tests/test_batch_review.py`; it must not be one now.
         Document(page_content="def b():\n    return 2\n",
                  metadata={"source": "r::prefix_target.py", "file_name": "prefix_target.py"}),
         # Matches only through `source`, which is empty-file_name territory.
@@ -353,7 +355,10 @@ async def test_the_units_per_file_count_uses_the_rank_s_own_predicate(eval_rag_m
     ]
 
     expected = sum(1 for d in corpus if eval_rag_module._unit_matches_file(d, "target.py"))
-    assert expected == 3, "fixture no longer exercises both match paths"
+    assert expected == 2, "fixture no longer exercises both match paths and the removed one"
+    assert not eval_rag_module._unit_matches_file(corpus[1], "target.py"), (
+        "a longer file name may not satisfy a ground truth by containing it"
+    )
 
     result = await eval_rag_module.evaluate_pipeline(
         dataset=[{"query": "target", "ground_truth_file": "target.py", "expected_symbols": []}],

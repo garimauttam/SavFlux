@@ -12,10 +12,12 @@
  */
 
 import { useState, useMemo, useEffect, useRef } from "react";
+import { formatDuration } from "../lib/stream";
+import { EMPTY_TIMINGS, stagesFor, type ReviewTimings } from "../lib/timings";
+import { useLiveElapsed } from "./agent/AgentRunHeader";
+import { TimingBreakdown } from "./agent/TimingBreakdown";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
   Loader2,
   ChevronDown,
@@ -44,8 +46,10 @@ import { IndexedFile } from "../types";
 import { PRReviewPanel } from "./PRReviewPanel";
 import { EvidenceViewer } from "./EvidenceViewer";
 import { ApplyFixPanel } from "./ApplyFixPanel";
+import { StopButton } from "./StopButton";
 import { useReview } from "../hooks/useReview";
 import { useMultiReview, ReviewSection } from "../hooks/useMultiReview";
+import { CodeHighlight } from "../lib/highlight";
 
 interface ReviewPanelProps {
   indexedFiles: IndexedFile[];
@@ -105,32 +109,16 @@ function activityIcon(step: ActivityStep) {
 function activityLabel(step: ActivityStep) {
   if (step.tool) return TOOL_LABELS[step.tool] ?? step.tool;
   if (step.step === "file") return step.file ? `Queued ${step.file}` : "Queued file";
-  if (step.step === "complete") return step.file ? `Finished ${step.file}` : "Finished file";
+  if (step.step === "complete") {
+    // A single-file review's completion names no file (there is only one), so the
+    // message is the label — "Finished file" would be a stranger's sentence.
+    return step.file ? `Finished ${step.file}` : (step.message || "Review finished");
+  }
   if (step.step === "summary_complete") return "Summary ready";
   if (step.step === "summary") return "Synthesizing summary";
   if (step.step === "writing") return step.mode === "fast" ? "Writing fast review" : "Writing review";
   if (step.step === "starting") return step.mode === "fast" ? "Fast scan started" : "Review started";
   return step.message;
-}
-
-function useElapsed(active: boolean) {
-  const [elapsed, setElapsed] = useState(0);
-
-  useEffect(() => {
-    if (!active) {
-      setElapsed(0);
-      return;
-    }
-    const started = Date.now();
-    const id = window.setInterval(() => {
-      setElapsed(Math.floor((Date.now() - started) / 1000));
-    }, 1000);
-    return () => window.clearInterval(id);
-  }, [active]);
-
-  const minutes = Math.floor(elapsed / 60);
-  const seconds = elapsed % 60;
-  return minutes > 0 ? `${minutes}m ${seconds.toString().padStart(2, "0")}s` : `${seconds}s`;
 }
 
 function ReviewActivityPanel({
@@ -147,6 +135,7 @@ function ReviewActivityPanel({
   plannedStatic,
   batchedFiles,
   cacheHits,
+  timings,
 }: {
   isActive: boolean;
   currentStep: string | null;
@@ -164,8 +153,22 @@ function ReviewActivityPanel({
   plannedStatic?: number;
   batchedFiles?: number;
   cacheHits?: number;
+  /** Per-stage cost as the stream reported it. Absent until a timing marker lands. */
+  timings?: ReviewTimings | null;
 }) {
-  const elapsed = useElapsed(isActive);
+  // Two clocks, deliberately told apart. While the run is live the browser knows
+  // only wall time since the click, so it is printed with a "+"; once the review
+  // finishes, the number shown is the one the server measured for the work itself,
+  // which is the number worth comparing between runs. (The panel used to print "0s"
+  // after a finished review, because its local clock reset on completion.)
+  const liveMs = useLiveElapsed(isActive);
+  const reportedMs = timings ? timings.totalMs ?? timings.filesMs : null;
+  const stages = timings ? stagesFor(timings) : [];
+  const elapsed = !isActive && reportedMs !== null
+    ? { text: formatDuration(reportedMs), title: "Time this review reported for itself" }
+    : isActive
+      ? { text: `+${formatDuration(liveMs)}`, title: "Wall time since this review started, measured by the browser" }
+      : null;
   const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
   const visibleSteps = steps.slice(-8).reverse();
   const finishedWithGaps = !isActive && total > 0 && completed < total;
@@ -195,10 +198,15 @@ function ReviewActivityPanel({
             )}
           </div>
           <div className="shrink-0 text-right text-xs text-gray-400">
-            <div className="flex items-center justify-end gap-1">
-              <Clock3 className="w-3.5 h-3.5" />
-              {elapsed}
-            </div>
+            {elapsed && (
+              <div
+                className="flex items-center justify-end gap-1 font-mono"
+                title={elapsed.title}
+              >
+                <Clock3 className="w-3.5 h-3.5" />
+                {elapsed.text}
+              </div>
+            )}
             {total > 0 && <div className="mt-1 font-mono">{completed}/{total}</div>}
             {!isActive && total > 1 && (
               <div
@@ -270,6 +278,16 @@ function ReviewActivityPanel({
           </div>
         )}
       </div>
+
+      {(stages.length > 0 || (isActive && !!timings)) && (
+        <div className="border-t border-gray-800 p-3">
+          <TimingBreakdown
+            timings={timings ?? EMPTY_TIMINGS}
+            running={isActive}
+            liveMs={liveMs}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -500,14 +518,12 @@ const reviewMdComponents: React.ComponentProps<typeof ReactMarkdown>["components
       return (
         <div className="my-2 rounded-lg overflow-hidden border border-gray-700">
           <div className="px-3 py-1 bg-gray-900 border-b border-gray-700 text-xs text-gray-500 font-mono">{match[1]}</div>
-          <SyntaxHighlighter
-            style={vscDarkPlus}
+          <CodeHighlight
             language={match[1]}
-            PreTag="div"
             customStyle={{ margin: 0, borderRadius: 0, fontSize: "12px", background: "#0d1117" }}
           >
             {String(children).replace(/\n$/, "")}
-          </SyntaxHighlighter>
+          </CodeHighlight>
         </div>
       );
     }
@@ -865,6 +881,10 @@ export function ReviewPanel({
 
   // ── Derived state ─────────────────────────────────────────────────────────
   const isActive = isMulti ? multi.isReviewing : single.isReviewing;
+  const activeStopped = isMulti ? multi.stopped : single.stopped;
+  // The button aborts the request, which is what the server is watching for: the run
+  // stops *costing* something, not just printing.
+  const handleStop = () => (isMulti ? multi.stop() : single.stop());
 
   const canReview = !isActive && (
     tab === "paste"
@@ -1090,6 +1110,11 @@ export function ReviewPanel({
                 : <><Zap className="w-4 h-4" />{buttonLabel()}</>
               }
             </button>
+            {isActive && (
+              <div className="mt-2">
+                <StopButton onClick={handleStop} className="w-full" />
+              </div>
+            )}
           </div>
         </div>
 
@@ -1139,6 +1164,7 @@ export function ReviewPanel({
               {(single.isReviewing || single.agentSteps.length > 0) && (
                 <ReviewActivityPanel
                   isActive={single.isReviewing}
+                  timings={single.timings}
                   currentStep={currentStep}
                   steps={single.agentSteps}
                   completed={single.isReviewing ? 0 : 1}
@@ -1186,9 +1212,9 @@ export function ReviewPanel({
                       code({ className, children }: any) {
                         const match = /language-(\w+)/.exec(className || "");
                         return match ? (
-                          <SyntaxHighlighter style={vscDarkPlus} language={match[1]} PreTag="div" className="rounded-lg text-xs">
+                          <CodeHighlight language={match[1]} className="rounded-lg text-xs">
                             {String(children).replace(/\n$/, "")}
-                          </SyntaxHighlighter>
+                          </CodeHighlight>
                         ) : (
                           <code className="bg-gray-800 text-purple-300 px-1.5 py-0.5 rounded text-xs font-mono">{children}</code>
                         );
@@ -1216,6 +1242,7 @@ export function ReviewPanel({
               {(multi.isReviewing || multi.agentSteps.length > 0) && (
                 <ReviewActivityPanel
                     isActive={multi.isReviewing}
+                    timings={multi.timings}
                     currentStep={currentStep}
                     steps={multi.agentSteps}
                     completed={multi.completedFiles}
@@ -1241,6 +1268,15 @@ export function ReviewPanel({
               {!multi.isReviewing && multi.sections.length > 0 && fixableFiles.length > 0 && (
                 <ApplyFixPanel files={fixableFiles} />
               )}
+            </div>
+          )}
+
+          {/* A stopped run: what arrived stays readable, what did not is named. */}
+          {activeStopped && !isActive && (
+            <div className="p-6 pb-0">
+              <p role="status" className="text-xs text-amber-300/90 bg-amber-500/10 border border-amber-500/25 rounded-lg px-3 py-2">
+                {currentStep || "Stopped — the remaining files were not reviewed."}
+              </p>
             </div>
           )}
 

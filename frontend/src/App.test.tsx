@@ -8,7 +8,7 @@
  * an empty container, which is exactly the "dead tab" failure mode.
  */
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 // react-force-graph-2d needs a canvas; the graph's own behaviour is not what
 // this test is about, only that the section mounts.
@@ -43,6 +43,15 @@ describe("App — section reachability", () => {
       fireEvent.click(screen.getByRole("tab", { name: tab.label }));
       const panel = document.getElementById(`savflux-panel-${tab.id}`);
       expect(panel, `${tab.id} has a tab but no panel`).not.toBeNull();
+      // The dependency graph is loaded on demand, so its container holds the Suspense
+      // fallback for a tick — text that would satisfy an emptiness check without the
+      // panel ever mounting. Wait for the chunk, then assert on its content, or the
+      // laziness this file exists to permit would also make it untestable.
+      if (tab.id === "graph") {
+        await waitFor(() => expect(panel!.textContent).toContain("No repo indexed yet"), {
+          timeout: 4000,
+        });
+      }
       // A dead tab — listed but absent from the switch — renders an empty div.
       expect(panel!.textContent?.trim(), `${tab.id} panel rendered nothing`).not.toBe("");
       expect(screen.getByRole("tab", { name: tab.label })).toHaveAttribute("aria-selected", "true");

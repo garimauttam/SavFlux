@@ -8,7 +8,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "report:bundle": "node scripts/bundle-report.mjs",
+    "report:bundle:gate": "node scripts/bundle-report.mjs --entry-budget-kb 320"
   },
   "dependencies": {
     "@types/diff": "^7.0.2",

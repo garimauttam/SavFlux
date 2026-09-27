@@ -9,9 +9,14 @@ Endpoints:
   GET    /review/cache   — what the content-hash review cache is holding
   DELETE /review/cache   — drop it (the next review is a cold one)
 
-The review streams have two types of chunks:
-  __STATUS__...text...{"step": "..."}__STATUS_END__  →  progress update (tool running)
-  everything else                                    →  actual review text tokens
+The review streams carry two kinds of chunk, framed by `app.services.stream_protocol`
+— the same protocol the code agent, the writer and chat use:
+  __STATUS__{"step": "...", "message": "..."}__STATUS_END__  →  progress (a stage, a
+      file, a tool call, a per-stage duration) — never part of the answer
+  everything else                                            →  review markdown
+
+Markers are telemetry, so they are what a client renders as a timeline; the prose
+between them is what it renders as the review.
 """
 
 import asyncio
@@ -28,6 +33,7 @@ from pydantic import BaseModel, field_validator
 from app.api.deps import require_api_key
 from app.limiter import limiter
 from app.services.review_agent import stream_code_review, stream_fast_code_review
+from app.services.stream_protocol import is_protocol_token
 from app.services.multi_review_agent import stream_multi_review
 from app.services import review_cache
 from app.services.impact_analyzer import analyze_diff, inline_comments_for_diff
@@ -227,7 +233,11 @@ async def review_indexed_file(request: Request, body: ReviewFileRequest, _: None
         raise HTTPException(status_code=500, detail=str(e))
 
     return StreamingResponse(
-        review_fn(body.file_name, content, body.language),
+        # The disconnect is the only cancellation signal a streaming response gets,
+        # and forwarding it is what turns Stop from "the output went quiet" into "the
+        # model was let go". Both review modes take the same keyword, so the choice of
+        # function above does not change what cancellation means.
+        review_fn(body.file_name, content, body.language, should_stop=request.is_disconnected),
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -259,7 +269,7 @@ async def review_pasted_code(request: Request, body: ReviewPasteRequest, _: None
     )
 
     return StreamingResponse(
-        review_fn(body.file_name, body.code, body.language),
+        review_fn(body.file_name, body.code, body.language, should_stop=request.is_disconnected),
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -345,7 +355,10 @@ async def review_multiple_files(request: Request, body: ReviewMultiRequest, _: N
         )
 
     return StreamingResponse(
-        stream_multi_review(file_dicts),
+        # The reader's disconnect is the only cancellation signal a streaming
+        # response gets, and forwarding it is what makes Stop stop spending model
+        # time rather than just hiding the output.
+        stream_multi_review(file_dicts, should_stop=request.is_disconnected),
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -371,8 +384,9 @@ async def review_pr_webhook(request: Request, body: PRWebhookRequest, _: None = 
         ),
         language="diff",
     ):
-        # Filter out UI status telemetry markers from the stream
-        if not token.startswith("__STATUS__"):
+        # Filter out UI telemetry markers from the stream — the webhook posts one
+        # review body to GitHub, where a marker would be visible to reviewers.
+        if not is_protocol_token(token):
             review_chunks.append(token)
 
     full_review = "".join(review_chunks).strip()

@@ -153,3 +153,15 @@ jobs:
       # the last five off-screen compiles perfectly.
       - name: Frontend unit tests
         run: npm test
+
+      # A production build, then the budget that splitting exists to protect. `vite
+      # build` prints every chunk it emitted; this measures the narrower thing — the
+      # bytes a browser must have before it can paint, walked from the manifest's
+      # static imports. A dependency that drags 200 kB onto the critical path, or a
+      # diff that un-lazies the graph panel, is invisible to tsc and to every unit
+      # test here, and would otherwise ship quietly.
+      # `report:bundle` prints the full per-chunk table for the PR log.
+      - name: Bundle budget (first paint, gzipped)
+        run: |
+          npx vite build
+          node scripts/bundle-report.mjs --entry-budget-kb 320

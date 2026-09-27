@@ -37,17 +37,24 @@ ARCHITECTURE (v3 — planned, batched, cached):
     Synthesises all per-file findings into an overall health assessment.
     Falls back to a rich deterministic summary if the LLM is unavailable.
 
-SECTION WIRE FORMAT (unchanged — frontend already handles this):
-  __SECTION_START__{json}__SECTION_END__   → open a new card
-  __STATUS__message{json}__STATUS_END__    → progress update
-  plain text                               → review content for current card
+WIRE FORMAT — defined in `app.services.stream_protocol`, not here:
+  __SECTION_START__{"id": …, "file_name": …}__SECTION_END__  → open a card
+  __STATUS__{"step": …, "message": …}__STATUS_END__          → progress + timings
+  plain text                                                  → review content
+
+Every marker this generator emits is built by `status_event()`, which is also what
+the code agent, the writer and the chat retrieval path use. That is deliberate:
+one encoder means the client needs one decoder, and a field added for one surface
+(a tool duration, a plan step id) is available to all of them. The stage timings
+below (`plan_ms`, `context_ms`, per-file `llm_ms`/`wait_ms`, `elapsed_ms`) are the
+measurement the latency work has to start from — until now the only number a
+review reported was "it finished".
 """
 
 import asyncio
-import json
 import logging
 import re
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -64,6 +71,7 @@ from app.services.review_planner import (
     ROUTE_FULL,
     plan_review,
 )
+from app.services.stream_protocol import is_protocol_token, section_event, status_event
 from app.services.code_analysis import analyze_file
 from app.services.code_analysis.analyzer import render_findings_markdown
 from app.services.code_analysis.models import FileAnalysis
@@ -88,10 +96,16 @@ _BATCH_TIMEOUT = 180  # seconds
 # ── Section payload helper ─────────────────────────────────────────────────────
 
 def _section_payload(file_info: dict) -> str:
-    return json.dumps({
-        "id":        file_info.get("file_path") or file_info["file_name"],
-        "file_name": file_info["file_name"],
-    })
+    """
+    The marker that opens one file's section, framed by the shared protocol.
+
+    `id` stays the caller's `file_path` when there is one, because the UI keys its
+    section cards on it; a section that re-keys mid-stream duplicates a card.
+    """
+    return section_event(
+        id=file_info.get("file_path") or file_info["file_name"],
+        file_name=file_info["file_name"],
+    )
 
 
 # ── Phase 0: repo context build ───────────────────────────────────────────────
@@ -543,8 +557,45 @@ def _deterministic_repo_summary(
 
 # ── Main entry point ───────────────────────────────────────────────────────────
 
+#: How often a running repo review asks whether the reader is still there, while the
+#: model calls are the thing holding the run open. A poll is a queue lookup; the calls
+#: it can cancel are seconds of a local model.
+_STOP_POLL_SECONDS = 0.2
+
+
+async def _reap(tasks: list[asyncio.Task]) -> None:
+    """
+    Cancel what is still running and wait for it, rather than abandoning it.
+
+    A generator that returns leaves its tasks pending, and asyncio then either runs
+    the very model calls the Stop was meant to avoid or logs "Task was destroyed but
+    it is pending" — so cancellation has to be awaited to count as done. The
+    exceptions are swallowed on purpose: a `CancelledError` from a worker a reader
+    stopped is not a failure to report anywhere.
+    """
+    pending = [task for task in tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _cancelled_marker(files: list[dict], streamed: set[int], started_at: float) -> str:
+    """The closing marker for a review a reader stopped."""
+    missing = [files[idx].get("file_name", "?") for idx in range(len(files)) if idx not in streamed]
+    return status_event(
+        f"Stopped — {len(missing)} of {len(files)} file(s) were not reviewed",
+        step="cancelled",
+        elapsed_ms=int((_time.monotonic() - started_at) * 1000),
+        published=len(streamed),
+        not_reviewed=len(missing),
+        files_skipped=missing,
+    )
+
+
 async def stream_multi_review(
     files: list[dict],
+    should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Stream a planned, batched, cached review of multiple files.
@@ -558,7 +609,35 @@ async def stream_multi_review(
     Every model result is cached under a key derived from the file content, the
     model and the planner version, so re-reviewing an unchanged file costs a
     dictionary lookup instead of a call. Cache hits are labelled in the output.
+
+    `should_stop` is an async predicate checked before every model call and between
+    streamed sections; the route hands it `Request.is_disconnected`, so closing the
+    tab ends the run instead of paying for it. The saving is the point — a 60-file
+    repo review is minutes of a local model's time, and the browser has already gone.
+    Files that were never started are named in a closing `cancelled` marker rather
+    than left as blank sections, which is what separates "stopped here" from
+    "reviewed nothing and said nothing".
     """
+    async def _never_stopped() -> bool:
+        return False
+
+    stop = should_stop or _never_stopped
+    # Set once the reader is known to be gone. The workers check this flag as well
+    # as the predicate: after a Stop, `is_disconnected` stays true, but a task that
+    # is already past its check must not start a *second* model call, and a cached
+    # lookup should not be paid for either.
+    abandoned = False
+    #: Indexes whose section has been yielded — the "what did you actually review"
+    #: set the closing marker counts against the plan.
+    streamed: set[int] = set()
+
+    async def stopping() -> bool:
+        return abandoned or await stop()
+
+    #: Set by the watcher as well as the driver, so a Stop noticed mid-model-call can
+    #: reach the files still waiting for a semaphore slot.
+    running = True
+
     settings     = get_settings()
     n            = len(files)
     review_mode  = getattr(settings, "review_mode", "fast")
@@ -583,6 +662,7 @@ async def stream_multi_review(
 
     # ── Phase -1: score, then plan ────────────────────────────────────────────
     scores = {idx: _triage_score(f) for idx, f in enumerate(files)}
+    planned_at = _time.monotonic()
     plan = plan_review(
         files,
         scores=scores,
@@ -592,16 +672,25 @@ async def stream_multi_review(
         fast_route=_fast_route(),
     )
 
+    plan_ms = int((_time.monotonic() - planned_at) * 1000)
+
     # ── Phase 0: build repo context ───────────────────────────────────────────
+    context_at = _time.monotonic()
     repo_context_map = _build_repo_context(files)
+    context_ms = int((_time.monotonic() - context_at) * 1000)
 
     plan_stats = plan.stats(n)
-    yield (
-        f"__STATUS__Planned {n} files: {plan_stats['single_reviews']} full review(s), "
+    yield status_event(
+        f"Planned {n} files: {plan_stats['single_reviews']} full review(s), "
         f"{plan_stats['batched_files']} batched into {plan_stats['batch_count']} call(s), "
         f"{plan_stats['static_only']} static-only "
-        f"({plan_stats['model_calls']} model call(s) instead of {n})..."
-        f"{json.dumps({'step': 'planned', 'total': n, **plan_stats})}__STATUS_END__\n"
+        f"({plan_stats['model_calls']} model call(s) instead of {n})",
+        step="planned", total=n, **plan_stats,
+        # Where the run's time went before any model was called. `plan_ms` covers
+        # the parse+triage of every file, `context_ms` the cross-file map — the
+        # two deterministic phases, which a user experiences as "it is just
+        # sitting there" and nobody could previously separate from the model.
+        plan_ms=plan_ms, context_ms=context_ms,
     )
 
     # ── Cache helpers ─────────────────────────────────────────────────────────
@@ -643,8 +732,23 @@ async def stream_multi_review(
             f"No model call was made for it in this run.\n"
         )
 
+    # Per-file timings, filled by the workers and read by the markers below.
+    #
+    # A side table rather than a fifth element of the result tuple, because four
+    # places build those tuples and none of them cares about timing — widening the
+    # tuple would touch every one of them to move one number.
+    #
+    # `wait_ms` is the time the file spent queued behind the concurrency
+    # semaphore, `llm_ms` the model call itself. Separating them is the point: a
+    # review where every file waited 900 ms and answered in 200 ms has a
+    # concurrency problem, and one where it waited 10 ms and answered in 4 s has a
+    # model problem. The two want opposite fixes.
+    stage_ms: dict[int, dict] = {}
+
     # ── Phase 1+2: static work and model work ─────────────────────────────────
     async def run_static(idx: int) -> list[tuple[int, str, bool, str | None]]:
+        if await stopping():
+            return []
         cached = _cache_read(idx, "static")
         if cached is not None:
             return [(idx, cached + _provenance(idx, "static"), True, None)]
@@ -653,6 +757,8 @@ async def stream_multi_review(
         return [(idx, text, False, None)]
 
     async def run_single(idx: int) -> list[tuple[int, str, bool, str | None]]:
+        if await stopping():
+            return []
         cached = _cache_read(idx, "single")
         if cached is not None:
             return [(idx, cached + _provenance(idx, "single"), True, None)]
@@ -665,7 +771,14 @@ async def stream_multi_review(
             )
             return _static_fallback(idx, "model provider is failing; call skipped")
 
+        queued_at = _time.monotonic()
         async with semaphore:
+            # The check belongs here, not only at entry: a file that queued behind
+            # the semaphore for two minutes has had two chances to be cancelled, and
+            # the call it is about to make is the expensive one.
+            if await stopping():
+                return []
+            waited_ms = int((_time.monotonic() - queued_at) * 1000)
             route = plan.of(idx).route
             model_override = "" if route == ROUTE_FULL else route
             tokens: list[str] = []
@@ -681,8 +794,13 @@ async def stream_multi_review(
                 ):
                     tokens.append(token)
 
+            called_at = _time.monotonic()
             try:
                 await asyncio.wait_for(_collect(), timeout=_LLM_TIMEOUT)
+                stage_ms[idx] = {
+                    "llm_ms": int((_time.monotonic() - called_at) * 1000),
+                    "wait_ms": waited_ms,
+                }
             except asyncio.TimeoutError:
                 logger.warning(
                     "LLM review timed out after %ds for file %s — falling back to static",
@@ -709,7 +827,7 @@ async def stream_multi_review(
 
         review_text = "".join(
             t for t in tokens
-            if not t.startswith("__STATUS__") and not t.startswith("__ERROR__")
+            if not is_protocol_token(t)
         ).strip()
         _cache_write(idx, "single", review_text)
         return [(idx, review_text, False, None)]
@@ -721,6 +839,8 @@ async def stream_multi_review(
         return [(idx, text, False, reason or "model unavailable")]
 
     async def run_batch(batch_id: str) -> list[tuple[int, str, bool, str | None]]:
+        if await stopping():
+            return []
         batch = plan.batches[batch_id]
         members = [files[i] for i in batch.indexes]
         names = [m["file_name"] for m in members]
@@ -744,7 +864,11 @@ async def stream_multi_review(
                 for i in batch.indexes
             ]
 
+        queued_at = _time.monotonic()
         async with semaphore:
+            if await stopping():
+                return []
+            waited_ms = int((_time.monotonic() - queued_at) * 1000)
             tokens: list[str] = []
 
             async def _collect() -> None:
@@ -753,6 +877,7 @@ async def stream_multi_review(
                 ):
                     tokens.append(token)
 
+            started_call = _time.monotonic()
             try:
                 await asyncio.wait_for(_collect(), timeout=_BATCH_TIMEOUT)
             except asyncio.TimeoutError:
@@ -765,10 +890,18 @@ async def stream_multi_review(
                 return [_static_fallback(i, "model call failed")[0] for i in batch.indexes]
 
         _PROVIDER_CIRCUIT.record_success()
+        # One call, several files: every member of the batch records the same
+        # model duration, which is the measurement that shows batching working.
+        for member in batch.indexes:
+            stage_ms[member] = {
+                "llm_ms": int((_time.monotonic() - started_call) * 1000),
+                "wait_ms": waited_ms,
+                "batch": batch_id,
+            }
 
         combined = "".join(
             t for t in tokens
-            if not t.startswith("__STATUS__") and not t.startswith("__ERROR__")
+            if not is_protocol_token(t)
         ).strip()
         split = split_batch_review(combined, names)
         if combined:
@@ -800,115 +933,200 @@ async def stream_multi_review(
     for batch_id in plan.batches:
         tasks.append(asyncio.create_task(run_batch(batch_id)))
 
+    async def _watch_for_departure() -> None:
+        nonlocal abandoned
+        while running:
+            await asyncio.sleep(_STOP_POLL_SECONDS)
+            if not running:
+                return
+            if await stop():
+                # A Stop that arrives while every in-flight review is mid-model-call
+                # would otherwise go unnoticed until one of them finishes, which on a
+                # 40-second local call is precisely the wait the button exists to end.
+                abandoned = True
+                await _reap(tasks)
+                return
+
+    watch = asyncio.create_task(_watch_for_departure())
+
+    # The reviews are detached tasks, which is what lets six of them share three
+    # semaphore slots — and what makes them survive their own generator. When a client
+    # hangs up, Starlette may abandon the frame instead of unwinding it, and then no
+    # `finally` of mine runs at all; the generator is left suspended and its children
+    # keep calling the model. So the consumer of this stream is asked to cancel them
+    # when *it* finishes, whatever it was doing at the time. A done callback needs no
+    # await, so it fires on a cancelled task, on a closed generator, and during loop
+    # teardown alike.
+    consumer = asyncio.current_task()
+
+    def _cancel_outstanding(_result=None):
+        # One function, reached from both ways this run can end: the consumer task's
+        # done-callback (which fires even when the frame below is abandoned) and the
+        # generator's own teardown. `Task.cancel()` needs no await, so it lands while a
+        # frame is unwinding and after one is gone.
+        nonlocal running
+        running = False
+        if not watch.done():
+            watch.cancel()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    if consumer is not None:
+        consumer.add_done_callback(_cancel_outstanding)
+
+    async def _await_result(coro):
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            if abandoned:
+                # The watcher tore this down on the reader's behalf: an ending, not a
+                # failure. Anything else must keep propagating, or a real teardown
+                # would be swallowed here.
+                return None
+            raise
+
     # ── Phase 3: stream results as they complete ──────────────────────────────
     # Static results appear immediately; model results stream as they arrive.
     # Batches resolve into several file sections from one completed task.
-    for coro in asyncio.as_completed(tasks):
-        results = await coro
-        for idx, review_text, was_cached, fallback_reason in results:
-            file_info = files[idx]
-            file_name = file_info["file_name"]
-            file_id   = file_info.get("file_path") or file_name
-            dispatch  = plan.of(idx)
+    # The loop and its teardown share a frame, so that the `finally` below also
+    # covers a run that is cancelled from underneath rather than one that notices
+    # the disconnect between two files.
+    try:
+        for coro in asyncio.as_completed(tasks):
+            results = await _await_result(coro)
+            if results is None:
+                # The watcher already cancelled the work; there is nothing left to
+                # hand the reader, and the `finally` reaps what is still winding down.
+                return
+            if await stopping():
+                abandoned = True
+                await _reap(tasks)
+                yield _cancelled_marker(files, streamed, started_at)
+                return
+            for idx, review_text, was_cached, fallback_reason in results:
+                file_info = files[idx]
+                file_name = file_info["file_name"]
+                file_id   = file_info.get("file_path") or file_name
+                dispatch  = plan.of(idx)
 
-            yield f"__SECTION_START__{_section_payload(file_info)}__SECTION_END__\n"
+                yield _section_payload(file_info)
+                streamed.add(idx)
 
-            if was_cached:
-                cache_hits.add(idx)
-                # A cache hit is only an LLM review when a model produced it. A
-                # static report served from cache is still static analysis, and
-                # counting it as LLM coverage would overstate how much of the repo
-                # a model actually saw.
-                if dispatch.kind != "static":
-                    llm_succeeded.add(idx)
+                if was_cached:
+                    cache_hits.add(idx)
+                    # A cache hit is only an LLM review when a model produced it. A
+                    # static report served from cache is still static analysis, and
+                    # counting it as LLM coverage would overstate how much of the repo
+                    # a model actually saw.
+                    if dispatch.kind != "static":
+                        llm_succeeded.add(idx)
+                    tier_label = dispatch.tier
+                    yield status_event(
+                        f"Cache hit: `{file_name}` (no model call)",
+                        step="file", id=file_id, file=file_name,
+                        index=idx + 1, total=n, tier=tier_label, cached=True,
+                    )
+                    yield review_text
+                    per_summaries[idx] = f"**{file_name}**: {review_text[:400]}"
+                    yield status_event(
+                        f"Review done: `{file_name}`",
+                        step="complete", id=file_id, file=file_name,
+                        index=idx + 1, total=n, tier=tier_label, cached=True,
+                    )
+                    continue
+
+                if dispatch.kind == "static":
+                    yield status_event(
+                        f"Scanned `{file_name}`",
+                        step="file", id=file_id, file=file_name,
+                        index=idx + 1, total=n, tier="static",
+                    )
+                    yield review_text
+                    per_summaries[idx] = f"**{file_name}**: {review_text[:400]}"
+                    yield status_event(
+                        f"Static done: `{file_name}`",
+                        step="complete", id=file_id, file=file_name,
+                        index=idx + 1, total=n, tier="static",
+                    )
+                    continue
+
+                # A model review — single or one file of a batch.
                 tier_label = dispatch.tier
-                status_meta = json.dumps({
-                    "step": "file", "id": file_id, "file": file_name,
-                    "index": idx + 1, "total": n, "tier": tier_label, "cached": True,
-                })
-                yield f"__STATUS__Cache hit: `{file_name}` (no model call)...{status_meta}__STATUS_END__\n"
-                yield review_text
-                per_summaries[idx] = f"**{file_name}**: {review_text[:400]}"
-                complete_meta = json.dumps({
-                    "step": "complete", "id": file_id, "file": file_name,
-                    "index": idx + 1, "total": n, "tier": tier_label, "cached": True,
-                })
-                yield f"__STATUS__Review done: `{file_name}`...{complete_meta}__STATUS_END__\n"
-                continue
-
-            if dispatch.kind == "static":
-                status_meta = json.dumps({
-                    "step": "file", "id": file_id, "file": file_name,
-                    "index": idx + 1, "total": n, "tier": "static",
-                })
-                yield f"__STATUS__Scanned `{file_name}`...{status_meta}__STATUS_END__\n"
-                yield review_text
-                per_summaries[idx] = f"**{file_name}**: {review_text[:400]}"
-                complete_meta = json.dumps({
-                    "step": "complete", "id": file_id, "file": file_name,
-                    "index": idx + 1, "total": n, "tier": "static",
-                })
-                yield f"__STATUS__Static done: `{file_name}`...{complete_meta}__STATUS_END__\n"
-                continue
-
-            # A model review — single or one file of a batch.
-            tier_label = dispatch.tier
-            status_meta = json.dumps({
-                "step": "file", "id": file_id, "file": file_name,
-                "index": idx + 1, "total": n, "tier": tier_label,
-                **({"batch": dispatch.batch_id} if dispatch.batch_id else {}),
-            })
-            yield f"__STATUS__Reviewing `{file_name}`...{status_meta}__STATUS_END__\n"
-            yield review_text
-
-            if fallback_reason:
-                # The static report is already in review_text; name the failure
-                # without quoting the provider.
-                yield f"\n\n*Static analysis shown — {fallback_reason}.*"
-                per_summaries[idx] = f"**{file_name}**: {review_text[:400]}"
-            else:
-                llm_succeeded.add(idx)
-                per_summaries[idx] = (
-                    f"**{file_name}**: {review_text[:400]}"
-                    + ("..." if len(review_text) > 400 else "")
+                yield status_event(
+                    f"Reviewing `{file_name}`",
+                    step="file", id=file_id, file=file_name,
+                    index=idx + 1, total=n, tier=tier_label,
+                    **({"batch": dispatch.batch_id} if dispatch.batch_id else {}),
                 )
-            complete_meta = json.dumps({
-                "step": "complete", "id": file_id, "file": file_name,
-                "index": idx + 1, "total": n, "tier": tier_label,
-            })
-            yield f"__STATUS__Review done: `{file_name}`...{complete_meta}__STATUS_END__\n"
+                yield review_text
+
+                if fallback_reason:
+                    # The static report is already in review_text; name the failure
+                    # without quoting the provider.
+                    yield f"\n\n*Static analysis shown — {fallback_reason}.*"
+                    per_summaries[idx] = f"**{file_name}**: {review_text[:400]}"
+                else:
+                    llm_succeeded.add(idx)
+                    per_summaries[idx] = (
+                        f"**{file_name}**: {review_text[:400]}"
+                        + ("..." if len(review_text) > 400 else "")
+                    )
+                yield status_event(
+                    f"Review done: `{file_name}`",
+                    step="complete", id=file_id, file=file_name,
+                    index=idx + 1, total=n, tier=tier_label,
+                    **stage_ms.get(idx, {}),
+                )
+
+    finally:
+        # Reached when this generator is unwound rather than abandoned — a consumer that
+        # stops reading mid-yield, or a test. The done-callback above covers the case
+        # where nobody unwinds the frame at all.
+        _cancel_outstanding()
 
     # ── Run telemetry ─────────────────────────────────────────────────────────
     # The numbers that make the plan auditable: how many calls this run actually
     # made, how many of the planned ones it skipped because content was unchanged,
     # and how long the whole file phase took.
     elapsed_ms = int((_time.monotonic() - started_at) * 1000)
-    timing_meta = json.dumps({
-        "step": "timing",
-        "elapsed_ms": elapsed_ms,
-        "model_calls": plan_stats["model_calls"],
-        "cache_hits": len(cache_hits),
-        "static_only": plan_stats["static_only"],
-        "batched_files": plan_stats["batched_files"],
-        "batch_count": plan_stats["batch_count"],
-    })
-    yield (
-        f"__STATUS__{plan_stats['model_calls']} model call(s), "
-        f"{len(cache_hits)} cache hit(s) in {elapsed_ms} ms..."
-        f"{timing_meta}__STATUS_END__\n"
+
+    # The slowest file, by model time. `max` over the *measured* subset: a file
+    # answered from cache or by the parser has no `llm_ms` at all, and counting
+    # those as zero would report "the slowest model call took 0 ms" on a run where
+    # no model ran. Key presence rather than truthiness for the same reason — an
+    # instant local answer genuinely measures 0 ms, and a 0 ms sample is still the
+    # sample a benchmark should average.
+    slowest: tuple[str, dict] | None = None
+    _by_llm = {idx: timings for idx, timings in stage_ms.items() if "llm_ms" in timings}
+    if _by_llm:
+        _worst = max(_by_llm, key=lambda idx: _by_llm[idx]["llm_ms"])
+        slowest = (files[_worst]["file_name"], _by_llm[_worst])
+    yield status_event(
+        f"{plan_stats['model_calls']} model call(s), {len(cache_hits)} cache hit(s) in {elapsed_ms} ms",
+        step="timing", stage="files",
+        elapsed_ms=elapsed_ms,
+        model_calls=plan_stats["model_calls"],
+        cache_hits=len(cache_hits),
+        static_only=plan_stats["static_only"],
+        batched_files=plan_stats["batched_files"],
+        batch_count=plan_stats["batch_count"],
+        # Slowest file in the run, with the phase that made it slow. One number is
+        # a statistic; the split says whether the fix is concurrency or model.
+        **({"slowest_file": slowest[0], **slowest[1]} if slowest else {}),
     )
 
 # ── Repo summary (Idea 6: Mixture-of-Agents) ──────────────────────────────
     if n > 1:
         summary_info = {"file_path": "__repo_summary__", "file_name": "📊 Overall Repo Summary"}
-        yield f"__SECTION_START__{_section_payload(summary_info)}__SECTION_END__\n"
+        yield _section_payload(summary_info)
 
         # Emit a structured coverage token so the frontend can display accurate
         # LLM vs static counts independently of text scanning.
         llm_count  = len(llm_succeeded)
         static_count = n - llm_count
         planned_static = len(set(plan.static_indexes) - fallback_only)
-        coverage_meta = json.dumps({
+        coverage_meta = {
             "step":    "coverage",
             "id":      "__repo_summary__",
             "total":   n,
@@ -924,11 +1142,15 @@ async def stream_multi_review(
             "provider_circuit": _PROVIDER_CIRCUIT.snapshot(),
             "fallback_static": len(fallback_only),
             "model_calls": plan_stats["model_calls"],
-        })
-        yield f"__STATUS__Coverage: {llm_count}/{n} LLM reviews...{coverage_meta}__STATUS_END__\n"
+        }
+        yield status_event(
+            f"Coverage: {llm_count}/{n} LLM reviews", **{
+                key: value for key, value in coverage_meta.items()},
+        )
 
-        summary_meta = json.dumps({"step": "summary", "id": "__repo_summary__",
-                                    "file": "📊 Overall Repo Summary"})
+        summary_meta = {"step": "summary", "id": "__repo_summary__",
+                        "file": "📊 Overall Repo Summary"}
+        summary_at = _time.monotonic()
 
         # Parse mixture model list from config (comma-separated)
         mixture_models: list[str] = [
@@ -974,18 +1196,20 @@ async def stream_multi_review(
             # what a failed LLM summary produces anyway, so produce it directly
             # and say that the provider never answered.
             circuit = _PROVIDER_CIRCUIT.snapshot()
-            fallback_meta = json.dumps({"step": "summary", "id": "__repo_summary__",
-                                        "file": "📊 Overall Repo Summary"})
-            yield f"__STATUS__Writing the deterministic summary (provider not answering)...{fallback_meta}__STATUS_END__\n"
+            yield status_event(
+                "Writing the deterministic summary (provider not answering)",
+                step="summary", id="__repo_summary__", file="📊 Overall Repo Summary",
+            )
             yield _deterministic_repo_summary(
                 files, per_summaries,
                 f"provider unavailable ({circuit['last_reason'] or 'no response'})",
                 llm_succeeded_indexes=llm_succeeded,
             )
-            summary_complete_meta = json.dumps({"step": "summary_complete",
-                                                "id": "__repo_summary__",
-                                                "file": "📊 Overall Repo Summary"})
-            yield f"__STATUS__Repo summary ready...{summary_complete_meta}__STATUS_END__\n"
+            yield status_event(
+                "Repo summary ready",
+                step="summary_complete", id="__repo_summary__", file="📊 Overall Repo Summary",
+                elapsed_ms=int((_time.monotonic() - summary_at) * 1000), model=False,
+            )
             return
 
         try:
@@ -1008,7 +1232,7 @@ async def stream_multi_review(
 
             if len(mixture_models) >= 2:
                 # ── MoA path: fan out to N cheap models, aggregate ─────────────
-                yield f"__STATUS__MoA summary ({len(mixture_models)} models)...{summary_meta}__STATUS_END__\n"
+                yield status_event(f"MoA summary ({len(mixture_models)} models)", **summary_meta)
 
                 from app.services.llm_factory import get_review_llm
 
@@ -1061,7 +1285,7 @@ async def stream_multi_review(
 
             else:
                 # ── Single-model path (default — no config change needed) ───────
-                yield f"__STATUS__Generating repo summary...{summary_meta}__STATUS_END__\n"
+                yield status_event("Generating repo summary", **summary_meta)
                 llm = get_chat_llm(streaming=True, review=True)
                 messages = [
                     SystemMessage(content=summary_system),
@@ -1078,6 +1302,9 @@ async def stream_multi_review(
                 llm_succeeded_indexes=llm_succeeded,
             )
         finally:
-            done_meta = json.dumps({"step": "summary_complete", "id": "__repo_summary__",
-                                     "file": "📊 Overall Repo Summary"})
-            yield f"\n__STATUS__Repo summary ready...{done_meta}__STATUS_END__\n"
+            yield "\n" + status_event(
+                "Repo summary ready",
+                step="summary_complete", id="__repo_summary__", file="📊 Overall Repo Summary",
+                elapsed_ms=int((_time.monotonic() - summary_at) * 1000),
+                model=summary_uses_model,
+            )

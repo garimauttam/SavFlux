@@ -8,13 +8,12 @@
  *   repo selector + clear button) and ChatWindow (for scoped retrieval)
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { Suspense, lazy, useState, useEffect, useCallback } from "react";
 import { IngestPanel } from "./components/IngestPanel";
 import { ChatWindow } from "./components/ChatWindow";
 import { ReviewPanel } from "./components/ReviewPanel";
 import { AgentPanel } from "./components/AgentPanel";
 import { CodeWriterPanel } from "./components/CodeWriterPanel";
-import { GraphPanel } from "./components/GraphPanel";
 import { HealthPanel } from "./components/HealthPanel";
 import { OrgPanel } from "./components/OrgPanel";
 import AnalyticsPanel from "./components/AnalyticsPanel";
@@ -36,6 +35,27 @@ import { IndexedFile, IndexedRepo } from "./types";
 import { DEFAULT_TAB, SHORTCUT_BY_KEY, TABS, type Tab } from "./navigation";
 import { OPEN_FILE_EVENT, openFileAt, parseOpenFileDetail } from "./lib/openFile";
 import { apiFetch } from "./api";
+
+// The dependency-graph panel is the one section whose weight earns loading on demand: it
+// pulls in force-graph plus the d3 force/scale/zoom family, and nothing else in the app
+// touches them, so they can all stay out of the first-paint bundle. Kept in step with
+// the vendor grouping in src/lib/chunking.ts by a test — the moment this import stops
+// being dynamic, that whole subtree is back on the critical path and every number in the
+// build output still looks fine.
+const GraphPanel = lazy(() =>
+  import("./components/GraphPanel").then((m) => ({ default: m.GraphPanel })),
+);
+
+/** Stand-in while a lazily imported panel's chunk is in flight. */
+function PanelLoader({ label }: { label: string }) {
+  return (
+    <div className="p-6 space-y-3" role="status" aria-live="polite">
+      <div className="text-xs text-gray-500 font-mono animate-pulse">{label}</div>
+      <div className="h-64 rounded-xl bg-gray-900/60 border border-gray-800 animate-pulse" />
+    </div>
+  );
+}
+
 
 // localStorage helpers for persisting activeRepoUrl across page refreshes
 const ACTIVE_REPO_KEY = "savflux:activeRepoUrl";
@@ -271,14 +291,16 @@ function Workspace() {
           {activeTab === "write"  && <CodeWriterPanel indexedFiles={indexedFiles} />}
           {activeTab === "agent"  && <AgentPanel />}
           {activeTab === "graph"  && (
-            <GraphPanel
-              indexedRepos={indexedRepos}
-              activeRepoUrl={activeRepoUrl}
-              onNavigateToReview={(source) => {
-                setReviewTargetSource(source);
-                setActiveTab("review");
-              }}
-            />
+            <Suspense fallback={<PanelLoader label="Loading the dependency graph\u2026" />}>
+              <GraphPanel
+                indexedRepos={indexedRepos}
+                activeRepoUrl={activeRepoUrl}
+                onNavigateToReview={(source) => {
+                  setReviewTargetSource(source);
+                  setActiveTab("review");
+                }}
+              />
+            </Suspense>
           )}
           {activeTab === "health" && <HealthPanel activeRepoUrl={activeRepoUrl} />}
           {activeTab === "org" && (

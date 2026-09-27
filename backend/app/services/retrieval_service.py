@@ -19,6 +19,7 @@ import json
 import logging
 import pickle
 import re
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import AsyncGenerator
@@ -42,13 +43,65 @@ from app.services.query_enhancer import (
     route_query_intent, get_intent_filter,
 )
 from app.services.token_counter import get_token_callback, increment_request
+from app.services.stream_protocol import status_event
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+class _StageClock:
+    """
+    Announce a retrieval stage and report what the previous one cost.
+
+    The chat pipeline has seven observable stages (plan → dense → [crag] →
+    lexical → rerank → context → generate) and, before this, a user could see
+    *which* stage was running but not that the reranker took 4.1 s while the
+    LLM took 0.6 s. Nothing can be optimised that has never been separated, and
+    the answer to "why is the first query slow" is always one of these stages.
+
+    `mark()` therefore carries the *completed* stage's duration rather than its
+    own — the stage that just finished is the only one whose cost is known at the
+    moment the next one starts. `close()` reports the last one.
+
+    Monotonic, never wall-clock: these numbers are compared against each other,
+    and a clock adjustment mid-answer would show up as a negative stage.
+    """
+
+    def __init__(self) -> None:
+        self._at = time.monotonic()
+        self._start = self._at
+        self._step = ""
+
+    def mark(self, step: str, message: str, **extra) -> str:
+        now = time.monotonic()
+        completed = (
+            {} if not self._step
+            else {"prev_step": self._step, "prev_ms": int((now - self._at) * 1000)}
+        )
+        self._at, self._step = now, step
+        return status_event(message, step=step, **completed, **extra)
+
+    def close(self, **extra) -> str | None:
+        """The final stage plus the whole retrieval, for one honest total."""
+        if not self._step:
+            return None
+        now = time.monotonic()
+        message = f"{self._step.replace('-', ' ')}: {int((now - self._at) * 1000)} ms"
+        marker = status_event(
+            message,
+            step="stage_done",
+            prev_step=self._step,
+            prev_ms=int((now - self._at) * 1000),
+            total_ms=int((now - self._start) * 1000),
+            **extra,
+        )
+        self._step = ""
+        return marker
+
+
 def _status(message: str, step: str) -> str:
-    return f"__STATUS__{message}{json.dumps({'step': step})}__STATUS_END__\n"
+    """Legacy two-argument form, kept for call sites outside the staged path."""
+    return status_event(message, step=step)
 
 
 # ── Idea 4: RAG Failure Diagnostics ──────────────────────────────────────────
@@ -481,7 +534,8 @@ async def stream_answer(
     # Idea 2: Intent-based routing — classify query into a namespace, build filter
     intent = route_query_intent(search_query)
     intent_filter = get_intent_filter(intent)
-    yield _status(f"Planning [{intent}] retrieval...", "planning")
+    stages = _StageClock()
+    yield stages.mark("planning", f"Planning [{intent}] retrieval…")
 
     # ── Step 2: Hybrid Retrieval (Dense Vector MMR + Lexical BM25 + RRF) ─────
     vectorstore = _get_vectorstore()
@@ -545,7 +599,7 @@ async def stream_answer(
         if settings.query_expansion_enabled
         else [search_query]
     )
-    yield _status(f"Searching {len(query_variants)} variant(s) [{intent}]...", "dense-search")
+    yield stages.mark("dense-search", f"Searching {len(query_variants)} variant(s) [{intent}]…")
 
     # Retrieve each local query variant (improves recall, no extra LLM call).
     dense_lists = list(await asyncio.gather(
@@ -555,7 +609,7 @@ async def stream_answer(
     # Idea 3: Corrective RAG — if intent filter produced zero dense results, retry
     # without the intent filter (P05 fallback). This ensures a non-empty answer.
     if intent != "general" and not any(dense_lists):
-        yield _status(f"Intent filter [{intent}] returned 0 — retrying general search...", "crag-fallback")
+        yield stages.mark("crag-fallback", f"Intent filter [{intent}] returned 0 — retrying general search…")
         fallback_kwargs: dict = {"k": CANDIDATE_ROWS, "fetch_k": CANDIDATE_ROWS * 2}
         fallback_filter = _build_chroma_filter(_repo_filter_urls, {})
         if fallback_filter:
@@ -590,7 +644,7 @@ async def stream_answer(
     async with _get_bm25_lock():
         bm25_index = await asyncio.to_thread(_get_bm25_index, vectorstore)
 
-    yield _status("Running lexical BM25 + graph search...", "lexical-search")
+    yield stages.mark("lexical-search", "Running lexical BM25 + graph search…")
     bm25_lists = []
     if bm25_index:
         graph_hints = await asyncio.to_thread(_get_dep_graph_hints, search_query, vectorstore)
@@ -636,7 +690,7 @@ async def stream_answer(
             # Fall through with full unscoped results rather than returning nothing
 
     # ── Step 3: Cross-Encoder Re-ranking ─────────────────────────────────────
-    yield _status("Fusing and reranking evidence...", "reranking")
+    yield stages.mark("reranking", "Fusing and reranking evidence…")
     # Rerank over the full fused candidate pool — cross-encoder scores determine quality
     reranked_docs = await rerank(search_query, fused_candidates, top_n=CANDIDATE_COUNT)
     # Diversify AFTER reranking: keep highest-ranked chunk per source
@@ -716,7 +770,7 @@ async def stream_answer(
 
     sources = build_citations(used_docs)
     context = "\n\n".join(context_parts)
-    yield _status(f"Assembled {len(relevant_docs)} evidence chunks...", "context")
+    yield stages.mark("context", f"Assembled {len(relevant_docs)} evidence chunks…")
 
     # ── Step 4: Compact chat history ─────────────────────────────────────────
     history_str = compact_chat_history(chat_history, max_turns=6)
@@ -744,7 +798,7 @@ async def stream_answer(
     yield f"__SOURCES__{json.dumps(sources)}__SOURCES_END__\n"
 
     increment_request("chat")
-    yield _status("Generating grounded answer...", "generation")
+    yield stages.mark("generation", "Generating grounded answer…")
     llm = get_chat_llm(streaming=True).with_config(callbacks=[get_token_callback()])
     try:
         yielded_any = False
@@ -752,6 +806,9 @@ async def stream_answer(
             if chunk.content:
                 yield chunk.content
                 yielded_any = True
+        final = stages.close(model="answer")
+        if final:
+            yield final
         if not yielded_any:
             # Primary provider returned an empty stream (e.g. model name wrong).
             # Try the Ollama fallback explicitly before giving up.

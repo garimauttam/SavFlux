@@ -14,8 +14,14 @@ from langchain_core.documents import Document
 from app.services.ingestion_service import _load_and_split, normalize_repo_url
 
 
-def _make_doc(content: str, source: str, repo_url: str = "https://github.com/test/repo") -> Document:
-    """Helper: create a Document with the same metadata structure as _load_and_split produces."""
+def _make_doc(content: str, source: str, repo_url: str = "https://github.com/test/repo",
+              build: str = "") -> Document:
+    """
+    A Document with the metadata `_load_and_split` produces, `index_build` included.
+
+    The stamp is not optional in a delta test: a chunk without one is a chunk whose
+    pipeline nobody can attribute, which `plan_delta` deliberately re-embeds.
+    """
     content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
     return Document(
         page_content=content,
@@ -26,6 +32,7 @@ def _make_doc(content: str, source: str, repo_url: str = "https://github.com/tes
             "repo_url": repo_url,
             "chunk_index": 0,
             "content_hash": content_hash,
+            "index_build": build,
         },
     )
 
@@ -83,104 +90,74 @@ def test_load_and_split_same_hash_for_all_chunks_of_same_file(tmp_path):
 
 def test_delta_logic_skips_unchanged_files():
     """
-    Simulate the delta re-indexing logic:
-    - File A: unchanged → should be skipped
-    - File B: changed → should be in new_docs
-    - File C: new → should be in new_docs
+    File A unchanged -> skipped; file B changed -> re-embedded with its old rows purged;
+    file C new -> embedded.
+
+    These two tests used to paste the production loop into the test body, line for line.
+    That is a fixture, not a check: any edit to the real loop — including deleting it —
+    left them green. They now call `plan_delta`, so the assertions describe behaviour.
     """
-    hash_a = hashlib.sha256(b"file a content").hexdigest()[:16]
-    hash_b_old = hashlib.sha256(b"file b old").hexdigest()[:16]
-    hash_b_new = hashlib.sha256(b"file b new").hexdigest()[:16]
-    hash_c = hashlib.sha256(b"file c content").hexdigest()[:16]
+    from app.services.ingestion_service import plan_delta
 
-    # What's currently in the index (file A and B)
+    hash_a = _hash(b"file a content")
+    hash_b_new = _hash(b"file b new")
+    hash_c = _hash(b"file c content")
+    build = "same-pipeline"
+
+    # The shape `build_indexed_map` returns: sets per file, so a file whose stored rows
+    # disagree with each other cannot be quietly resolved to whichever came first.
     indexed_map = {
-        "/repo/a.py": {"hash": hash_a, "ids": ["id_a1", "id_a2"]},
-        "/repo/b.py": {"hash": hash_b_old, "ids": ["id_b1"]},
+        "/repo/a.py": {"hashes": {hash_a}, "builds": {build}, "ids": ["id_a1", "id_a2"]},
+        "/repo/b.py": {"hashes": {_hash(b"file b old")}, "builds": {build}, "ids": ["id_b1"]},
     }
-
-    # What the current repo scan produced
     documents = [
-        _make_doc("file a content", "/repo/a.py"),        # unchanged
-        _make_doc("file b new", "/repo/b.py"),            # changed
-        _make_doc("file c content", "/repo/c.py"),        # new file
+        _make_doc("file a content", "/repo/a.py", build=build),
+        _make_doc("file b new", "/repo/b.py", build=build),
+        _make_doc("file c content", "/repo/c.py", build=build),
     ]
-    # Fix hashes to match our test values
-    documents[0].metadata["content_hash"] = hash_a
-    documents[1].metadata["content_hash"] = hash_b_new
-    documents[2].metadata["content_hash"] = hash_c
 
-    current_sources = {"/repo/a.py", "/repo/b.py", "/repo/c.py"}
+    plan = plan_delta(
+        indexed_map=indexed_map,
+        documents=documents,
+        current_sources={"/repo/a.py", "/repo/b.py", "/repo/c.py"},
+        build_id=build,
+    )
 
-    # Replicate the delta logic from ingestion_service.py
-    new_docs = []
-    stale_ids = []
-    seen_sources: set = set()
-
-    for doc in documents:
-        src = doc.metadata["source"]
-        chash = doc.metadata["content_hash"]
-        if src not in seen_sources:
-            seen_sources.add(src)
-            if src in indexed_map:
-                if indexed_map[src]["hash"] == chash:
-                    continue  # unchanged — skip
-                else:
-                    stale_ids.extend(indexed_map[src]["ids"])
-        new_docs.append(doc)
-
-    # Mark removed files (none in this test, but verify the logic)
-    for src, info in indexed_map.items():
-        if src not in current_sources:
-            stale_ids.extend(info["ids"])
-
-    # Assertions
-    new_srcs = [d.metadata["source"] for d in new_docs]
+    new_srcs = [d.metadata["source"] for d in plan.new_docs]
     assert "/repo/a.py" not in new_srcs, "Unchanged file A should be skipped"
     assert "/repo/b.py" in new_srcs, "Changed file B should be re-indexed"
     assert "/repo/c.py" in new_srcs, "New file C should be indexed"
 
-    assert "id_a1" not in stale_ids, "IDs for unchanged file A should NOT be deleted"
-    assert "id_b1" in stale_ids, "Old IDs for changed file B must be deleted"
+    assert "id_a1" not in plan.stale_ids, "IDs for unchanged file A should NOT be deleted"
+    assert "id_b1" in plan.stale_ids, "Old IDs for changed file B must be deleted"
+    assert plan.files_skipped == 1 and plan.files_changed == 1 and plan.files_new == 1
 
 
 def test_delta_logic_removes_deleted_files():
     """Files that existed in the index but are no longer in the repo must be purged."""
-    hash_old = hashlib.sha256(b"deleted file").hexdigest()[:16]
+    from app.services.ingestion_service import plan_delta
 
+    build = "same-pipeline"
     indexed_map = {
-        "/repo/deleted.py": {"hash": hash_old, "ids": ["id_del1", "id_del2"]},
-        "/repo/kept.py":    {"hash": "aabbccdd11223344", "ids": ["id_k1"]},
+        "/repo/deleted.py": {"hashes": {_hash(b"deleted file")}, "builds": {build},
+                             "ids": ["id_del1", "id_del2"]},
+        "/repo/kept.py": {"hashes": {"aabbccdd11223344"}, "builds": {build}, "ids": ["id_k1"]},
     }
+    documents = [_make_doc("kept file content", "/repo/kept.py", build=build)]
+    documents[0].metadata["content_hash"] = "aabbccdd11223344"  # same hash -> unchanged
 
-    documents = [
-        _make_doc("kept file content", "/repo/kept.py"),
-    ]
-    documents[0].metadata["content_hash"] = "aabbccdd11223344"  # same hash → unchanged
+    plan = plan_delta(
+        indexed_map=indexed_map,
+        documents=documents,
+        current_sources={"/repo/kept.py"},
+        build_id=build,
+    )
 
-    current_sources = {"/repo/kept.py"}  # deleted.py no longer in repo
+    assert plan.new_docs == [], "Unchanged kept.py should be skipped"
+    assert "id_del1" in plan.stale_ids, "Deleted file IDs must be purged"
+    assert "id_del2" in plan.stale_ids, "All IDs for deleted file must be purged"
+    assert "id_k1" not in plan.stale_ids, "Unchanged file IDs must NOT be purged"
 
-    new_docs = []
-    stale_ids = []
-    seen_sources: set = set()
 
-    for doc in documents:
-        src = doc.metadata["source"]
-        chash = doc.metadata["content_hash"]
-        if src not in seen_sources:
-            seen_sources.add(src)
-            if src in indexed_map:
-                if indexed_map[src]["hash"] == chash:
-                    continue
-                else:
-                    stale_ids.extend(indexed_map[src]["ids"])
-        new_docs.append(doc)
-
-    for src, info in indexed_map.items():
-        if src not in current_sources:
-            stale_ids.extend(info["ids"])
-
-    assert len(new_docs) == 0, "Unchanged kept.py should be skipped"
-    assert "id_del1" in stale_ids, "Deleted file IDs must be purged"
-    assert "id_del2" in stale_ids, "All IDs for deleted file must be purged"
-    assert "id_k1" not in stale_ids, "Unchanged file IDs must NOT be purged"
+def _hash(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()[:16]

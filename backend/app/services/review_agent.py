@@ -22,13 +22,15 @@ import asyncio
 import json
 import re
 import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
 from app.core.config import get_settings
 from app.services.llm_factory import get_chat_llm, get_review_llm
+from app.services.agent_run import summarize_args
+from app.services.stream_protocol import error_event, status_event
 from app.services.token_counter import get_token_callback, increment_request
 from app.services.code_analysis import analyze_file
 from app.services.code_analysis.analyzer import build_llm_facts
@@ -94,7 +96,7 @@ async def _strip_think_tags(
                     buffer = buffer[buffer.index("<think>") + len("<think>"):]
                     state = "thinking"
                     if not thinking_announced:
-                        yield f"__STATUS__Reasoning...{json.dumps({'step': 'thinking'})}__STATUS_END__\n"
+                        yield status_event("Reasoning…", step="thinking")
                         thinking_announced = True
                     changed = True
                     continue
@@ -108,7 +110,7 @@ async def _strip_think_tags(
                     # Discard all content before (and including) </think>
                     buffer = buffer[buffer.index("</think>") + len("</think>"):]
                     state = "after"
-                    yield f"__STATUS__Writing review...{json.dumps({'step': 'writing', 'mode': 'fast'})}__STATUS_END__\n"
+                    yield status_event("Writing review…", step="writing", mode="fast")
                     changed = True
                     continue
                 # else: still inside think block.
@@ -136,6 +138,17 @@ async def _strip_think_tags(
         yield buffer
 
 settings = get_settings()
+
+
+def _one_line(text: str) -> str:
+    """First line of a tool result, whitespace-collapsed, for a status preview."""
+    return " ".join((text or "").split())[:160]
+
+
+def _peek(result: object) -> str:
+    """A short, single-line view of a tool result for the finished step."""
+    text = " ".join(str(result or "").split())
+    return text[:80] + ("…" if len(text) > 80 else "") if text else "no output"
 
 
 # ── Tool factory ───────────────────────────────────────────────────────────────
@@ -341,17 +354,40 @@ Overall score with one-line reasoning. Base it on the metrics above.\
 
 # ── Agentic review (single-file deep mode) ────────────────────────────────────
 
+def _review_cancelled(file_name: str, mode: str, started_at: float, **facts) -> str:
+    """
+    The marker for a review whose reader went away.
+
+    It is not a `complete` marker, and that distinction is the whole point: a review
+    that stopped after two of eight iterations produced no verdict, and a client told
+    otherwise would show an empty review as a finished one and count the run as a
+    success. The only duration it carries is the elapsed wall time of the run that
+    really happened; stages that never ran are absent, not zero.
+    """
+    return status_event(
+        f"Review stopped: `{file_name}`",
+        step="cancelled", mode=mode,
+        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+        **facts,
+    )
+
+
 async def stream_code_review(
     file_name: str,
     file_content: str,
     language: str = "",
     repo_context: str = "",
     model_override: str = "",
+    should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     ReAct-loop agentic review. Used for single-file deep reviews.
     Each file costs 3–9 LLM calls but produces the most thorough output.
     """
+    async def _never_stopped() -> bool:
+        return False
+
+    stop = should_stop or _never_stopped
     increment_request("review")
     llm           = get_review_llm(model_override, streaming=False)
     streaming_llm = get_review_llm(model_override, streaming=True)
@@ -373,28 +409,94 @@ async def stream_code_review(
         )),
     ]
 
-    yield f"__STATUS__Analyzing `{file_name}`...{json.dumps({'step': 'starting'})}__STATUS_END__\n"
+    yield status_event(f"Analyzing `{file_name}`…", step="starting", mode="agentic")
 
     llm_with_tools = llm.bind_tools(tools)
     max_iters  = 8
     max_secs   = 90
     start_time = time.monotonic()
+    tool_calls = 0
+
+    def _agentic_done(*, iterations: int, forced: bool) -> str:
+        """
+        The review's own account of what it spent.
+
+        Every number here is measured inside this generator, so it excludes the
+        browser's own latency and includes the parts a reader cannot see from the
+        text: how many ReAct iterations ran, how many tools were called, whether
+        the loop was cut short by the time limit rather than finished. Without it
+        "the deep review is slow" has no answer to "slow because of what".
+        """
+        return status_event(
+            f"Review done: `{file_name}`",
+            step="complete", mode="agentic",
+            elapsed_ms=int((time.monotonic() - start_time) * 1000),
+            iterations=iterations, tool_calls=tool_calls, forced=forced,
+        )
+
+    # Tools actually executed, as opposed to `tool_calls`, which counts the ones the
+    # model asked for. A cancelled run reports what ran, and the two numbers differ.
+    tools_run = 0
 
     try:
         for iteration in range(max_iters):
             if time.monotonic() - start_time > max_secs:
                 break  # fall through to forced final generation
+            if await stop():
+                # The saving this guard exists for: every remaining round of this
+                # loop is another model call on a machine the user just walked away
+                # from, and the loop runs up to eight of them.
+                yield _review_cancelled(
+                    file_name, "agentic", start_time,
+                    iterations=iteration, tools_run=tools_run, max_iterations=max_iters,
+                )
+                return
             response = await llm_with_tools.with_config(callbacks=[get_token_callback()]).ainvoke(messages)
             messages.append(response)
             if response.tool_calls:
-                for tc in response.tool_calls:
-                    yield f"__STATUS__Tool: `{tc['name']}`...{json.dumps({'step': 'tool', 'tool': tc['name']})}__STATUS_END__\n"
+                tool_calls += len(response.tool_calls)
+                for index, tc in enumerate(response.tool_calls):
+                    # Same vocabulary the code agent uses: an id that pairs the
+                    # two markers, the arguments the model actually passed, and a
+                    # duration. A review that says "Tool: search_pattern..." with
+                    # no result and no cost is a log line, not a tool card.
+                    step_id = f"{tc['name']}#{index + 1 + iteration * len(response.tool_calls)}"
+                    yield status_event(
+                        f"Tool: `{tc['name']}`…",
+                        step="tool", tool=tc["name"], step_id=step_id,
+                        plan_id=f"plan:{tc['name']}", iteration=iteration + 1,
+                        args=summarize_args(tc["name"], tc.get("args") or {}),
+                    )
                     fn = tool_map.get(tc["name"])
-                    result = await asyncio.to_thread(fn.invoke, tc["args"]) if fn else f"Unknown tool: {tc['name']}"
+                    called_at = time.monotonic()
+                    if await stop():
+                        # A tool is a repo read or a grep, not a model call, so this
+                        # is about not paying for the *next* round rather than about
+                        # saving seconds.
+                        yield _review_cancelled(
+                            file_name, "agentic", start_time,
+                            iterations=iteration, tools_run=tools_run, max_iterations=max_iters,
+                        )
+                        return
+                    try:
+                        result = await asyncio.to_thread(fn.invoke, tc["args"]) if fn else f"Unknown tool: {tc['name']}"
+                        ok = fn is not None
+                    except Exception as exc:  # noqa: BLE001 — a failed tool is a fact, not a crash
+                        result, ok = f"{tc['name']} failed: {str(exc)[:120]}", False
+                    yield status_event(
+                        f"{tc['name']}: {_peek(result)}",
+                        step="tool_done" if ok else "tool_error",
+                        tool=tc["name"], step_id=step_id, ok=ok,
+                        elapsed_ms=int((time.monotonic() - called_at) * 1000),
+                        preview=[_one_line(line) for line in str(result).splitlines()[:3]],
+                        preview_more=max(0, len(str(result).splitlines()) - 3),
+                    )
+                    tools_run += 1
                     messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
             else:
                 # LLM chose not to call tools — write the review now
-                yield f"__STATUS__Writing review...{json.dumps({'step': 'writing'})}__STATUS_END__\n"
+                yield status_event("Writing review…", step="writing", mode="agentic",
+                                   elapsed_ms=int((time.monotonic() - start_time) * 1000))
                 messages.append(HumanMessage(
                     content="Based on your investigation, write the full structured review."
                 ))
@@ -405,11 +507,13 @@ async def stream_code_review(
                 )
                 async for token in _strip_think_tags(raw_stream):
                     yield token
+                yield _agentic_done(iterations=iteration + 1, forced=False)
                 return
 
         # Reached max_iters or timed out — force a final generation pass
         # using the tool results already accumulated in `messages`
-        yield f"__STATUS__Writing review (forced)...{json.dumps({'step': 'writing'})}__STATUS_END__\n"
+        yield status_event("Writing review (forced)…", step="writing", mode="agentic",
+                           forced=True, elapsed_ms=int((time.monotonic() - start_time) * 1000))
         messages.append(HumanMessage(
             content=(
                 "Time or iteration limit reached. "
@@ -425,8 +529,11 @@ async def stream_code_review(
         )
         async for token in _strip_think_tags(raw_stream):
             yield token
+        # Reached the iteration/time ceiling: the review still shipped, but only a
+        # `forced` flag tells a reader the model was cut off rather than done.
+        yield _agentic_done(iterations=max_iters, forced=True)
     except Exception as e:
-        yield f"__ERROR__{str(e)[:200]}__ERROR_END__\n"
+        yield error_event(str(e))
 
 
 # ── Fast review (multi-file batch mode) ───────────────────────────────────────
@@ -437,6 +544,7 @@ async def stream_fast_code_review(
     language: str = "",
     repo_context: str = "",
     model_override: str = "",
+    should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Low-latency review: parallel deterministic tools → single LLM streaming pass.
@@ -445,6 +553,10 @@ async def stream_fast_code_review(
     per batch by multi_review_agent. It tells the LLM which other files import
     this one, what it exports, and which types/services it depends on — enabling
     cross-file findings without reviewing every file with the LLM.
+
+    `should_stop` is consulted once, immediately before the model is asked. This path
+    makes a single call, so there is no queue to drain — but a review nobody is waiting
+    for still occupies the model that the next user needs.
 
     model_override: if non-empty, routes the LLM call to a specific Ollama model
     (set by the LLM router in multi_review_agent based on the file's triage score).
@@ -457,22 +569,39 @@ async def stream_fast_code_review(
     preview = file_content[:9000]
     trunc   = f"\n[Truncated — {len(file_content)} chars total]" if len(file_content) > 9000 else ""
 
-    yield f"__STATUS__Scanning `{file_name}`...{json.dumps({'step': 'starting', 'mode': 'fast'})}__STATUS_END__\n"
+    yield status_event(f"Scanning `{file_name}`…", step="starting", mode="fast")
+
+    started_at = time.monotonic()
+
+    async def _never_stopped() -> bool:
+        return False
+
+    stop = should_stop or _never_stopped
 
     try:
         # One AST parse replaces three overlapping regex tools. The analyzer
         # returns proven findings with line numbers, so the model is handed
         # facts to explain rather than patterns to re-derive — which is what
         # closes most of the gap between a 7B local model and a hosted one.
+        analysed_at = time.monotonic()
         analysis = await asyncio.to_thread(analyze_file, file_content, file_name, language)
         verified_facts = build_llm_facts(analysis)
+        analysis_ms = int((time.monotonic() - analysed_at) * 1000)
 
         context_block = (
             f"\n### Cross-file Repo Context\n{repo_context}\n"
             if repo_context else ""
         )
 
-        yield f"__STATUS__Writing review...{json.dumps({'step': 'writing', 'mode': 'fast'})}__STATUS_END__\n"
+        # The split the latency work needs: this is the cost of the deterministic
+        # pre-pass, and everything after it is the model's. The count is reported
+        # without a proven/heuristic split — that threshold belongs to the
+        # analyzer, and a second copy here would be a second definition.
+        yield status_event(
+            f"Writing review… ({len(analysis.findings)} finding(s) from static analysis)",
+            step="writing", mode="fast",
+            analysis_ms=analysis_ms, findings=len(analysis.findings),
+        )
 
         messages = [
             SystemMessage(content=FAST_REVIEW_SYSTEM_PROMPT),
@@ -492,6 +621,15 @@ async def stream_fast_code_review(
             )),
         ]
 
+        if await stop():
+            # The static analysis ran and is reported, because it finished. What must
+            # not happen is the call that follows it.
+            yield _review_cancelled(
+                file_name, "fast", started_at,
+                analysis_ms=analysis_ms, findings=len(analysis.findings), stopped_before_model=True,
+            )
+            return
+
         raw_stream = (
             chunk.content
             async for chunk in streaming_llm.with_config(callbacks=[get_token_callback()]).astream(messages)
@@ -500,8 +638,19 @@ async def stream_fast_code_review(
         async for token in _strip_think_tags(raw_stream):
             yield token
 
+        # `elapsed_ms` is this file's whole review; `analysis_ms` is the part that
+        # cost no model at all. The split is the point: on a small local model the
+        # deterministic pre-pass is often a tenth of the run, and a single total
+        # hides both that fact and the opportunity.
+        yield status_event(
+            f"Review done: `{file_name}`",
+            step="complete", mode="fast",
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            analysis_ms=analysis_ms, findings=len(analysis.findings),
+        )
+
     except Exception as e:
-        yield f"__ERROR__{str(e)[:200]}__ERROR_END__\n"
+        yield error_event(str(e))
 
 
 # ── Batched multi-file review ─────────────────────────────────────────────────
