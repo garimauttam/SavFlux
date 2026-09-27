@@ -14,8 +14,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { diffLines, Change } from "diff";
 import {
   Wand2,
@@ -38,7 +36,9 @@ import {
 } from "lucide-react";
 import { IndexedFile } from "../types";
 import { useCodeWriter } from "../hooks/useCodeWriter";
+import { StopButton } from "./StopButton";
 import { apiFetch } from "../api";
+import { CodeHighlight } from "../lib/highlight";
 
 interface CodeWriterPanelProps {
   indexedFiles: IndexedFile[];
@@ -318,7 +318,7 @@ function ContextPicker({
 
 // ── Main panel ────────────────────────────────────────────────────────────────
 export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
-  const { isGenerating, output, steps, currentStep, error, generate, reset } = useCodeWriter();
+  const { isGenerating, output, steps, currentStep, error, stopped, generate, reset, stop } = useCodeWriter();
 
   const [mode, setMode] = useState<WriteMode>("generate");
 
@@ -706,6 +706,11 @@ export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
                 : <><activeMode.Icon className="w-4 h-4" />{buttonLabel}</>
               }
             </button>
+            {isGenerating && (
+              <div className="mt-2">
+                <StopButton onClick={stop} className="w-full" />
+              </div>
+            )}
           </div>
         </div>
 
@@ -768,10 +773,15 @@ export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
                 </div>
               )}
 
-              {/* Current step */}
-              {isGenerating && currentStep && (
-                <div className={`flex items-center gap-2 text-xs ${activeMode.color}`}>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              {/* Current step — and, once the reader stops it, where it stopped */}
+              {currentStep && (isGenerating || stopped) && (
+                <div
+                  role={stopped ? "status" : undefined}
+                  className={`flex items-center gap-2 text-xs ${
+                    stopped ? "text-amber-300/90 bg-amber-500/10 border border-amber-500/25 rounded-lg px-3 py-2" : activeMode.color
+                  }`}
+                >
+                  {isGenerating && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                   {currentStep}
                 </div>
               )}
@@ -821,15 +831,13 @@ export function CodeWriterPanel({ indexedFiles }: CodeWriterPanelProps) {
                                 </span>
                                 <CopyButton text={codeText} />
                               </div>
-                              <SyntaxHighlighter
-                                style={vscDarkPlus}
+                              <CodeHighlight
                                 language={match[1]}
-                                PreTag="div"
                                 className="!mt-0 !rounded-none text-xs"
                                 customStyle={{ margin: 0, borderRadius: 0 }}
                               >
                                 {codeText}
-                              </SyntaxHighlighter>
+                              </CodeHighlight>
                             </div>
                           ) : (
                             <code className={`px-1.5 py-0.5 rounded text-xs font-mono bg-gray-800 ${activeMode.color}`}>{children}</code>

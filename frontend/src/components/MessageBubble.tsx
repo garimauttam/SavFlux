@@ -24,8 +24,6 @@
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { useState } from "react";
 import { User, Bot, FileCode, Activity, ShieldCheck, ShieldAlert, Shield, ExternalLink, Share2, Copy, Check } from "lucide-react";
 // snippet save event dispatched via savflux:snippet-save
@@ -34,6 +32,7 @@ import { ExportButton } from "./ExportButton";
 import { VoiceButton } from "./VoiceButton";
 import { Message, SourceFile } from "../types";
 import { TrustLedgerDrawer } from "./TrustLedger";
+import { CodeHighlight } from "../lib/highlight";
 
 interface MessageBubbleProps {
   message: Message;
@@ -102,10 +101,8 @@ const mdComponents: React.ComponentProps<typeof ReactMarkdown>["components"] = {
           <div className="flex items-center justify-between px-3 py-1 bg-gray-900 border-b border-gray-700">
             <span className="text-xs text-gray-500 font-mono">{match[1]}</span>
           </div>
-          <SyntaxHighlighter
-            style={vscDarkPlus}
+          <CodeHighlight
             language={match[1]}
-            PreTag="div"
             customStyle={{
               margin: 0,
               borderRadius: 0,
@@ -114,7 +111,7 @@ const mdComponents: React.ComponentProps<typeof ReactMarkdown>["components"] = {
             }}
           >
             {String(children).replace(/\n$/, "")}
-          </SyntaxHighlighter>
+          </CodeHighlight>
         </div>
       );
     }

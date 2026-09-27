@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { vendorChunkFor } from './src/lib/chunking'
 
 // Vite config — two things worth noting:
 // 1. proxy: forwards /api calls to FastAPI during development
@@ -21,6 +22,22 @@ const allowedHosts = (process.env.VITE_ALLOWED_HOSTS ?? "")
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Emits dist/.vite/manifest.json, which is what `scripts/bundle-report.mjs` reads to
+    // know the difference between "a chunk exists" and "the browser must have it before
+    // it can paint". Chunk-to-chunk imports are the entry graph; guessing them from the
+    // minified output is not something a budget should rest on.
+    manifest: true,
+    rollupOptions: {
+      output: {
+        // The policy — which subtree lands in which file, and why only one of them is
+        // optional at first paint — is in src/lib/chunking.ts (imported here rather than
+        // restated, and covered by src/lib/chunking.test.ts, so the config and the
+        // guarantee cannot drift apart).
+        manualChunks: vendorChunkFor,
+      },
+    },
+  },
   server: {
     allowedHosts: allowedHosts.length > 0 ? allowedHosts : undefined,
     proxy: {

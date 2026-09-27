@@ -167,6 +167,46 @@ def _resolve_embedding_device(configured: str) -> str:
     return "cpu"
 
 
+#: Providers whose embedding path is a local model, i.e. free at $0. Everything else
+#: embeds through a paid API — and a corpus is 1,800-odd calls, not one, which is why
+#: "the benchmark uses whatever the product uses" is not a safe rule. The set lives here,
+#: next to the branch that implements it, so that adding a provider cannot silently leave
+#: a caller's allowlist behind.
+LOCAL_EMBEDDING_PROVIDERS = frozenset({"deepseek", "ollama"})
+
+
+def build_local_embeddings(model_name: str) -> Any:
+    """
+    The one construction of a local, free embedding model: device, normalisation, batch.
+
+    Split out of `get_embedding_fn` so a caller that only knows a model NAME — the
+    benchmark, which must be able to measure a candidate embedder without being the
+    product's configured one — gets exactly what production gets. A second copy of these
+    three settings is how a benchmark starts measuring an embedding pipeline that ships
+    to nobody: different normalisation and the cosine scores, and the retrieval numbers,
+    are not the same quantity.
+
+    The matching rule still governs: the model used at index time must be the model used
+    at query time, so naming a model here is a decision about what to index with, not a
+    way to run two at once. Uncached on purpose — `get_embedding_fn` keeps its own cache,
+    and a name-keyed cache for a benchmark pin would be a second lifecycle to reason
+    about for one construction per run.
+    """
+    s = _settings()
+    try:
+        from langchain_huggingface import HuggingFaceEmbeddings
+    except ImportError:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs={"device": _resolve_embedding_device(s.embedding_device)},
+        encode_kwargs={
+            "normalize_embeddings": True,
+            "batch_size": s.embedding_batch_size,
+        },
+    )
+
+
 @lru_cache(maxsize=1)
 def get_embedding_fn() -> Any:
     """
@@ -180,26 +220,14 @@ def get_embedding_fn() -> Any:
     openai uses text-embedding-3-small (paid, 1536 dims).
     """
     s = _settings()
-    if s.llm_provider in ("deepseek", "ollama"):
-        try:
-            from langchain_huggingface import HuggingFaceEmbeddings
-        except ImportError:
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-        return HuggingFaceEmbeddings(
-            model_name=s.embedding_model,
-            model_kwargs={"device": _resolve_embedding_device(s.embedding_device)},
-            encode_kwargs={
-                "normalize_embeddings": True,
-                "batch_size": s.embedding_batch_size,
-            },
-        )
-    else:
-        _require_key("OPENAI_API_KEY", s.openai_api_key)
-        from langchain_openai import OpenAIEmbeddings
-        return OpenAIEmbeddings(
-            model=s.openai_embedding_model,
-            openai_api_key=s.openai_api_key,
-        )
+    if s.llm_provider in LOCAL_EMBEDDING_PROVIDERS:
+        return build_local_embeddings(s.embedding_model)
+    _require_key("OPENAI_API_KEY", s.openai_api_key)
+    from langchain_openai import OpenAIEmbeddings
+    return OpenAIEmbeddings(
+        model=s.openai_embedding_model,
+        openai_api_key=s.openai_api_key,
+    )
 
 
 def get_provider_name() -> str:

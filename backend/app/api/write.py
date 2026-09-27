@@ -103,6 +103,9 @@ async def generate_code(request: Request, body: WriteGenerateRequest, _: None = 
             file_name=body.file_name,
             context_sources=body.context_sources,
             mode=body.mode,
+            # Forwarding the disconnect is what makes the Stop button stop work,
+            # rather than merely stop drawing.
+            should_stop=request.is_disconnected,
         ),
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

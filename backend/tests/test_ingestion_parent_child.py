@@ -32,6 +32,12 @@ NORM = ing.normalize_repo_url(REPO)
 
 BODY = "def handler(request):\n    return request.args.get('id')\n"
 
+#: The index-build stamp these fixtures carry. Patched onto `index_build_id` inside
+#: `_ingest` so the comparison is deterministic whatever .env the suite runs under — and
+#: so a fixture that forgot to carry one is exercising the "unattributed, rebuild" path,
+#: which is a behaviour of its own with a test of its own.
+BUILD = "build-fixture-1"
+
 
 def _parent(path: str, token: str, repeat: int = 25, chunk_index: int = 0) -> Document:
     """
@@ -54,6 +60,7 @@ def _parent(path: str, token: str, repeat: int = 25, chunk_index: int = 0) -> Do
             "language": "python",
             "repo_url": NORM,
             "content_hash": f"hash-{token}",
+            "index_build": BUILD,
             "chunk_index": chunk_index,
             "symbol_name": "handler",
             "start_line": 1,
@@ -143,6 +150,7 @@ async def _ingest(store, documents, files):
     with patch.object(ing.git, "Repo", return_value=object()), \
          patch.object(ing, "_collect_files", side_effect=_collect), \
          patch.object(ing, "_load_and_split", return_value=documents), \
+         patch.object(ing, "index_build_id", return_value=BUILD), \
          patch.object(ing, "_get_vectorstore", return_value=store), \
          patch("app.services.trust_service.record_index"), \
          patch("app.services.history_service.seed_mirror_from_tmp"):
