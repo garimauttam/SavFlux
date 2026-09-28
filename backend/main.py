@@ -11,6 +11,7 @@ It should NOT contain any business logic.
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -43,7 +44,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.limiter import limiter
 
 from app.core.config import get_settings
-from app.api import ingest, chat, review, write, metrics, agent, prompts, analytics, share, trust, history, architecture, snippets, activity, bulk, file_tree, diff, notifications, slash, watcher, security, policy
+from app.api import ingest, chat, review, write, metrics, agent, prompts, analytics, share, trust, history, architecture, snippets, activity, bulk, file_tree, diff, notifications, slash, watcher, security, policy, github, models, auth, workspace
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,25 @@ async def lifespan(app: FastAPI):
             logger.info("BM25 index warmed.")
         except Exception as e:
             logger.warning(f"BM25 warmup skipped: {e}")
+
+    # Establish the single owner's credential before the API accepts traffic.
+    # A supplied environment API_KEY takes precedence and is never copied to disk.
+    # When no environment key exists, generate a random owner key once in the
+    # configured data directory and print it once so the local operator can sign in.
+    if not (settings.api_key or "").strip():
+        from app.services.owner_key import load_or_create_owner_key, read_stored_key
+        owner_key, created = load_or_create_owner_key()
+        if created:
+            if read_stored_key():
+                logger.warning(
+                    "SavFlux first-run owner key (copy it now; it will not be shown again): %s",
+                    owner_key,
+                )
+            else:
+                logger.error(
+                    "Could not persist the SavFlux owner key. Set API_KEY in the environment "
+                    "and configure a persistent data directory before exposing this instance."
+                )
 
     # Do not block socket binding on model downloads or a large BM25 rebuild.
     # Requests can arrive immediately and pay the warmup cost only if needed.
@@ -198,6 +218,45 @@ async def analytics_middleware(request: Request, call_next):
     return response
 
 
+# ── API authentication ─────────────────────────────────────────────────────────
+# Route-level dependencies are retained as defence in depth and for API docs,
+# but this gate also covers endpoints added later without an auth dependency.
+# The only public API surface is a capability-based share URL; the owner key is
+# deliberately not required to view a share that its owner explicitly created.
+@app.middleware("http")
+async def authenticate_api_requests(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/api/v1/") or request.method == "OPTIONS":
+        return await call_next(request)
+
+    # The sign-in check validates the key in its route dependency. Public share
+    # links are intentionally capability URLs (share IDs are unguessable).
+    public_session_check = path == "/api/v1/auth/session" and request.method == "POST"
+    public_share = path.startswith("/api/v1/share/") and request.method == "GET"
+    if public_session_check or public_share:
+        return await call_next(request)
+
+    from app.services.owner_key import effective_owner_key
+    expected = effective_owner_key()
+    provided = request.headers.get("X-API-Key", "")
+    if not expected:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    "SavFlux owner authentication is not configured. Set API_KEY, "
+                    "or restart with a writable persistent data directory."
+                )
+            },
+        )
+    if not hmac.compare_digest(provided, expected):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "SavFlux sign-in required. Enter the instance owner key."},
+        )
+    return await call_next(request)
+
+
 # ── CORS ───────────────────────────────────────────────────────────────────────
 # CORS = Cross-Origin Resource Sharing.
 # Without this, the browser blocks requests from localhost:3000 (React dev server)
@@ -237,6 +296,13 @@ app.include_router(slash.router, prefix="/api/v1")
 app.include_router(watcher.router, prefix="/api/v1")
 app.include_router(security.router, prefix="/api/v1")
 app.include_router(policy.router, prefix="/api/v1")
+# GitHub and the model picker are the two surfaces that make SavFlux usable as
+# a product rather than a demo: the first is how your code gets to GitHub at
+# all, the second is how you find out which free model is answering.
+app.include_router(github.router, prefix="/api/v1")
+app.include_router(models.router, prefix="/api/v1")
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(workspace.router, prefix="/api/v1")
 
 
 @app.get("/health")
@@ -255,14 +321,15 @@ async def health_check():
         get_hosted_model_name,
         get_provider_name,
     )
+    from app.services.model_service import active_chat_model, active_provider
+    active_provider_name = active_provider()
     checks: dict[str, str] = {}
     overall_ok = True
 
     # ── Check 1: LLM provider ─────────────────────────────────────────────────
-    # Supported providers: "ollama" | "deepseek" | "openai"  (see config.py Literal).
-    # Ollama is probed over its native /api/tags route; every hosted provider
-    # speaks the OpenAI HTTP API, so one openai.AsyncOpenAI probe covers them all.
-    if settings.llm_provider == "ollama":
+    # The user-selected provider can override the deployment default. Ollama is
+    # probed over /api/tags; hosted providers share an OpenAI-compatible probe.
+    if active_provider_name == "ollama":
         try:
             import httpx
             async with httpx.AsyncClient(
@@ -271,14 +338,14 @@ async def health_check():
             ) as client:
                 response = await client.get("/api/tags")
             response.raise_for_status()
-            checks["llm"] = f"ok (Ollama — {settings.ollama_chat_model})"
+            checks["llm"] = f"ok (Ollama — {active_chat_model()})"
         except Exception as e:
             checks["llm"] = f"error: {str(e)[:120]}"
             overall_ok = False
     else:
         hosted_kwargs = get_hosted_client_kwargs()
         if hosted_kwargs is None:
-            checks["llm"] = f"error: unknown LLM_PROVIDER={settings.llm_provider!r}"
+            checks["llm"] = f"error: unknown LLM_PROVIDER={active_provider_name!r}"
             overall_ok = False
         else:
             try:

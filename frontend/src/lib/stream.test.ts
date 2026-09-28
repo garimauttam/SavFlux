@@ -13,7 +13,8 @@
 import { describe, expect, it } from "vitest";
 import {
   AGENT_TAGS, CHAT_TAGS, MARKER_TAGS, REVIEW_TAGS,
-  containsMarker, decodeStatus, drainMarkers, flushTail, formatDuration, stripMarkers,
+  containsMarker, decodeStatus, drainMarkers, flushTail, formatDuration, salvageUnreadableStream,
+  stripMarkers,
 } from "./stream";
 
 const status = (payload: string) => `${MARKER_TAGS.status.open}${payload}${MARKER_TAGS.status.close}\n`;
@@ -92,6 +93,42 @@ describe("drainMarkers", () => {
     expect(flushTail("error code __STAT", AGENT_TAGS)).toBe("error code __STAT");
   });
 
+  it("recovers the answer after a marker that never closed", () => {
+    // A close tag the client cannot match — a producer bug, a proxy that
+    // rewrote the body, a version skew. The reply used to disappear entirely:
+    // the scan held from the first open tag to the end of the response and
+    // flush cut at index 0, so the reader saw an empty message and no error.
+    // `stream_protocol.py` puts a marker on a line of its own, so the newline
+    // is where the unreadable marker ends and the answer resumes.
+    const mangled = [
+      `${MARKER_TAGS.status.open}{"step":"retrieving"}_STATUS_END_\n`,
+      "Signature verification happens in `token_backend.verify`.\n",
+    ].join("");
+    expect(flushTail(mangled, CHAT_TAGS)).toBe("Signature verification happens in `token_backend.verify`.\n");
+  });
+
+  it("resumes after a bad line and still parses the markers that follow", () => {
+    const body = [
+      `${MARKER_TAGS.status.open}{"step":"broken"}_STATUS_END_\n`,
+      status('{"step":"reranking"}'),
+      "## Answer\n",
+      status('{"step":"done"}'),
+      "last line",
+    ].join("");
+    // The good markers are recovered by drainMarkers; the tail is prose only.
+    const scan = drainMarkers(body, CHAT_TAGS);
+    const prose = scan.segments
+      .filter((segment): segment is { kind: "text"; value: string } => segment.kind === "text")
+      .map((segment) => segment.value)
+      .join("");
+    expect(prose + flushTail(scan.rest, CHAT_TAGS)).toBe("## Answer\nlast line");
+  });
+
+  it("keeps prose that precedes a truncated marker", () => {
+    const body = `The answer so far.\n${MARKER_TAGS.status.open}{"step":"wri`;
+    expect(flushTail(body, AGENT_TAGS)).toBe("The answer so far.\n");
+  });
+
   it("keeps section order so prose lands on the card it belongs to", () => {
     const stream = [
       "prose-for-a",
@@ -108,9 +145,31 @@ describe("drainMarkers", () => {
       "answer " +
       `${MARKER_TAGS.sources.open}[{"file":"a.py"}]${MARKER_TAGS.sources.close}\n` +
       "more " +
-      `${MARKER_TAGS.diagnostic.open}P01 retrieval drift${MARKER_TAGS.diagnostic.close}\n`;
+      `${MARKER_TAGS.diagnostic.open}P01 retrieval drift${MARKER_TAGS.diagnostic.close}\n` +
+      "and " +
+      `${MARKER_TAGS.grounding.open}{"is_clean":false}${MARKER_TAGS.grounding.close}\n`;
     const kinds = drainMarkers(stream, CHAT_TAGS).segments.map((segment) => segment.kind);
-    expect(kinds).toEqual(["text", "sources", "text", "diagnostic"]);
+    expect(kinds).toEqual(["text", "sources", "text", "diagnostic", "text", "grounding"]);
+  });
+
+  it("the grounding marker is chat-only, so a review stream cannot emit one", () => {
+    // A review or agent stream is not passed the sources it would be checked
+    // against; honouring the marker there would render a check with no basis.
+    const stream = `a${MARKER_TAGS.grounding.open}{"is_clean":false}${MARKER_TAGS.grounding.close}`;
+    const scan = drainMarkers(stream, REVIEW_TAGS);
+
+    // Not parsed as a marker — it stays prose, and the text is not lost: the
+    // scanner holds a trailing `__` back because it could still become one.
+    expect(scan.segments.every((segment) => segment.kind === "text")).toBe(true);
+    const prose = scan.segments.map((segment) => (segment as { value: string }).value).join("");
+    expect(prose + flushTail(scan.rest, REVIEW_TAGS)).toBe(stream);
+  });
+
+  it("an unterminated grounding marker is held back rather than shown as prose", () => {
+    const stream = `answer\n${MARKER_TAGS.grounding.open}{"is_c`;
+    const scan = drainMarkers(stream, CHAT_TAGS);
+    expect(scan.rest).toBe(`${MARKER_TAGS.grounding.open}{"is_c`);
+    expect(flushTail(scan.rest, CHAT_TAGS)).toBe("");
   });
 
   it("reports markers and strips them for a string-only reader", () => {
@@ -179,5 +238,38 @@ describe("formatDuration", () => {
     expect(formatDuration(12400)).toBe("12.4 s");
     expect(formatDuration(65_000)).toBe("1 m 05 s");
     expect(formatDuration(null)).toBe("");
+  });
+});
+
+describe("salvageUnreadableStream", () => {
+  it("explains a body whose delimiters never matched", () => {
+    // The body that produced a blank answer in the first screenshot run: the
+    // producer wrote `_STATUS_END_` and the client knew only `__STATUS_END__`,
+    // so the whole response was held back and then cut.
+    const body = [
+      '__STATUS__{"step":"retrieving","message":"Searching 2,830 windows across 147 files…"}_STATUS_END_',
+      "Signature verification happens in `token_backend.verify`.",
+    ].join("");
+
+    const salvaged = salvageUnreadableStream(body, CHAT_TAGS);
+    expect(salvaged).toBeTruthy();
+    expect(salvaged).toContain("Signature verification happens in `token_backend.verify`.");
+    // The protocol must not be reprinted as if it were the answer.
+    expect(salvaged).not.toContain("__STATUS__");
+    expect(salvaged).not.toContain("_STATUS_END_");
+    expect(salvaged).not.toContain('"step":"retrieving"');
+  });
+
+  it("has nothing to say about an empty tail", () => {
+    expect(salvageUnreadableStream("", CHAT_TAGS)).toBeNull();
+    expect(salvageUnreadableStream("   \n ", CHAT_TAGS)).toBeNull();
+    // Telemetry only, no prose: showing a paragraph of JSON as an answer is
+    // worse than showing nothing.
+    expect(salvageUnreadableStream('__STATUS__{"step":"wri', CHAT_TAGS)).toBeNull();
+  });
+
+  it("strips well-formed markers too, since the caller only reaches it with no prose", () => {
+    const body = `${status('{"step":"done"}')}\nAll three gates passed.\n`;
+    expect(salvageUnreadableStream(body, CHAT_TAGS)).toContain("All three gates passed.");
   });
 });

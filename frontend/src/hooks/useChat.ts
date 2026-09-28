@@ -13,9 +13,9 @@
  */
 
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Message, SourceFile } from "../types";
+import { Message, SourceFile, GroundingReport } from "../types";
 import { apiFetch } from "../api";
-import { CHAT_TAGS, decodeStatus, drainMarkers, flushTail } from "../lib/stream";
+import { CHAT_TAGS, decodeStatus, drainMarkers, flushTail, salvageUnreadableStream } from "../lib/stream";
 
 function generateId(): string {
   return Math.random().toString(36).slice(2, 9);
@@ -137,6 +137,7 @@ export function useChat(
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
       let sources: SourceFile[] = [];
+      let grounding: GroundingReport | undefined;
       let buffer = "";
       let answerBuffer = "";
       let generationSteps: string[] = [];
@@ -171,6 +172,21 @@ export function useChat(
             }
             continue;
           }
+          if (segment.kind === "grounding") {
+            // A malformed report is dropped rather than guessed at: the answer
+            // and its citations are already on screen, and a fabricated
+            // warning about them would be worse than no warning.
+            try {
+              const parsed = JSON.parse(segment.payload);
+              if (parsed && typeof parsed === "object") {
+                grounding = parsed as GroundingReport;
+              }
+            } catch {
+              // Deliberately swallowed, loudly commented — same reasoning as
+              // the citations block above.
+            }
+            continue;
+          }
           if (segment.kind === "diagnostic") {
             const note = segment.payload.trim();
             if (note) generationSteps = [...generationSteps, `⚠️ ${note}`];
@@ -196,7 +212,7 @@ export function useChat(
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMessageId
-              ? { ...m, content: answerBuffer, sources, generationSteps }
+              ? { ...m, content: answerBuffer, sources, grounding, generationSteps }
               : m
           )
         );
@@ -206,10 +222,20 @@ export function useChat(
       // never finished it, which is truncated telemetry and must not be shown.
       const residual = flushTail(buffer, CHAT_TAGS);
 
+      // A turn that produced no prose at all — the server sent only markers, or
+      // markers whose delimiters this build cannot match — used to render as an
+      // empty bubble, which reads as "the model had nothing to say" when the
+      // bytes actually arrived and were dropped. Show what came instead, and say
+      // so, rather than leaving the reader with a blank and no next step.
+      const answered = (answerBuffer + residual).trim();
+      const content = answered
+        ? (answerBuffer + residual).trimStart()
+        : (salvageUnreadableStream(buffer, CHAT_TAGS) ?? answered);
+
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantMessageId
-            ? { ...m, content: (answerBuffer + residual).trimStart(), isStreaming: false, sources, generationSteps }
+            ? { ...m, content, isStreaming: false, sources, generationSteps }
             : m
         )
       );

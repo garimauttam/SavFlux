@@ -47,7 +47,11 @@ from fastapi.testclient import TestClient  # noqa: E402
 def _make_fake_settings():
     """Return a Settings-like object with dummy values for all required fields."""
     from app.core.config import Settings
-    return Settings(llm_provider="openai", openai_api_key="sk-test-fake-key-for-tests")
+    return Settings(
+        llm_provider="openai",
+        openai_api_key="sk-test-fake-key-for-tests",
+        api_key="test-owner-key",
+    )
 
 
 @pytest.fixture()
@@ -120,6 +124,7 @@ def client():
     # before any other patch can take effect. Without this, Settings() fails
     # because OPENAI_API_KEY is not set in the test environment.
     with patch("app.core.config.get_settings", return_value=fake_settings), \
+         patch("app.services.owner_key.get_settings", return_value=fake_settings), \
          patch("app.services.ingestion_service.settings", fake_settings), \
          patch("openai.AsyncOpenAI"), \
          patch("chromadb.PersistentClient") as mock_chroma, \
@@ -128,7 +133,12 @@ def client():
         # Make heartbeat() a no-op so the health check's ChromaDB check passes
         mock_chroma.return_value.heartbeat.return_value = True
 
-        # NOW import main — patches are already in place
+        # NOW import main — patches are already in place. The fixture uses the
+        # same explicit test owner key every request, mirroring real sign-in.
         from main import app
-        with TestClient(app, raise_server_exceptions=False) as c:
+        with TestClient(
+            app,
+            raise_server_exceptions=False,
+            headers={"X-API-Key": "test-owner-key"},
+        ) as c:
             yield c

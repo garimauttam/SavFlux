@@ -13,36 +13,212 @@
 html, body, #root {
   height: 100%;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Design tokens ────────────────────────────────────────────────────────────
+ * One palette, named by role rather than by colour, so the shell and the panels
+ * written earlier agree without either of them owning the other's values.
+ *
+ * The old app had no tokens at all: 39 components each picked from the
+ * gray-800/900/950 ramp independently, which is why nothing matched and the UI
+ * read as assembled rather than designed. These are the values the shell uses,
+ * and `.sf-*` below gives them to markup that should not depend on a utility
+ * class surviving a Tailwind purge.
+ */
+:root {
+  --sf-canvas: #08080a;
+  --sf-surface: #0d0d10;
+  --sf-raised: #141418;
+  --sf-overlay: #1a1a20;
+  --sf-line: rgba(255, 255, 255, 0.08);
+  --sf-line-strong: rgba(255, 255, 255, 0.14);
+  --sf-text: #e8e8ec;
+  --sf-text-dim: #a1a1ab;
+  --sf-text-mute: #6b6b76;
+  --sf-accent: #6366f1;
+  --sf-accent-soft: rgba(99, 102, 241, 0.14);
+  --sf-accent-line: rgba(99, 102, 241, 0.38);
+  --sf-good: #34d399;
+  --sf-warn: #fbbf24;
+  --sf-bad: #f87171;
+  --sf-rail: 60px;
+  --sf-rail-open: 212px;
+  --sf-topbar: 48px;
+  --sf-status: 26px;
+  --sf-radius: 12px;
+}
+
+/* Light theme overrides for the same roles. The older utility remap further
+ * down still covers the panels that predate these tokens. */
+html:not(.dark) {
+  --sf-canvas: #f6f7f9;
+  --sf-surface: #ffffff;
+  --sf-raised: #f2f3f6;
+  --sf-overlay: #ffffff;
+  --sf-line: rgba(15, 23, 42, 0.10);
+  --sf-line-strong: rgba(15, 23, 42, 0.18);
+  --sf-text: #0f172a;
+  --sf-text-dim: #475569;
+  --sf-text-mute: #94a3b8;
+  --sf-accent: #4f46e5;
+  --sf-accent-soft: rgba(79, 70, 229, 0.10);
+  --sf-accent-line: rgba(79, 70, 229, 0.32);
 }
 
 html.dark, html.dark body {
-  background-color: #030712; /* gray-950 */
+  background-color: var(--sf-canvas);
   color-scheme: dark;
 }
 
 html:not(.dark), html:not(.dark) body {
-  background-color: #f8fafc; /* slate-50 */
+  background-color: var(--sf-canvas);
   color-scheme: light;
 }
 
-/* Custom scrollbar — makes the dark theme look polished */
+/* Custom scrollbar */
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #374151;
-  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #4b5563;
+  background: rgba(255, 255, 255, 0.22);
+  background-clip: content-box;
+}
+html:not(.dark) ::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.20);
+  background-clip: content-box;
+}
+html:not(.dark) ::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.32);
+  background-clip: content-box;
 }
 
-/* ── Light theme remap ───────────────────────────────────────────────
- * Components are built with fixed dark utilities, so instead of touching
- * every file we remap the most common surfaces when <html> lacks .dark.
+/* ── Shell primitives ─────────────────────────────────────────────────────── */
+
+.sf-surface { background: var(--sf-surface); }
+.sf-raised { background: var(--sf-raised); }
+.sf-line { border-color: var(--sf-line); }
+.sf-text { color: var(--sf-text); }
+.sf-dim { color: var(--sf-text-dim); }
+.sf-mute { color: var(--sf-text-mute); }
+.sf-accent { color: var(--sf-accent); }
+.sf-mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace; }
+
+/* Icon buttons in the rail and the top bar. One class so 40+ controls share
+ * one hover, one focus ring and one size. */
+.sf-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: var(--sf-text-dim);
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.sf-iconbtn:hover:not(:disabled) {
+  background: var(--sf-raised);
+  color: var(--sf-text);
+}
+.sf-iconbtn:disabled { opacity: 0.4; cursor: not-allowed; }
+.sf-iconbtn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--sf-accent-line);
+}
+
+/* Primary / secondary / ghost buttons. */
+.sf-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 0.42rem 0.8rem;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+.sf-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--sf-accent-line);
+}
+.sf-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.sf-btn-primary {
+  background: var(--sf-accent);
+  color: #fff;
+}
+.sf-btn-primary:hover:not(:disabled) { background: #4f52e0; }
+
+.sf-btn-secondary {
+  background: var(--sf-raised);
+  border: 1px solid var(--sf-line);
+  color: var(--sf-text);
+}
+.sf-btn-secondary:hover:not(:disabled) { background: var(--sf-overlay); border-color: var(--sf-line-strong); }
+
+.sf-btn-ghost {
+  background: transparent;
+  color: var(--sf-text-dim);
+}
+.sf-btn-ghost:hover:not(:disabled) { background: var(--sf-raised); color: var(--sf-text); }
+
+.sf-btn-danger {
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  color: #fca5a5;
+}
+.sf-btn-danger:hover:not(:disabled) { background: rgba(248, 113, 113, 0.2); }
+
+/* Inputs, selects and textareas across the shell. */
+.sf-input {
+  width: 100%;
+  background: var(--sf-raised);
+  border: 1px solid var(--sf-line);
+  border-radius: 9px;
+  padding: 0.45rem 0.7rem;
+  font-size: 13px;
+  color: var(--sf-text);
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.sf-input::placeholder { color: var(--sf-text-mute); }
+.sf-input:focus {
+  outline: none;
+  border-color: var(--sf-accent-line);
+  background: var(--sf-overlay);
+}
+.sf-input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Small status/label chip. */
+.sf-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border-radius: 999px;
+  border: 1px solid var(--sf-line);
+  background: var(--sf-raised);
+  padding: 0.14rem 0.5rem;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--sf-text-dim);
+  white-space: nowrap;
+}
+.sf-chip-good { color: var(--sf-good); border-color: rgba(52, 211, 153, 0.28); background: rgba(52, 211, 153, 0.1); }
+.sf-chip-warn { color: var(--sf-warn); border-color: rgba(251, 191, 36, 0.28); background: rgba(251, 191, 36, 0.1); }
+.sf-chip-bad  { color: var(--sf-bad);  border-color: rgba(248, 113, 113, 0.3); background: rgba(248, 113, 113, 0.1); }
+.sf-chip-accent { color: var(--sf-accent); border-color: var(--sf-accent-line); background: var(--sf-accent-soft); }
+
+/* ── Light theme remap for components built with fixed dark utilities ───────
  * Scoped strictly to html:not(.dark) — dark mode is pixel-identical.
  */
 html:not(.dark) .bg-gray-950 { background-color: #f8fafc !important; }
@@ -60,8 +236,60 @@ html:not(.dark) .border-gray-700 { border-color: #e2e8f0 !important; }
 html:not(.dark) .border-gray-800 { border-color: #e2e8f0 !important; }
 html:not(.dark) .divide-gray-700 > :not([hidden]) ~ :not([hidden]) { border-color: #e2e8f0 !important; }
 html:not(.dark) .placeholder-gray-500::placeholder { color: #94a3b8 !important; }
-html:not(.dark) ::-webkit-scrollbar-thumb { background: #cbd5e1; }
-html:not(.dark) ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ── Light theme: the alpha neutrals ───────────────────────────────────────
+ * The rules above only ever matched the SOLID utilities. Tailwind emits
+ * `bg-black/30` and `bg-gray-800/60` as entirely separate class names from
+ * `bg-black` and `bg-gray-800`, so every alpha variant in the codebase fell
+ * through untouched and kept its dark-theme value in light mode.
+ *
+ * The visible damage was not subtle. `bg-black/30` is the field background on
+ * FileTreePanel's search bar and DiffViewer's filter — both rendered as a
+ * solid grey slab sitting on a white page, which read as a disabled or broken
+ * control rather than a text input. 36 `border-white/10` dividers stayed
+ * near-invisible (white hairline on white) and 31 `bg-white/10` panels lost
+ * the surface separation they exist to create.
+ *
+ * The mapping is a lightness flip, not a lookup table: on a light canvas a
+ * translucent BLACK surface is a raised light surface, and a translucent WHITE
+ * surface is a faint tint. That keeps the intent of the original alpha rather
+ * than copying its darkness.
+ *
+ * Every class listed here is checked against the components by
+ * src/test/lightTheme.test.ts, which fails if the source uses an alpha
+ * neutral that is missing from this block. Adding one to a component without
+ * adding it here fails the suite rather than shipping a grey slab.
+ */
+html:not(.dark) .bg-black\/20 { background-color: #f4f5f8 !important; }
+html:not(.dark) .bg-black\/30 { background-color: var(--sf-raised) !important; }
+html:not(.dark) .bg-black\/40 { background-color: #e9eaef !important; }
+html:not(.dark) .bg-black\/50 { background-color: #e4e5eb !important; }
+html:not(.dark) .bg-black\/70 { background-color: #dcdee5 !important; }
+
+html:not(.dark) .bg-white\/5  { background-color: #fafbfc !important; }
+html:not(.dark) .bg-white\/10 { background-color: #f2f3f6 !important; }
+html:not(.dark) .bg-white\/20 { background-color: #e6e7ec !important; }
+
+html:not(.dark) .border-white\/5  { border-color: rgba(15, 23, 42, 0.06) !important; }
+html:not(.dark) .border-white\/10 { border-color: var(--sf-line) !important; }
+
+html:not(.dark) .bg-gray-500\/10 { background-color: #f2f3f6 !important; }
+html:not(.dark) .bg-gray-700\/70 { background-color: #e2e8f0 !important; }
+html:not(.dark) .bg-gray-800\/40 { background-color: #f8f9fb !important; }
+html:not(.dark) .bg-gray-800\/60 { background-color: #f2f3f6 !important; }
+html:not(.dark) .bg-gray-800\/70 { background-color: #eef0f4 !important; }
+html:not(.dark) .bg-gray-800\/80 { background-color: #e9ebf0 !important; }
+html:not(.dark) .bg-gray-900\/50 { background-color: #fafbfc !important; }
+html:not(.dark) .bg-gray-900\/60 { background-color: #f5f6f9 !important; }
+html:not(.dark) .bg-gray-900\/90 { background-color: #f8fafc !important; }
+
+html:not(.dark) .border-gray-500\/30 { border-color: #e2e8f0 !important; }
+html:not(.dark) .border-gray-600\/50 { border-color: #e2e8f0 !important; }
+html:not(.dark) .border-gray-700\/50 { border-color: #e2e8f0 !important; }
+html:not(.dark) .border-gray-700\/70 { border-color: #e2e8f0 !important; }
+html:not(.dark) .border-gray-800\/50 { border-color: #e2e8f0 !important; }
+html:not(.dark) .border-gray-800\/60 { border-color: #e2e8f0 !important; }
+html:not(.dark) .divide-gray-800\/70 > :not([hidden]) ~ :not([hidden]) { border-color: #e2e8f0 !important; }
 
 /* `hover:text-white` was never remapped: 31 controls use it on a neutral gray
  * surface, so in light mode their label turned pure white on white on hover —
@@ -69,28 +297,20 @@ html:not(.dark) ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
  * slate-100/200 above, so the hover label has to go dark with them. */
 html:not(.dark) .hover\:text-white:hover { color: #0f172a !important; }
 
-/* ── Light theme: action buttons keep their white label ──────────────────
+/* ── Light theme: action buttons keep their white label ─────────────────────
  * The remap above rewrites `.text-white` to near-black, which is right for
- * body text on a white surface and wrong for the 20 classNames that put
- * `text-white` on a saturated background, across 13 shades (Agent "Run",
- * Diff "Compare", "Apply fix", "Open PR", the chat send arrow). Those were
- * designed with a white label, and the remap was measurably worse: on
- * bg-purple-600 the contrast drops from 5.38:1 to 3.32:1, below WCAG AA
- * (4.5:1).
- *
- * The shade list below is not decorative — src/test/lightTheme.test.ts scans
+ * body text on a white surface and wrong for the classNames that put
+ * `text-white` on a saturated background. src/test/lightTheme.test.ts scans
  * every .tsx for `text-white` on a saturated background and fails if a shade
- * used there is missing here (or is listed here but used nowhere). It caught
- * Code Writer's `bg-green-600` Generate button, which a hand-written list had
- * missed; the list is derived from the components, not remembered.
+ * used there is missing here (or is listed here but used nowhere).
  */
 html:not(.dark) :is(
   .bg-amber-600,
   .bg-blue-500, .bg-blue-600,
-  .bg-cyan-600,
   .bg-emerald-500, .bg-emerald-600,
   .bg-green-600,
-  .bg-pink-500, .bg-pink-600,
+  .bg-indigo-600,
+  .bg-pink-500,
   .bg-purple-600,
   .bg-red-500,
   .bg-violet-500, .bg-violet-600
@@ -98,10 +318,10 @@ html:not(.dark) :is(
 html:not(.dark) :is(
   .bg-amber-600,
   .bg-blue-500, .bg-blue-600,
-  .bg-cyan-600,
   .bg-emerald-500, .bg-emerald-600,
   .bg-green-600,
-  .bg-pink-500, .bg-pink-600,
+  .bg-indigo-600,
+  .bg-pink-500,
   .bg-purple-600,
   .bg-red-500,
   .bg-violet-500, .bg-violet-600
@@ -110,10 +330,9 @@ html:not(.dark) :is(
 }
 
 /* ── Scrollable strip with no visible scrollbar ────────────────────────────
- * The section strip scrolls because 17 tabs do not fit beside the sidebar; a
- * 6px scrollbar under a 44px row is noise, and the prev/next arrows are the
- * affordance. Keyboard and wheel scrolling still work — this hides the track,
- * it does not disable scrolling.
+ * The rail scrolls when the window is short; a scrollbar under a 60px column is
+ * noise. Keyboard and wheel scrolling still work — this hides the track, it
+ * does not disable scrolling.
  */
 .scrollbar-none {
   scrollbar-width: none;
@@ -121,4 +340,16 @@ html:not(.dark) :is(
 }
 .scrollbar-none::-webkit-scrollbar {
   display: none;
+}
+
+/* ── Motion ─────────────────────────────────────────────────────────────────
+ * One duration and one easing for every hover, so a rail that moves and a
+ * panel that fades do not disagree about how fast this app is.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

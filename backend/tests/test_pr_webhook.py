@@ -6,15 +6,8 @@ import pytest
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-from fastapi.testclient import TestClient
 from app.services.multi_review_agent import _static_triage, _triage_score
 from app.services.multi_review_agent import stream_multi_review
-
-
-@pytest.fixture
-def client():
-    from main import app
-    return TestClient(app)
 
 
 def test_pr_webhook_rejects_empty_diff(client):

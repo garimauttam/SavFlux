@@ -193,6 +193,29 @@ async def test_build_patch_tool_returns_diff_branch_and_body():
     assert result.data["digest"]
 
 
+async def test_build_patch_persists_verified_proposal_to_selected_local_worktree(monkeypatch):
+    from app.services import worktree_service
+
+    captured = {}
+
+    def persist(repo_url, changes):
+        captured["repo_url"] = repo_url
+        captured["changes"] = changes
+        return {"persisted": True, "branch": "savflux/agent-test", "dirty": True}
+
+    monkeypatch.setattr(worktree_service, "apply_changes", persist)
+    result = await build_patch(
+        changes=[{"path": "src/a.py", "original": "x = 1\n", "content": "x = 2\n"}],
+        repo_url="https://github.com/acme/project",
+    )
+
+    assert result.ok is True
+    assert captured["repo_url"] == "https://github.com/acme/project"
+    assert captured["changes"][0]["path"] == "src/a.py"
+    assert result.data["workspace"]["persisted"] is True
+    assert "local Agent worktree updated" in result.message
+
+
 async def test_build_patch_digest_matches_the_patch_service_digest():
     """
     The digest is the confirmation token for `create_pr`. If the two producers
@@ -269,7 +292,12 @@ async def test_the_right_digest_without_a_token_still_does_not_push(monkeypatch,
 
     assert result.ok
     assert result.data["status"] == "manual"
-    assert "GITHUB_TOKEN" in result.data["reason"]
+    # Named in words the reader can act on: no account is connected, and
+    # connecting one is what would change this. See test_pr_security.py for why
+    # this no longer asserts the literal string "GITHUB_TOKEN".
+    assert "not connected" in result.data["reason"].lower()
+    assert "connect" in result.data["reason"].lower()
+    assert result.data.get("gh_command"), "a manual plan with no command is not a plan"
     no_push.assert_not_called()
 
 

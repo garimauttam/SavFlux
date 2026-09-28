@@ -11,20 +11,38 @@ fix is unambiguous — a patch that `git apply` accepts.
 Everything runs on free local models by default. No API key, no credit card, no
 trial that expires into a bill.
 
-[![Tests](https://img.shields.io/badge/tests-1141%20passing-2ea043?style=flat-square)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-1294%20passing-2ea043?style=flat-square)](#-testing)
 [![Cost](https://img.shields.io/badge/cost-%240.00-2ea043?style=flat-square)](#-the-0-guarantee)
-[![First paint](https://img.shields.io/badge/first%20paint-232%20kB%20gz-0969da?style=flat-square)](#what-the-browser-downloads)
+[![First paint](https://img.shields.io/badge/first%20paint-245%20kB%20gz-0969da?style=flat-square)](#what-the-browser-downloads)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev)
 
-[Why it exists](#-why-another-code-review-tool) ·
-[Quickstart](#-quickstart-5-minutes) ·
+[Start here](#-quickstart-5-minutes) ·
+[What you can do](#-the-workspace) ·
+[GitHub + branches](#-github-end-to-end) ·
+[How it works](#-how-it-works) ·
 [Benchmarks](#-benchmarks) ·
-[What it does not do](#-what-it-does-not-do) ·
-[Roadmap](#-roadmap)
+[Security & limits](#-what-it-does-not-do) ·
+[Troubleshooting](#-troubleshooting)
 
 </div>
+
+---
+
+## 🧭 A useful first run
+
+SavFlux is built around one short loop: **bring code in → ask or review → inspect evidence → decide what ships.**
+
+| Step | In SavFlux | What to expect |
+|---|---|---|
+| **1. Choose code** | Connect GitHub, select a repository, or upload files | Public repositories can be indexed without a GitHub token; private repositories need a connected account. |
+| **2. Choose a branch and index** | Use the branch picker beside the repository name, then index it | The selected branch is now the branch SavFlux indexes for that repository. Ingestion reports progress and errors instead of leaving a blank state. |
+| **3. Ask or review** | Ask a code question in Agent, or run Review | Answers show the source lines used. Reviews combine static analysis with bounded model review. |
+| **4. Inspect changes** | Open **Changes** | **Branches** compares remote GitHub refs; **Agent workspace** shows persistent local Agent edits; **Indexed files** compares file contents already stored in SavFlux’s index. These are distinct views, not aliases for one another. |
+| **5. Ship only what you approve** | Review the patch and explicitly confirm the exact diff before opening a PR | Agent-generated patches are proposals until you confirm them. SavFlux does not silently push. |
+
+The default model path is local Ollama and costs **$0** in provider fees. If the local runtime or model is unavailable, SavFlux reports that; it does not pretend a hosted fallback or a generated answer happened.
 
 ---
 
@@ -224,6 +242,148 @@ confirmed digest, so a model decision alone can never open a pull request.
 
 ---
 
+## 🪟 The workspace
+
+The previous interface was **seventeen tabs in one flat row**. On a laptop the strip
+scrolled and clipped its own tail behind prev/next arrows, so the sections people used
+least were the ones hidden — which made the list look arbitrary. Seven of those
+"tabs" were small local collections (`Prompts`, `Snippets`, `Activity`, `History`,
+`Inbox`, `Slash`, `Bulk`), which is a filing system rather than a product, and `Chat`
+and `Agent` split one job in two: you had to decide *which product* you were in before
+you had said anything.
+
+So the app is now **nine destinations in four groups**, and the agent conversation is
+one surface with a mode switch:
+
+| group | destinations |
+|---|---|
+| **Work** | Agent · Review · Write |
+| **Understand** | Files · Graph · Health |
+| **Ship** | Repositories · Changes |
+| **Keep** | Library *(prompts, snippets, history, activity, inbox, commands, bulk, metrics)* |
+
+`frontend/src/navigation.ts` is the only place that list exists. The rail, the command
+palette, the `g`+key shortcuts and the reachability test all read from it, so a new
+destination is one entry and none of those four can drift apart again.
+
+**The rail does not collapse while you type.** The old rail expanded on hover, which
+meant it shifted under the pointer every time you reached for the composer. It is now
+*pinned* — the state is persisted in `localStorage`, defaults to expanded on a screen
+wider than 1024px, and a chevron beside the logo toggles it deliberately.
+
+| key | does |
+|---|---|
+| `⌘K` / `Ctrl+K` | command palette, including the GitHub actions |
+| `g` then `a` `r` `w` `e` `g` `h` `o` `d` `l` | jump to a destination |
+| `/` | focus search |
+| `?` | keyboard shortcuts |
+| `Esc` | close the palette, a dialog, or the context drawer |
+
+`?` is suppressed while you are typing. The guard checks **both** `event.target` and
+`document.activeElement` for an input, textarea or contenteditable, because the two
+diverge for synthesized events, IME compositions and assistive technology — and
+checking only the first meant that typing `where is the JWT signature?` into the
+composer opened the shortcuts dialog and stole the question mark.
+
+**Click a citation and the evidence opens beside the answer**, scrolled to the cited
+line with that span marked, in a drawer rather than a permanent column, because on a
+laptop the conversation needs the width. A citation that said "auth/tokens.py:42-58"
+used to cost five steps and a tab switch; now the claim and its evidence are one click
+apart, which is the only reason the rest of the product's honesty rules are worth
+anything.
+
+**Light and dark, both real.** `hooks/useTheme.ts` owns the preference, follows the OS
+while set to *system*, and `index.html` applies the stored value in an inline script
+before first paint — so the first frame is already the right theme instead of flashing
+white at a dark-mode reader.
+
+---
+
+## 🔗 GitHub, end to end
+
+GitHub is not a `GITHUB_TOKEN` read at push time. It is a connected account, a
+browsable repository list, a branch list, an index you can build from what is there,
+and one gated path that writes.
+
+**Connect.** *Repositories → Connect GitHub*, or a PAT in settings. A token connected
+**in the app** wins over `GITHUB_TOKEN` from the environment, because a machine that
+already exports a `GITHUB_TOKEN` for CI, a deploy or a shell script should not have
+those credentials silently drive a code review; disconnecting reports the environment
+fallback rather than pretending the account is gone. Private clones pass the token as
+`git -c http.https://github.com/.extraheader=…`, so it never lands in `.git/config`,
+in a remote URL, or in a crash report.
+
+```bash
+GET    /api/v1/github/status                 # connected? valid? which source?
+POST   /api/v1/github/connect               # store a PAT
+DELETE /api/v1/github/connect               # remove it
+GET    /api/v1/github/repos?q=&page=        # browse
+GET    /api/v1/github/repos/{owner}/{name}  # one repository
+GET    /api/v1/github/repos/{owner}/{name}/branches
+POST   /api/v1/github/compare             # read-only base...head comparison
+GET    /api/v1/github/repos/{owner}/{name}/pulls
+GET    /api/v1/github/pulls/{owner}/{name}/{number}
+GET    /api/v1/workspace/status?repo=owner/name # local Agent worktree diff
+POST   /api/v1/workspace/reset?repo=owner/name  # discard local Agent edits
+```
+
+For example, after connecting GitHub, compare a feature branch with `main`:
+
+```bash
+curl -sS "$SAVFLUX_URL/api/v1/github/compare" \
+  -H "X-API-Key: $SAVFLUX_OWNER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"repo":"owner/repository","base":"main","head":"feature/my-change"}'
+```
+
+The response contains the remote refs, ahead/behind counts, bounded changed-file
+patches, commit summaries, and the GitHub comparison URL. It does not mutate GitHub.
+
+**Index.** Indexing a repository streams progress over SSE and also returns a `job_id`,
+so a browser refresh or a dropped connection cannot silently lose an ingest — the
+client polls `GET /api/v1/ingest/status/{job_id}` and finds out what happened. A public
+repository can be ingested by URL with no token at all, and files can be uploaded
+directly. Ingestion failures are translated by `friendly_ingest_error` before they reach
+the UI: when the embedding step cannot reach `huggingface.co`, the reader is told that
+the model could not be downloaded, not shown a raw `MaxRetryError` for a host name they
+never typed. There is deliberately no silent hashing fallback — a hashed "embedding"
+produces confident nonsense and is worse than an error.
+
+**Compare branches.** Open **Changes → Branches**, choose a base and compare ref, and
+SavFlux asks GitHub for a read-only `base...head` comparison. The page shows ahead /
+behind counts, commit summaries, changed-file totals, and per-file patches. The repo’s
+default branch is the initial base; the branch selected in the top bar is used as the
+initial compare ref when it differs. You can change either selector before comparing.
+
+The other Changes view, **Indexed files**, is intentionally different: it compares two
+file contents already stored in SavFlux’s index. It can be useful for two snapshots,
+but it is not a branch diff. The tab now names that distinction rather than making you
+guess from two file pickers with the same basename.
+
+**Agent workspace.** Each GitHub repository gets a dedicated SavFlux-managed local
+branch when Agent successfully builds its first patch. The worktree starts at the exact
+commit recorded by indexing, keeps uncommitted changes between visits, and refuses to
+apply a later proposal if the index has moved or the local file no longer matches its
+base. **Reset edits** is explicit and discards only that isolated workspace; it never
+changes the remote branch.
+
+**What “local” means here.** GitHub branch comparison is between remote GitHub refs.
+Ingestion still deletes its temporary clone after indexing. When Agent builds a patch
+for an indexed GitHub repository, SavFlux creates or reuses an isolated server-side Git
+worktree on a local `savflux/agent-*` branch based on the exact indexed commit, applies
+the verified proposal, and retains it across page loads. **Changes → Agent workspace**
+shows that local diff and can reset it. It is not the developer’s laptop checkout, and
+nothing is committed or pushed by that action. The existing digest-bound confirmation
+is still required before a PR can write to GitHub.
+
+**Ship.** Creating a pull request goes through the same digest-bound gate as the
+autofix path: `POST /review/create-pr` refuses to push unless the caller echoes back
+the digest of the exact diff it displayed, so a stale preview or a swapped diff fails
+the check instead of being pushed. Without a token the same endpoint returns the
+`gh pr create` command and the patch, so the path still works at $0.
+
+---
+
 ## 🧠 How it works
 
 ```mermaid
@@ -326,15 +486,57 @@ python3 scripts/bench_security.py --compare 2b049e9  # and the regex baseline it
 
 ### Retrieval
 
-`eval_rag.py` runs 44 queries against SavFlux's own source and gates CI: **the build
-fails if Hit Rate@5 drops below 40%**. It reports per stage and per retrieval leg
-(`bm25_only`, `dense_only`, `fused`, `fused_reranked`), at two granularities, and
-`--compare BASELINE.json` diffs two runs while recording dataset and corpus hashes so
-runs over different inputs cannot be silently blended.
+`eval_rag.py` runs 44 queries against SavFlux's own source. It reports per stage and
+per retrieval leg (`bm25_only`, `dense_only`, `fused`, `fused_reranked`), at two
+granularities, and records dataset and corpus hashes so runs over different inputs
+cannot be silently blended.
+
+**The regression gate.** CI holds every quality metric to a floor against a committed
+baseline, and fails the build when one drops further than that floor:
 
 ```bash
-python eval_rag.py --embedder offline --no-rerank --top-k 5 --json-out reports/rag.json
+python eval_rag.py --embedder offline --no-rerank \
+  --gate benchmarks/rag_offline_baseline.json
 ```
+
+This replaced `if hit_rate < 40: fail`. The score is **61.36**, so that floor could not
+fail for any regression worth noticing — retrieval could have collapsed a third and CI
+would have called it a pass. The gate catches a 16-point drop and names the six metrics
+that moved. Floors are absolute and sized in queries: over 44 queries one query is 2.27
+points of a rate, so 5 points is about two.
+
+Two things the gate deliberately does **not** do:
+
+- **Grade runs scored by different definitions.** A stricter answer key or a different
+  corpus shape makes two runs incomparable; those rows are skipped with the reason
+  printed, not failed.
+- **Fail on a corpus change.** The corpus is this repository, so it moves on almost
+  every commit and a fingerprint-keyed gate would either fail every PR or never fire. A
+  changed corpus is reported as a `NOTE` instead — loud enough that a reader knows part
+  of the movement is content, quiet enough to stay useful.
+
+Latency is not gated. Those numbers come from one machine, and `--fail-on-regression`
+already exists for them, labelled a smoke gate. To record a new baseline after an
+intended improvement, let the diff be the record:
+
+```bash
+python eval_rag.py --embedder offline --no-rerank \
+  --save-baseline benchmarks/rag_offline_baseline.json
+```
+
+The gate runs on pull requests, not only after merge. 20 tests in
+`backend/tests/test_eval_gate.py` pin its behaviour, including that the old 40% rule
+would *not* have caught a 21-point collapse.
+
+**Record the baseline last.** The corpus is this repository's `backend/**/*.py`, so
+*any* change under `backend/` — including adding a test file — moves the corpus hash.
+A baseline recorded before such a change reports a `NOTE` on every run forever, which
+is the noise this design is supposed to avoid. Three tests enforce the order: the
+committed `corpus_sha256` must match the tree, the recorded unit/file counts must
+match what ingestion actually produces, and the hash must be unchanged when the same
+files are re-ingested from a different absolute path (which is what makes a laptop run
+and a CI run comparable). If any of them fails, the fix is to re-run
+`--save-baseline` above and commit that too.
 
 `--embedder offline` is the deterministic hashing embedder: no download, no network.
 It proves the dense branch's plumbing works and **its numbers are not a measure of
@@ -343,18 +545,18 @@ lexical stand-in that quietly impersonates a model is worse than a failure.
 
 | metric (offline embedder, top-k 5, measured on this tree) | value |
 |---|:---:|
-| Hit Rate@5, file level | 63.64% |
-| Span Hit Rate@5, unit level | 54.55% |
-| MRR | 0.413 |
-| Symbol recall | 69.11% |
-| Precision@5 | 17.73% |
-| `bm25_only` → `dense_only` → `fused` hit@5 | 68.18% → 36.36% → 63.64% |
-| retrieval latency | 214 ms/query avg, 207 ms p50 |
+| Hit Rate@5, file level | 61.36% |
+| Span Hit Rate@5, unit level | 45.45% |
+| MRR | 0.424 |
+| Symbol recall | 67.48% |
+| Precision@5 | 16.36% |
+| `bm25_only` → `dense_only` → `fused` hit@5 | 68.18% → 38.64% → 61.36% |
+| retrieval latency | 158 ms/query avg, 133 ms p50 |
 | dense stage's share of that | ~90% |
 
 The last two rows are the same fact: the dense leg is a linear cosine scan over every
 window, so retrieval latency tracks corpus size, and adding files moves every number.
-Corpus here: 147 files → 1,884 chunks → 2,830 embed windows.
+Corpus here: 166 source files → 2,130 chunks → 3,168 embed windows (this tree; re-recorded with the baseline).
 
 **The instrument needed fixing before it could be trusted**, and the story is worth
 telling because both defects inflated the score:
@@ -368,7 +570,7 @@ telling because both defects inflated the score:
 Correcting both moved Hit Rate@5 from **79.55% to 59.09%** on one tree, retrieval code
 byte-identical — substring→exact alone took 79.55 to 77.27, and slicing to true `@K`
 removed eight more hits that had been scored at ranks 6 through 13. The CI threshold is
-40, so the gate passed before and passes now (63.64% on today's tree, 23 points of
+40, so the gate passed before and passes now (61.36% on today's tree, 21.36 points of
 headroom); what changed is that the margin is real. A benchmark that flatters you is
 not a guard.
 
@@ -391,10 +593,10 @@ embedded by the new model, scored against vectors from the old one.
 Measured on this repo (2 CPU threads), reported by the harness as `embed_index_ms` and
 `embed_units_per_second`:
 
-| | offline embedder | a real MiniLM-L6-H384 |
+| | deterministic offline-hashing leg | local MiniLM model |
 |---|:---:|:---:|
-| index 2,767–2,830 windows once | **319–514 ms** (5,500–8,700 units/s) | ~79 ms/unit → **≈3.7 min** |
-| encode one query | free (a hash lookup) | 18.6 ms p50, 22.6 ms p95 |
+| index 3,168 windows once (recorded baseline) | **356 ms** (8,897 windows/s) | Hardware-dependent; not measured in this CI environment |
+| encode one query | a hash lookup (not a quality model) | Local model; no latency figure claimed here |
 | re-ingest an unchanged repo | **nothing embedded** | **nothing embedded** |
 
 The second row is the reason the identity exists: re-embedding is not a
@@ -412,8 +614,8 @@ there rather than guess them.
 | Operation | Measured |
 |---|---|
 | AST analysis | **8.4 ms/file** (98-file repo in 853 ms) |
-| Full backend suite | **975 tests in ~20 s** (166 frontend, ~28 s) |
-| Dense index build (offline) | 319–514 ms for ~2,800 windows |
+| Full backend suite | **1,084 tests in ~28 s** (210 frontend, ~31 s) |
+| Dense index build (offline) | 356 ms for 3,168 windows in the latest run |
 | Patch generation | in-process `difflib`, no subprocess |
 
 ### What the browser downloads
@@ -424,9 +626,9 @@ imported to colour python, typescript, json and yaml.
 
 | | before | after |
 |---|---:|---:|
-| first paint (entry JS + CSS, gz) | 477.57 kB | **232.87 kB** |
-| entry JS, gz | 468.94 kB | 224.24 kB |
-| deferred (graph tab, on demand) | — | 65.57 kB |
+| first paint (JS chunks + CSS, gz) | 479.57 kB | **247.7 kB** |
+| first-paint JS chunks, gz | 471.07 kB | 237.1 kB |
+| deferred (graph tab, on demand) | — | 65.6 kB |
 
 One `<CodeHighlight>` on `PrismLight` with a closed list of 40 grammars + 29 fence
 aliases did the first half; `React.lazy` on the dependency-graph subtree did the
@@ -448,7 +650,7 @@ Every feature works with no paid API, no credit card, no trial.
 |---|---|---|
 | Embeddings | `all-MiniLM-L6-v2`, local CPU | OpenAI `text-embedding-3-small` |
 | Reranking | `ms-marco-MiniLM-L-6-v2`, local CPU | — |
-| Chat / review | Ollama (`qwen2.5-coder`) | DeepSeek · GPT-4o |
+| Chat / review | Ollama `qwen2.5-coder:7b` (~4.7 GB) | DeepSeek · GPT-4o · `qwen2.5-coder:14b` |
 | Static analysis | stdlib `ast` | — *(always free)* |
 | Autofix | stdlib `ast` | — *(always free)* |
 | CVE lookup | OSV.dev, no key | — |
@@ -464,12 +666,24 @@ The benchmark's refusal above is not decoration: a $0 claim that depends on nobo
 exporting the wrong environment variable is not a guarantee. It is enforced in code,
 with a test that fails if a paid embedding client is constructed.
 
+**The shipped default has to be runnable, not just free.** `configs.json` overrides the
+config defaults for anyone who has no `.env` — which is every fresh clone — so a large
+model there is not a preference, it is the download a first-time user is told to make.
+It shipped `qwen3-coder:30b` and `deepseek-coder:33b` while `config.py` defaulted to
+`qwen2.5-coder:7b`, and the whole suite passed, because every test constructed
+`Settings` explicitly and never went near the file that actually decided the answer. It
+now ships `qwen2.5-coder:7b` with no separate review model (empty falls back to the
+chat model, so a first run pulls one set of weights), and
+`tests/test_provider_config.py` holds both files to the same 8B ceiling — the largest
+a free-tier machine starts — plus a test that `.env` still wins.
+
 ---
 
 ## 🚀 Quickstart (5 minutes)
 
 **Prerequisites:** Python 3.11+, Node 18+, and [Ollama](https://ollama.com) for the
-free path.
+free path. Keep Ollama running, then use **two terminals**: one for the backend and
+one for the frontend.
 
 ```bash
 git clone https://github.com/garimauttam/SavFlux && cd SavFlux
@@ -518,6 +732,23 @@ npm install && npm run dev
 
 **4 · Open** → http://localhost:5173
 
+SavFlux is single-owner by default, not a multi-user service. The first backend
+startup creates a random owner key, prints it once in the backend log, and saves
+it with restrictive file permissions at `chroma_data/owner_key`. Paste that key
+into the sign-in screen. If you miss the one-time log line, run
+`cat chroma_data/owner_key` from the backend directory. The browser keeps the
+key only for the current tab session; **do not set `VITE_API_KEY`**, which would
+bake a secret into the public frontend bundle.
+
+For a hosted instance, set a strong `API_KEY` in the deployment's secret manager
+and use HTTPS. Anyone holding it has owner-level access to that one instance,
+including its indexed code and GitHub connection. Do not run unrelated users on
+one instance: storage is not partitioned by user. Public sign-ups and per-user
+key vaults are not part of this single-owner login. The owner can still add a
+provider API key in **Settings → Model**; it is kept in the server data directory
+(`provider_api_keys.json`, mode `0600`), never returned by the API, and must be
+protected with the rest of the persistent deployment volume and its backups.
+
 First run downloads the MiniLM models (~120 MB) and caches them. Check
 `GET /health` — it reports each provider's real status. `/health` returns 503 when
 Ollama is not running, which is the honest answer, not a bug.
@@ -528,11 +759,19 @@ Ollama is not running, which is the honest answer, not a bug.
 <details>
 <summary><b>Prefer a hosted model?</b></summary>
 
+You can enter an OpenAI, DeepSeek, or OpenRouter key in **Settings → Model**; the
+key is stored server-side, never sent back to the browser, and not written into
+`.env`. Or configure DeepSeek through the deployment environment:
+
 ```env
 LLM_PROVIDER=deepseek
 DEEPSEEK_API_KEY=your_key    # platform.deepseek.com
 ```
-Embeddings stay local, so switching chat providers needs no re-index. Only changing
+Hosted chat calls use your selected provider and are billed by that provider. If a
+hosted call fails, SavFlux falls back to the selected local Ollama model when it is
+installed and reachable; Settings shows whether that fallback is available. Provider
+keys are never included in the model-status response. Embeddings stay local for these
+Settings-selected providers, so switching chat providers needs no re-index. Only changing
 the *embedding* provider requires one — and the index records which pipeline built
 each vector, so that re-index happens by itself on the next ingest rather than being
 left to someone remembering. The first ingest after upgrading re-embeds once (old rows
@@ -547,6 +786,7 @@ REVIEW_MODE=fast          # fast | agentic
 REVIEW_LLM_BUDGET=12      # single-file model reviews per run
 REVIEW_CONCURRENCY=2      # parallel model calls
 REVIEW_CACHE_ENABLED=true # reuse a review when the file's content is unchanged
+REVIEW_MAX_FILES_PER_REQUEST=2000 # cap on one review request, not on review depth
 RISK_GATE_ENABLED=true    # score every push and gate it on that score
 RISK_APPROVAL_THRESHOLD=6 # 0-10, higher = riskier
 RISK_BLOCK_THRESHOLD=10   # 0-10, refused outright at or above this
@@ -560,6 +800,19 @@ static triage here is a real review, not a placeholder.
 
 Reviews are cached against the file's content hash, so re-reviewing an unchanged repo
 makes no model calls at all; a hit says so, and names the digest it matched.
+
+`REVIEW_MAX_FILES_PER_REQUEST` is a **request-size** guard, not a review-quality one, and
+the two are easy to confuse. The pipeline never puts N files in one prompt: files are
+scored, answered by the static analyzer where it can, and sent at most four per batched
+call — so a 5,000-file selection is the same shape of work as a 50-file one, just more
+batches. Repo review doesn't even carry file content in the request body (paths only;
+content is read back from the index), so the cap is nowhere near the 10 MB body limit
+for that path. The only real cost of a bigger selection is wall-clock time, which
+`REVIEW_LLM_BUDGET` and `REVIEW_CONCURRENCY` govern. It was 200, and nothing explained
+why — a real repo was refused by a number with no basis while the button still read
+"Review 238 files". The page now reads the cap from `GET /api/v1/review/limits` and
+shows it *before* you build a request, so the count on the button means the request
+will be accepted.
 `GET /api/v1/review/cache` reports the cache's size and hit rate. If the provider
 stops answering, a circuit opens and the rest of the run is served by the analyzer
 instead of paying a connection timeout per file — the run says so rather than
@@ -757,7 +1010,7 @@ backend/
 frontend/src/
   components/         39 React components
   lib/                openFile.ts · highlight.tsx · chunking.ts · cancel.ts
-eval_rag.py           44-query retrieval benchmark, 2 granularities (runs in CI)
+eval_rag.py           44-query retrieval benchmark, 2 granularities, regression gate (in CI)
 scripts/              reproducible benchmarks
 ```
 
@@ -804,11 +1057,14 @@ A list this long is only worth reading if it is honest, so:
 ## 🧪 Testing
 
 ```bash
-cd backend && pytest -q                 # 975 tests, ~20 s
+cd backend && pytest -q                 # 1084 tests, ~22 s
 cd frontend && npx tsc --noEmit         # type check
-cd frontend && npx vitest run           # 166 tests, 16 files
+cd frontend && npx vitest run           # 210 tests, 24 files
 python3 scripts/bench_security.py       # reproduce the F1 table
-python eval_rag.py --embedder offline --no-rerank
+
+# the retrieval regression gate — the same command CI runs
+python eval_rag.py --embedder offline --no-rerank \
+  --gate benchmarks/rag_offline_baseline.json
 ```
 
 No environment setup is needed: `conftest.py` pins `LLM_PROVIDER=openai` so the suite
@@ -849,6 +1105,11 @@ implementation passes forever, including after the implementation is deleted.
 **Shipped**
 
 - [x] Line-precise citations with click-to-open and trust scoring
+- [x] **Every answer checked against its own citations** — a `file:line` the
+      answer claims that is not in the retrieved evidence, or that points at
+      lines never shown, is listed under the answer instead of rendering
+      identically to real evidence. No model call, so it works on every
+      provider, local or hosted. It reports; it never hides the answer.
 - [x] AST + dataflow security analysis (F1 0.67 → 1.00)
 - [x] Verified deterministic autofix
 - [x] Git-applicable patch generation + PR creation
@@ -869,21 +1130,44 @@ implementation passes forever, including after the implementation is deleted.
       distinguished from "instant"
 - [x] Cancellation that reaches the run, not just the fetch, including a stop that
       arrives mid-model-call
-- [x] First paint 477.57 kB → 232.87 kB gz, with a bundle budget that fails CI
+- [x] First paint 479.57 kB → 247.7 kB gz, with a bundle budget that fails CI
 - [x] Honest retrieval metrics: exact answer-key matching, true `@K` slices,
       unit-level (span) scoring, and a benchmark that refuses a paid embedder
 - [x] Index provenance: vectors record the pipeline that made them, so a model
       swap re-embeds instead of silently mixing spaces
+- [x] Workspace shell — 17 flat tabs → 9 destinations in 4 groups, one navigation
+      source for the rail, palette, shortcuts and tests
+- [x] Unified Ask/Agent conversation with a mode switch, and a context drawer that
+      opens a citation scrolled to the line
+- [x] GitHub as a product surface — connect, browse, index, branch, and a
+      digest-bound pull request, not just a token read at push time
+- [x] Read-only remote branch comparison and indexed-file comparison are distinct
+      Changes views, with ahead/behind counts and bounded remote patches
+- [x] Persistent isolated Agent Git worktree on a local `savflux/agent-*` branch,
+      based on the indexed commit; explicit reset and no implicit push
+- [x] Light/dark themes applied before first paint
+- [x] Choose 2–8 installed Ollama models for repo-summary MoA in Settings; selections
+      are validated and persisted without a restart
+- [x] Configure OpenAI, DeepSeek, or OpenRouter API keys in Settings; secrets stay
+      server-side with restrictive file permissions and hosted calls fall back to Ollama
 
 **Next**
 
-- [ ] **Answer-quality eval on the free path** — groundedness of a generated answer
-      against the citations it claims, with the same "refuse rather than fake it"
-      guard the retrieval benchmark uses
+- [ ] **Answer-quality eval on the free path** — the *deterministic* half shipped:
+      every finished answer is checked against the evidence it was actually given,
+      and a citation pointing outside that evidence is reported under the answer
+      (`backend/app/services/grounding_check.py`, streamed as `__GROUNDING__`).
+      What is still missing is the judgement half — whether a cited line *supports*
+      the claim made about it, and a benchmark of that across models. That needs a
+      reader or a second model, and is recorded per answer (Task 2) rather than
+      guessed at, because a cheap model grading its own citation is worse than
+      no check at all.
 - [ ] **Cache the models in CI** so the reranked leg (the product default) and a real
       embedder get benchmarked instead of skipped
-- [ ] **Pin the CI benchmark corpus** — adding a test file currently moves every
-      measured number
+- [ ] **Pin the CI benchmark corpus** — adding a test file still moves every measured
+      number, which is why the baseline has to be re-recorded whenever `backend/`
+      changes. A frozen fixture corpus (instead of this repo's own source) would stop
+      that; the tests added here now make the staleness loud instead of silent
 - [ ] **VS Code extension** — thin client over `POST /chat/stream`
 - [ ] **Watcher-driven re-index** — delta ingest landed (a file re-embeds only when
       its bytes changed or the pipeline that embedded it did, so a re-ingest of an

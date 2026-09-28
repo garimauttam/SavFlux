@@ -360,7 +360,7 @@ async def autofix(file: str, source: str | None = None,
 
 async def build_patch(changes: list[dict], title: str = "", summary: str = "",
                       findings: list[dict] | None = None,
-                      context: int = 3) -> ToolResult:
+                      context: int = 3, repo_url: str = "") -> ToolResult:
     """
     Turn file contents into one reviewable diff.
 
@@ -398,6 +398,10 @@ async def build_patch(changes: list[dict], title: str = "", summary: str = "",
             "title": pr_title,
             "suggested_branch": suggest_branch_name(pr_title),
             "pr_body": build_pr_body(summary, result, findings=findings or []),
+            "_workspace_changes": [
+                {"path": change.path, "original": change.original, "content": change.modified}
+                for change in resolved
+            ],
         }
 
     if not changes:
@@ -408,11 +412,26 @@ async def build_patch(changes: list[dict], title: str = "", summary: str = "",
     except PatchError as exc:
         return ToolResult("build_patch", False, f"build_patch: {exc}")
 
+    workspace_changes = data.pop("_workspace_changes", [])
+    if repo_url:
+        try:
+            from app.services.worktree_service import apply_changes
+            workspace = await asyncio.to_thread(apply_changes, repo_url, workspace_changes)
+        except Exception as exc:  # keep the verified patch usable; report the local-worktree failure
+            workspace = {"persisted": False, "message": str(exc) or "Agent worktree could not be updated."}
+    else:
+        workspace = {"persisted": False, "message": "No GitHub repository was selected for this Agent run."}
+    data["workspace"] = workspace
+    workspace_note = (
+        "local Agent worktree updated" if workspace.get("persisted")
+        else f"local worktree not updated: {workspace.get('message', 'unavailable')}"
+    )
+
     return ToolResult(
         "build_patch",
         True,
         f"build_patch: {data['files_changed']} file(s), "
-        f"+{data['additions']}/-{data['deletions']}, digest {data['digest']}",
+        f"+{data['additions']}/-{data['deletions']}, digest {data['digest']}; {workspace_note}",
         data=data,
     )
 
@@ -493,6 +512,7 @@ async def create_pr(
         parse_repo_ref,
         validate_branches,
     )
+    from app.services.github_service import get_token
 
     try:
         repo_slug = parse_repo_ref(repo or repo_url or "")
@@ -605,10 +625,17 @@ async def create_pr(
             report=pr_markdown(plan),
         )
 
-    if not os.getenv("GITHUB_TOKEN", "").strip():
-        plan["reason"] = "GITHUB_TOKEN not configured — run the command below (gh CLI) to open the PR."
+    # `get_token()`, not the environment variable — see the same fix in
+    # `api/review.py`. The agent's create_pr and the review panel's Create PR
+    # must be gated by the same question, or the product has two definitions of
+    # "is GitHub connected" and they disagree.
+    if not get_token():
+        plan["reason"] = (
+            "GitHub is not connected — run the command below (gh CLI) to open the "
+            "PR, or connect an account in SavFlux."
+        )
         record_decision(decision, outcome="manual_plan", repo=repo_slug, actor="agent")
-        return ToolResult("create_pr", True, "create_pr: no GITHUB_TOKEN, manual plan returned",
+        return ToolResult("create_pr", True, "create_pr: GitHub not connected, manual plan returned",
                           data=plan, report=pr_markdown(plan))
 
     try:

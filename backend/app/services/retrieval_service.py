@@ -30,6 +30,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.config import get_settings
 from langchain_core.documents import Document
 from app.services.citation_service import build_citations
+from app.services.grounding_check import check_grounding
 from app.services.reranker import rerank
 from app.services.llm_factory import get_chat_llm, get_embedding_fn
 from app.services.hybrid_retriever import BM25Index, reciprocal_rank_fusion, diversify_documents, two_branch_rrf
@@ -800,10 +801,15 @@ async def stream_answer(
     increment_request("chat")
     yield stages.mark("generation", "Generating grounded answer…")
     llm = get_chat_llm(streaming=True).with_config(callbacks=[get_token_callback()])
+    # Every path that streams prose appends here, including both fallbacks: the
+    # grounding check at the end has to see whatever the reader actually saw,
+    # not only the happy path.
+    answer_parts: list[str] = []
     try:
         yielded_any = False
         async for chunk in llm.astream(messages_to_send):
             if chunk.content:
+                answer_parts.append(chunk.content)
                 yield chunk.content
                 yielded_any = True
         final = stages.close(model="answer")
@@ -817,6 +823,7 @@ async def stream_answer(
                 fallback = _build_chat_llm("ollama", streaming=True)
                 async for chunk in fallback.with_config(callbacks=[get_token_callback()]).astream(messages_to_send):
                     if chunk.content:
+                        answer_parts.append(chunk.content)
                         yield chunk.content
             except Exception:
                 yield (
@@ -833,8 +840,10 @@ async def stream_answer(
                 fallback = _build_chat_llm("ollama", streaming=True)
                 async for chunk in fallback.with_config(callbacks=[get_token_callback()]).astream(messages_to_send):
                     if chunk.content:
+                        answer_parts.append(chunk.content)
                         yield chunk.content
-                return
+                # No `return` here: falling through to the end is what lets the
+                # grounding check below run on the fallback's answer too.
             except Exception:
                 pass
             yield (
@@ -853,6 +862,16 @@ async def stream_answer(
             )
         else:
             yield f"⚠️ **LLM error:** {err[:300]}"
+
+    # ── Step 6: Check what the answer actually cited ───────────────────────
+    # Last, because a citation can only be judged once the whole answer exists.
+    # SYSTEM_PREFIX asks the model to cite only the ranges in the snippet
+    # headers; nothing was checking that it did, so a file it was never shown
+    # rendered exactly like one it was. Emitted even when clean, so the UI can
+    # tell "checked, nothing wrong" apart from "the check never ran" — which
+    # is the difference between a good answer and a silent failure.
+    report = check_grounding("".join(answer_parts), sources)
+    yield f"__GROUNDING__{json.dumps(report.to_dict())}__GROUNDING_END__\n"
 
 
 def _get_raw_collection():

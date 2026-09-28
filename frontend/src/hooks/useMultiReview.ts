@@ -197,7 +197,16 @@ export function useMultiReview() {
         const detail = Array.isArray(err.detail)
           ? err.detail.map((item: { msg?: string }) => item.msg ?? "Validation error").join("; ")
           : err.detail;
-        throw new Error(detail ?? `Server error ${response.status}`);
+        // Pydantic prefixes a plain `ValueError` raised in a validator with
+        // "Value error: ", so the reader saw a Python internal in a product
+        // message. The file-count validator no longer produces one, but every
+        // other validator on these models still does, and this is where they
+        // surface — so the prefix is stripped at the point of display.
+        const readable = (detail ?? `Server error ${response.status}`).replace(
+          /Value error:\s*/g,
+          "",
+        );
+        throw new Error(readable);
       }
 
       const reader = response.body!.getReader();

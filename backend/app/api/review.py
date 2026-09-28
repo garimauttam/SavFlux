@@ -29,6 +29,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
+from pydantic_core import PydanticCustomError
 
 from app.api.deps import require_api_key
 from app.limiter import limiter
@@ -135,16 +136,45 @@ class ReviewPasteRequest(BaseModel):
     language: str = ""
 
 
+def _max_files_per_request() -> int:
+    """
+    The cap one multi-review request may carry, read at call time.
+
+    Read through `get_settings()` rather than captured at import so a test — or
+    a deployment that changes it — does not need the module reloaded to take
+    effect. A hardcoded 200 here and a different number in the UI is exactly the
+    disagreement that made the limit invisible until it refused you.
+    """
+    from app.core.config import get_settings
+
+    return int(getattr(get_settings(), "review_max_files_per_request", 2000) or 2000)
+
+
 class ReviewMultiRequest(BaseModel):
     files: list[ReviewFileRequest]
 
     @field_validator("files")
     @classmethod
     def validate_files(cls, v: list) -> list:
+        # A plain ValueError here reaches the UI as `Value error: <message>`.
+        # Pydantic wraps ValueError with its own context prefix, so the reader
+        # saw a Python internal leaked into a product message. PydanticCustomError
+        # carries the sentence through verbatim.
         if not v:
-            raise ValueError("At least one file must be provided.")
-        if len(v) > 200:
-            raise ValueError("Too many files. Maximum 200 files per multi-review request.")
+            raise PydanticCustomError("no_files", "Select at least one file to review.")
+        limit = _max_files_per_request()
+        if len(v) > limit:
+            raise PydanticCustomError(
+                "too_many_files",
+                (
+                    "{count} files selected, but one review request carries at most "
+                    "{limit}. The cap is on the size of the request, not on review "
+                    "quality — a larger selection is split into more batches and "
+                    "costs more wall-clock time. Deselect {over} file(s), or raise "
+                    "REVIEW_MAX_FILES_PER_REQUEST if this repository needs it."
+                ),
+                {"count": len(v), "limit": limit, "over": len(v) - limit},
+            )
         return v
 
 
@@ -273,6 +303,22 @@ async def review_pasted_code(request: Request, body: ReviewPasteRequest, _: None
         media_type="text/plain",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/limits")
+async def review_limits(_: None = Depends(require_api_key)) -> dict:
+    """
+    What one review request will accept — fetched before the user picks files.
+
+    The alternative was a control that read "Review 1,000 files", refused, and
+    left the reader to work out from a 422 which 38 files to drop. Advertising
+    a ceiling the page does not show is the same defect as advertising a
+    capability the page lacks.
+    """
+    return {
+        "max_files_per_request": _max_files_per_request(),
+        "max_body_bytes": 10 * 1024 * 1024,
+    }
 
 
 @router.post("/multi")
@@ -796,8 +842,8 @@ async def create_pull_request(request: Request, body: CreatePRRequest,
     from app.services.pr_service import (
         parse_repo_ref, validate_branches, build_gh_command, create_pr_via_api,
     )
+    from app.services.github_service import get_token
     from app.services.patch_service import digest_of
-    import os
     try:
         repo_slug = parse_repo_ref(body.repo)
         head, base = validate_branches(body.head, body.base)
@@ -900,7 +946,13 @@ async def create_pull_request(request: Request, body: CreatePRRequest,
 
     plan["policy"] = decision.to_dict(include_signals=False)
 
-    if os.getenv("GITHUB_TOKEN", "").strip():
+    # The gate is `get_token()`, not `os.getenv("GITHUB_TOKEN")`. Those are not
+    # the same question: the first is "did this person connect an account to
+    # SavFlux", the second is "did some unrelated tool export a variable before
+    # the process started". Checking the variable meant a user who connected a
+    # token through the product was told no token existed, and a machine that
+    # happened to have one pushed as that machine's account.
+    if get_token():
         try:
             created = await create_pr_via_api(repo_slug, head, base, body.title, body.body)
             record_decision(decision, outcome="created", repo=repo_slug, actor="api",
@@ -914,7 +966,10 @@ async def create_pull_request(request: Request, body: CreatePRRequest,
                             detail=str(e))
             return plan
 
-    plan["reason"] = "GITHUB_TOKEN not configured — run the command below (gh CLI) to open the PR."
+    plan["reason"] = (
+        "GitHub is not connected — run the command below (gh CLI) to open the PR, "
+        "or connect an account in SavFlux."
+    )
     record_decision(decision, outcome="manual_plan", repo=repo_slug, actor="api")
     return plan
 

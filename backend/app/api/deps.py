@@ -1,28 +1,21 @@
 """
-deps.py — Shared FastAPI dependencies.
+deps.py — Shared FastAPI authentication dependency.
 
-WHY A SEPARATE DEPS FILE?
-FastAPI dependencies are reusable callables injected via Depends().
-Keeping them here (not inside route files) means any router can import
-them without circular imports, and tests can patch a single location.
+SavFlux is single-owner in this release. The owner credential comes from
+`API_KEY` in the environment, or from the random 256-bit key generated on first
+startup and saved in the configured data directory. There is deliberately no
+public-registration flow or user database.
 
-AUTHENTICATION DESIGN:
-  - API_KEY is optional in Settings. If unset, all requests pass through
-    (safe for local dev — zero config needed).
-  - If API_KEY is set (production / Railway), every protected endpoint
-    requires the header:  X-API-Key: <your-key>
-  - /health and GET /metrics are intentionally left unprotected so
-    Railway health checks and monitoring tools always work.
+The dependency uses `X-API-Key` because the backend remains usable by scripts
+and local tools. The browser sign-in page holds that credential in
+`sessionStorage` for the current tab and sends it in the header; it is never
+returned by an endpoint.
 
-HOW TO USE IN A ROUTE:
-    from app.api.deps import require_api_key
-
-    @router.post("/stream")
-    async def my_route(request: Request, _: None = Depends(require_api_key)):
-        ...
-
-HOW TO GENERATE A KEY:
-    python -c "import secrets; print(secrets.token_hex(32))"
+This fails closed: if the owner key is missing, *every* protected route refuses
+the request, including localhost. A loopback exception is unsafe behind a local
+reverse proxy, where a remote browser's socket peer can appear to be 127.0.0.1.
+`/health` remains intentionally public for platform health checks, and
+capability-based `GET /api/v1/share/{id}` remains public by design.
 """
 
 import hmac
@@ -30,42 +23,32 @@ import hmac
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security.api_key import APIKeyHeader
 
-from app.core.config import get_settings
+from app.services.owner_key import effective_owner_key
 
-# FastAPI's built-in API key header scheme.
-# auto_error=False means we handle the missing-header case ourselves
-# so we can give a clearer error message and support the "no key set = open" mode.
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 async def require_api_key(api_key_header: str | None = Security(_api_key_header)) -> None:
-    """
-    FastAPI dependency that enforces API key authentication.
+    """Require the configured single-instance owner key."""
+    expected = effective_owner_key()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "SavFlux owner authentication is not configured. Set API_KEY, "
+                "or restart with a writable persistent data directory so the "
+                "first-run owner key can be created."
+            ),
+        )
 
-    Behaviour:
-      - API_KEY not configured in settings  → always passes (open / dev mode)
-      - API_KEY configured, header present and matches  → passes
-      - API_KEY configured, header missing or wrong     → 401 Unauthorized
-
-    WHY 401 AND NOT 403?
-    401 = "I don't know who you are" (unauthenticated).
-    403 = "I know who you are but you're not allowed" (unauthorised).
-    A missing or wrong API key is an authentication failure → 401.
-    """
-    settings = get_settings()
-
-    # No key configured → open mode, always allow
-    if not settings.api_key:
-        return
-
-    # Use hmac.compare_digest for constant-time comparison.
-    # Plain string equality (!=) is not constant-time: Python short-circuits
-    # at the first differing character, leaking key length via response latency.
-    # An attacker can oracle individual characters by timing many requests.
-    # compare_digest always takes the same time regardless of where strings differ.
+    # Constant-time comparison avoids leaking matching prefixes through timing.
     provided = api_key_header or ""
-    if not hmac.compare_digest(provided, settings.api_key):
+    if not hmac.compare_digest(provided, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key. Set the X-API-Key header.",
+            detail=(
+                "Invalid or missing owner key. Send it as the X-API-Key header, "
+                "or paste it into the sign-in screen. The key is in the backend "
+                "log from first run, or in the configured data directory's owner_key file."
+            ),
         )

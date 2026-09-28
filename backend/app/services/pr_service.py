@@ -74,28 +74,32 @@ async def create_pr_via_api(repo_slug: str, head: str, base: str,
     A transport error used to escape as an unhandled httpx exception and turn the
     endpoint into a 500 with an empty body: the one moment the manual plan is most
     useful was the one moment it was unavailable.
+
+    WHY THIS DELEGATES INSTEAD OF POSTING
+    --------------------------------------
+    This used to open its own `httpx` client and read its credential from
+    `os.getenv("GITHUB_TOKEN")`. That made it a second GitHub integration, and it
+    was the one the product's own Connect button could not reach: a user who
+    pasted a token into SavFlux was told "GITHUB_TOKEN not configured" here,
+    while a machine that *did* export the variable had its pull requests opened
+    as that machine's account rather than the one connected in the UI. That is
+    precisely the failure `github_service.get_token()` exists to prevent,
+    reintroduced a module away from where it had been fixed.
+
+    So the POST, the credential and the error classification live in one place.
+    `GitHubError` already subclasses `RuntimeError`, and its `kind` carries the
+    distinction callers act on — "auth" means fix the token, "rate_limit" means
+    wait — which a bare status code did not.
     """
-    import httpx
-    token = os.getenv("GITHUB_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("GITHUB_TOKEN is not configured")
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{_API}/repos/{repo_slug}/pulls",
-                headers={"Authorization": f"Bearer {token}",
-                         "Accept": "application/vnd.github+json",
-                         "X-GitHub-Api-Version": "2022-11-28"},
-                json={"title": title, "head": head, "base": base, "body": body or ""},
-            )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"could not reach api.github.com ({exc.__class__.__name__}: {exc})") from exc
-    if resp.status_code not in (200, 201):
-        try:
-            detail = resp.json().get("message", resp.text[:200])
-        except Exception:
-            detail = resp.text[:200]
-        raise RuntimeError(f"GitHub API {resp.status_code}: {detail}")
-    data = resp.json()
-    return {"number": data.get("number"), "url": data.get("html_url"),
-            "state": data.get("state")}
+    from app.services import github_service
+
+    if not github_service.get_token():
+        raise RuntimeError(
+            "GitHub is not connected. Connect an account in SavFlux, or run the "
+            "command below with the gh CLI."
+        )
+    created = await github_service.create_pull(
+        repo_slug, title=title, head=head, base=base, body=body
+    )
+    return {"number": created.get("number"), "url": created.get("url"),
+            "state": created.get("state")}

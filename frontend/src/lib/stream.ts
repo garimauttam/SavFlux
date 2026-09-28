@@ -31,7 +31,7 @@
  * `split()`.
  */
 
-export type MarkerKind = "status" | "error" | "sources" | "diagnostic" | "section";
+export type MarkerKind = "status" | "error" | "sources" | "diagnostic" | "section" | "grounding";
 
 export interface MarkerTag {
   kind: MarkerKind;
@@ -43,6 +43,8 @@ export const MARKER_TAGS: Record<MarkerKind, MarkerTag> = {
   status: { kind: "status", open: "__STATUS__", close: "__STATUS_END__" },
   error: { kind: "error", open: "__ERROR__", close: "__ERROR_END__" },
   sources: { kind: "sources", open: "__SOURCES__", close: "__SOURCES_END__" },
+  /** What the finished answer cited, checked against the evidence it was given. */
+  grounding: { kind: "grounding", open: "__GROUNDING__", close: "__GROUNDING_END__" },
   diagnostic: { kind: "diagnostic", open: "__DIAGNOSTIC__", close: "__DIAGNOSTIC_END__" },
   section: { kind: "section", open: "__SECTION_START__", close: "__SECTION_END__" },
 };
@@ -53,7 +55,8 @@ export const REVIEW_TAGS: MarkerTag[] = [
 ];
 export const AGENT_TAGS: MarkerTag[] = [MARKER_TAGS.status, MARKER_TAGS.error];
 export const CHAT_TAGS: MarkerTag[] = [
-  MARKER_TAGS.status, MARKER_TAGS.sources, MARKER_TAGS.diagnostic, MARKER_TAGS.error,
+  MARKER_TAGS.status, MARKER_TAGS.sources, MARKER_TAGS.grounding,
+  MARKER_TAGS.diagnostic, MARKER_TAGS.error,
 ];
 
 export type Segment =
@@ -161,19 +164,106 @@ function partialTagStart(text: string, tags: MarkerTag[]): number {
 }
 
 /**
- * What to append when a stream ends: the held-back tail, minus a truncated
- * marker. A half-received `__STATUS__{"ste` is a telemetry line the server never
- * finished, not the last words of the answer — but ordinary prose that happens to
- * end with `__STAT` is prose, so only a *complete* open tag is cut.
+ * What to append when a stream ends: the held-back tail, minus anything that is
+ * still telemetry rather than prose.
+ *
+ * A half-received `__STATUS__{"ste` is a telemetry line the server never
+ * finished, not the last words of the answer — but ordinary prose that happens
+ * to end with `__STAT` is prose, so only a *complete* open tag is cut.
+ *
+ * The loop matters more than the cut. A marker is defined by
+ * `stream_protocol.py` as one JSON object on one line followed by a newline, so
+ * an open tag with no close is a bad line, not a bad stream: the newline is
+ * where the marker ends, and the answer after it is still the reader's. Cutting
+ * everything from the first unterminated open tag — which is what a single
+ * `rest.slice(0, index)` does — loses the whole reply to one malformed line and
+ * shows an empty message with no error, which is the worst thing this module
+ * could do. So the scan resumes past the newline and keeps going.
  */
 export function flushTail(rest: string, tags: MarkerTag[] = REVIEW_TAGS): string {
-  if (!rest) return "";
-  const truncated = earliestTag(rest, 0, tags);
-  return truncated ? rest.slice(0, truncated.index) : rest;
+  let out = "";
+  let buf = rest;
+  for (;;) {
+    const found = earliestTag(buf, 0, tags);
+    if (!found) return out + buf;
+
+    const bodyStart = found.index + found.tag.open.length;
+    const closeIndex = buf.indexOf(found.tag.close, bodyStart);
+
+    out += buf.slice(0, found.index);
+    if (closeIndex !== -1) {
+      // Complete after all — it simply survived to the end of the buffer
+      // without being scanned. Drop it, and keep looking.
+      buf = buf.slice(consumeNewline(buf, closeIndex + found.tag.close.length));
+      continue;
+    }
+
+    const newline = buf.indexOf("\n", bodyStart);
+    // No newline: the stream really was cut mid-marker. There is nothing after
+    // it that can be told apart from the payload, so the tail ends here.
+    if (newline === -1) return out;
+    buf = buf.slice(newline + 1);
+  }
 }
 
-/** Any complete protocol marker in `text`? Used when a stream is read as a string. */
-export function containsMarker(text: string, tags: MarkerTag[] = REVIEW_TAGS): boolean {
+/**
+ * The last resort for a stream that ended without a single line of prose.
+ *
+ * Every consumer builds its answer out of text segments, so a body that carried
+ * only markers — or markers whose delimiters did not match the tags this build
+ * knows — produces an empty assistant bubble. An empty bubble with no
+ * explanation is the one failure a reader cannot act on: it looks like the model
+ * had nothing to say, when in fact the bytes arrived and were dropped. So this
+ * returns the raw tail with the protocol stripped out, and a line that says what
+ * happened.
+ *
+ * Returns null when there is nothing worth showing, which keeps "the server
+ * truncated its own telemetry and sent no answer" an honest blank rather than a
+ * paragraph of JSON presented as prose.
+ */
+export function salvageUnreadableStream(
+  rest: string,
+  tags: MarkerTag[] = REVIEW_TAGS,
+): string | null {
+  if (!rest.trim()) return null;
+  let text = rest;
+  for (const tag of tags) {
+    text = text.split(tag.open).join(" ").split(tag.close).join(" ");
+  }
+  // A delimiter the client could not match is still a delimiter, just a broken
+  // one — `_STATUS_END_`, `__STATUS_END_`, `__SOURCES__`. The words are known,
+  // because they come from the tags themselves, so match those with the
+  // surrounding underscores loosened rather than guessing at the shape: a looser
+  // pattern would eat the first word of the answer after the delimiter.
+  const words = new Set<string>();
+  for (const tag of tags) {
+    for (const part of `${tag.open}${tag.close}`.split("_")) if (part) words.add(part);
+  }
+  if (words.size) {
+    const alternation = [...words].join("|");
+    text = text.replace(
+      new RegExp(`_{1,3}(?:${alternation})(?:_(?:${alternation}))?_{0,3}`, "g"),
+      " ",
+    );
+  }
+  // What is left of a telemetry line is a JSON object, not an answer — and the
+  // stream may have cut one in half, which is the whole reason we are here.
+  text = text.replace(/\{"[^]*?\}/g, " ").replace(/\{"[^]*$/, " ");
+  text = text.replace(/[ \t]{2,}/g, " ").trim();
+  if (!/[A-Za-z]/.test(text)) return null;
+  return [
+    "**The stream ended before this answer could be read.** The server sent a",
+    "response this build could not parse — the lines below are what arrived,",
+    "verbatim:",
+    "",
+    `> ${text.slice(0, 600).replace(/\n+/g, "\n> ")}`,
+    "",
+    "Re-send the request. If it keeps happening, the server log for this",
+    "request has the raw stream.",
+  ].join("\n");
+}
+
+/** Any complete protocol marker in `text`? Used when a stream is read as a string. */export function containsMarker(text: string, tags: MarkerTag[] = REVIEW_TAGS): boolean {
   return tags.some((tag) => text.includes(tag.open) && text.includes(tag.close));
 }
 

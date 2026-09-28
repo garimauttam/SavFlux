@@ -138,8 +138,8 @@ export default function DiffViewer() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <GitCompare className="w-5 h-5 text-pink-400" />
-          <h2 className="text-base font-bold text-pink-300">Diff Viewer</h2>
-          <span className="text-xs px-1.5 py-0.5 rounded bg-pink-500/20 text-pink-200">$0</span>
+          <h2 className="text-base font-bold text-[var(--sf-text)]">Compare indexed files</h2>
+          <span className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--sf-line)] text-[var(--sf-text-mute)]">INDEX SNAPSHOTS</span>
           {loading && <span className="text-xs text-gray-500">diffing…</span>}
         </div>
         <div className="flex items-center gap-2">
@@ -201,7 +201,9 @@ export default function DiffViewer() {
         {split ? renderSplit() : renderUnified()}
       </div>
 
-      <div className="text-xs text-gray-500 text-center">Diff via Python <code className="text-gray-400">difflib.unified_diff</code> · $0 local · context 0–10 · similarity via <code className="text-gray-400">SequenceMatcher</code></div>
+      <div className="rounded-lg border border-[var(--sf-line)] bg-[var(--sf-surface)] px-3 py-2 text-center text-xs leading-relaxed text-[var(--sf-text-mute)]">
+        This compares two file contents already in SavFlux's index; it does not compare Git branches. Choose <strong className="font-medium text-[var(--sf-text-dim)]">Branches</strong> above for a read-only GitHub branch comparison.
+      </div>
     </div>
   );
 }

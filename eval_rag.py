@@ -713,6 +713,30 @@ def _lookup(nested: Dict[str, Any], dotted: str) -> Any:
     return node
 
 
+def _measurement_rules_of(result: Dict[str, Any]) -> Dict[str, str]:
+    """How each run scored "retrieved correctly".
+
+    A missing key is its own value here, not agreement: two runs from before either
+    rule existed both used substrings and the deep slice, so they ARE comparable with
+    each other, while either of them against a current run is a definition change
+    wearing the clothes of a regression.
+
+    Module level because the regression gate grades on the same rules — a gate that
+    compared runs scored by different definitions would be grading noise.
+    """
+    evaluation = result.get("evaluation") or {}
+    rules: Dict[str, str] = {}
+    for key in MEASUREMENT_RULES:
+        block = evaluation.get(key)
+        # The matching rule was recorded under its own name before `metric_depth`
+        # existed, so look for both spellings rather than calling an old run "unset".
+        if isinstance(block, dict):
+            rules[key] = str(block.get("rule") or block.get("matching") or "unset")
+        else:
+            rules[key] = "unset"
+    return rules
+
+
 def compare_results(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Stage-by-stage and metric-by-metric deltas between two runs.
@@ -725,23 +749,6 @@ def compare_results(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[D
     base_m = baseline.get("metrics", {})
     cur_m = current.get("metrics", {})
     rows: List[Dict[str, Any]] = []
-
-    # A missing key is its own value here, not agreement: two runs from before either
-    # rule existed both used substrings and the deep slice, so they ARE comparable with
-    # each other, while either of them against a current run is a definition change
-    # wearing the clothes of a regression.
-    def _measurement_rules_of(result: Dict[str, Any]) -> Dict[str, str]:
-        evaluation = result.get("evaluation") or {}
-        rules: Dict[str, str] = {}
-        for key in MEASUREMENT_RULES:
-            block = evaluation.get(key)
-            # The matching rule was recorded under its own name before `metric_depth`
-            # existed, so look for both spellings rather than calling an old run "unset".
-            if isinstance(block, dict):
-                rules[key] = str(block.get("rule") or block.get("matching") or "unset")
-            else:
-                rules[key] = "unset"
-        return rules
 
     base_rules = _measurement_rules_of(baseline)
     cur_rules = _measurement_rules_of(current)
@@ -845,6 +852,225 @@ def format_comparison(rows: List[Dict[str, Any]]) -> str:
     lines.append("  Latency is measured on this machine; only compare runs taken on the")
     lines.append("  same corpus, same top_k, and with the reranker in the same state.")
     return "\n".join(lines)
+
+
+# ── The gate ───────────────────────────────────────────────────────────────────
+#
+# WHY THIS EXISTS
+# ---------------
+# CI ran `if hit_rate < 40: fail`. The benchmark scores 65.91. So the gate
+# tolerated a collapse of more than a third of the score — a change that broke
+# chunking, RRF fusion or query expansion could have taken retrieval from 66% to
+# 45% and CI would have called it a pass. It was a floor, not a regression guard,
+# and a floor that low is the same as no gate at all.
+#
+# WHAT THIS GATES
+# ---------------
+# Each quality metric is held to a floor describing the largest drop that does
+# not mean "the pipeline broke". The numbers are ABSOLUTE, in each metric's own
+# units, because that is what a reader of a PR can act on: "hit rate fell 8
+# points" is a fact, "fell 12% relative" needs the reader to do the arithmetic
+# and to care about the denominator.
+#
+# The floors are sized in queries. Over 44 queries one query is 2.27 points of
+# a rate, so 5 points is about two queries — enough to absorb a benign content
+# edit, far too little to hide a chunker that stopped emitting symbols.
+#
+# WHAT IT DELIBERATELY DOES NOT GATE
+# ---------------------------------
+# Latency. These numbers come from one machine, and a laptop with a compiler
+# running will exceed any fixed threshold. `--fail-on-regression` already exists
+# for that, labelled as a smoke gate. A quality number measured on the same code
+# is a different kind of claim, and conflating the two is how a benchmark starts
+# lying.
+#
+# THE CORPUS PROBLEM
+# ------------------
+# The corpus is SavFlux's own source, so `corpus_sha256` changes on almost every
+# commit and a fingerprint-keyed gate would either fail every PR or never fire.
+# A content edit can legitimately move hit rate by a query or two.
+#
+# So the fingerprint is not a gate — it is a WARNING. It says out loud that the
+# deltas include a corpus change, which is the difference between a reader
+# trusting the number and not. Measurement-rule changes are a different matter:
+# a stricter answer key or a different corpus shape makes the two runs genuinely
+# incomparable, and `compare_results` already refuses to grade those. This gate
+# inherits that refusal rather than re-deciding it.
+
+#: Largest absolute drop tolerated per headline quality metric, in that metric's
+#: own units. Percentage-point metrics use points; MRR uses its 0..1 scale.
+QUALITY_FLOORS: Dict[str, float] = {
+    "hit_rate_at_k": 5.0,             # ~2 of 44 queries
+    "span_hit_rate_at_k": 8.0,        # looser: spans are the harder half already
+    "hit_rate_at_k_answerable": 5.0,
+    "symbol_recall_pct": 5.0,
+    "precision_at_k_pct": 4.0,
+    "span_precision_at_k_pct": 4.0,
+    "mean_reciprocal_rank_mrr": 0.05,
+    "span_mrr": 0.05,
+}
+
+#: The production leg, gated separately. `bm25_only` and `dense_only` are
+#: diagnostics — a reranker or fusion change is allowed to move those in
+#: opposite directions, and failing CI on the diagnostic would make the gate
+#: something people disable.
+LEG_FLOORS: Dict[str, Dict[str, float]] = {
+    "fused": {
+        "hit_rate_at_k": 5.0,
+        "span_hit_rate_at_k": 8.0,
+        "symbol_recall_pct": 5.0,
+        "mean_reciprocal_rank_mrr": 0.05,
+    },
+}
+
+#: Fingerprints that, when they differ, make two runs incomparable rather than
+#: merely different. Content hashes are deliberately NOT here — see above.
+DEFINITION_FINGERPRINTS = ("corpus_shape", "top_k")
+
+
+def _definition_fingerprints(result: Dict[str, Any]) -> Dict[str, Any]:
+    evaluation = result.get("evaluation") or {}
+    out: Dict[str, Any] = {}
+    for key in DEFINITION_FINGERPRINTS:
+        out[key] = evaluation.get(key)
+    depth = evaluation.get("metric_depth") or {}
+    out["metric_depth"] = depth.get("rule") if isinstance(depth, dict) else None
+    return out
+
+
+def evaluate_gate(
+    baseline: Dict[str, Any],
+    current: Dict[str, Any],
+    floors: Optional[Dict[str, float]] = None,
+    leg_floors: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, Any]:
+    """Grade a run against a baseline. Returns rows, failures and warnings.
+
+    A failure is a metric that fell further than its floor says a broken
+    pipeline would. Everything else — including a metric that improved, a
+    metric whose definition changed, and a metric this run did not measure — is
+    reported without failing, because a gate that cries wolf over definitional
+    churn gets switched off within a week.
+    """
+    base_m = baseline.get("metrics") or {}
+    cur_m = current.get("metrics") or {}
+    base_rules = _measurement_rules_of(baseline)
+    cur_rules = _measurement_rules_of(current)
+
+    targets: List[tuple] = [(name, floor, False) for name, floor in
+                            (floors if floors is not None else QUALITY_FLOORS).items()]
+    for leg, leg_map in (leg_floors if leg_floors is not None else LEG_FLOORS).items():
+        for metric, floor in leg_map.items():
+            # `by_leg` nests under metrics, so the lookup path and the label
+            # differ only in that prefix — getting it wrong skips every leg row
+            # silently, which looks exactly like a leg that stopped reporting.
+            targets.append((f"by_leg.{leg}.{metric}", floor, True))
+
+    rows: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+
+    for path, floor, is_leg in targets:
+        name = path.split(".")[-1]
+        before, after = _lookup(base_m, path), _lookup(cur_m, path)
+        label = path
+
+        if before is None or after is None:
+            skipped.append({"metric": label, "reason": "not measured in both runs"})
+            continue
+        blocked_by = _changed_rules(name, base_rules, cur_rules)
+        if blocked_by:
+            skipped.append({
+                "metric": label,
+                "reason": "definition changed: " + ", ".join(blocked_by),
+            })
+            continue
+
+        drop = round(before - after, 4)
+        row = {
+            "metric": label,
+            "baseline": before,
+            "current": after,
+            "drop": drop,
+            "floor": floor,
+            "failed": drop > floor,
+        }
+        rows.append(row)
+        if row["failed"]:
+            failures.append(row)
+
+    warnings: List[str] = []
+    base_def, cur_def = _definition_fingerprints(baseline), _definition_fingerprints(current)
+    moved = [k for k in cur_def if base_def.get(k) != cur_def.get(k)]
+    if moved:
+        warnings.append(
+            "these runs score different definitions (" + ", ".join(sorted(moved)) +
+            "); the deltas are not a like-for-like comparison"
+        )
+
+    # Content hashes: a warning, never a failure. See THE CORPUS PROBLEM.
+    base_eval, cur_eval = baseline.get("evaluation") or {}, current.get("evaluation") or {}
+    for key, label in (("corpus_sha256", "corpus"), ("dataset_sha256", "query dataset")):
+        before_hash, after_hash = base_eval.get(key), cur_eval.get(key)
+        if before_hash and after_hash and before_hash != after_hash:
+            warnings.append(
+                f"the {label} changed since this baseline was recorded "
+                f"({str(before_hash)[:12]} → {str(after_hash)[:12]}); some movement is the "
+                f"content change, not the pipeline"
+            )
+
+    return {"rows": rows, "failures": failures, "skipped": skipped, "warnings": warnings,
+            "passed": not failures}
+
+
+def format_gate(outcome: Dict[str, Any]) -> str:
+    """A table a reader can act on, and a verdict they can trust."""
+    lines = ["", "=" * 78, "         SAVFLUX BENCHMARK — REGRESSION GATE", "=" * 78]
+    lines.append(f"  {'metric':<34} {'baseline':>10} {'current':>10} {'drop':>8} {'floor':>8}  verdict")
+    lines.append("  " + "-" * 74)
+
+    def fmt(value: Any) -> str:
+        return "—" if value is None else f"{value:.2f}"
+
+    for row in outcome["rows"]:
+        lines.append(
+            f"  {row['metric']:<34} {fmt(row['baseline']):>10} {fmt(row['current']):>10} "
+            f"{-row['drop']:>+8.2f} {row['floor']:>8.2f}  "
+            f"{'FAIL' if row['failed'] else 'ok'}"
+        )
+    for row in outcome["skipped"]:
+        lines.append(f"  {row['metric']:<34} {'—':>10} {'—':>10} {'—':>8} {'—':>8}  skipped: {row['reason']}")
+    for warning in outcome["warnings"]:
+        lines.append("")
+        lines.append(f"  NOTE  {warning}")
+    lines.append("")
+    if outcome["passed"]:
+        lines.append(f"  PASS — {len(outcome['rows'])} metric(s) within floor.")
+    else:
+        names = ", ".join(r["metric"] for r in outcome["failures"])
+        lines.append(f"  FAIL — {len(outcome['failures'])} metric(s) past floor: {names}")
+        lines.append("")
+        lines.append("  If this is an intended improvement, refresh the baseline deliberately:")
+        lines.append("    python eval_rag.py --embedder offline --no-rerank \\")
+        lines.append("        --save-baseline benchmarks/rag_offline_baseline.json")
+        lines.append("  and let the diff of that file in the PR be the record of the move.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def baseline_document(result: Dict[str, Any]) -> Dict[str, Any]:
+    """The part of a run worth keeping: the numbers, the definitions, the inputs.
+
+    `query_breakdown` is dropped. It is 28 kB of per-query detail, it is
+    reproducible from the corpus, and a baseline that changes on every commit
+    stops being reviewable in a diff.
+    """
+    keep = {}
+    for key in ("metrics", "evaluation", "models"):
+        if key in result:
+            keep[key] = result[key]
+    keep["baseline_format"] = "rag-baseline-v1"
+    return keep
 
 
 def _units_per_expected_file_stats(counts: List[int]) -> Dict[str, Any]:
@@ -1848,6 +2074,27 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--save-baseline",
+        metavar="PATH",
+        help=(
+            "Write this run as the baseline future runs are gated against. Writes "
+            "the metrics, the measurement rules and the input fingerprints — not "
+            "the per-query breakdown, which is 28 kB and changes on every commit. "
+            "Refreshing a baseline is a deliberate act: the diff is the record."
+        ),
+    )
+    parser.add_argument(
+        "--gate",
+        metavar="BASELINE.json",
+        help=(
+            "Fail the run when any quality metric falls further than its floor "
+            "versus this baseline, and print the table. This is the regression "
+            "guard; `--compare` alone only reports. Quality definitions that "
+            "changed between the runs are skipped rather than graded, and a "
+            "corpus change is reported as a NOTE, not a failure."
+        ),
+    )
+    parser.add_argument(
         "--fail-on-regression",
         type=float,
         metavar="PCT",
@@ -1904,6 +2151,13 @@ if __name__ == "__main__":
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(result, indent=2))
 
+    if args.save_baseline:
+        path = Path(args.save_baseline)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(baseline_document(result), indent=2) + "\n")
+        if not args.quiet:
+            print(f"  baseline written to {path}")
+
     rows = None
     if args.compare:
         baseline_path = Path(args.compare)
@@ -1911,6 +2165,18 @@ if __name__ == "__main__":
             raise SystemExit(f"--compare: no such file: {baseline_path}")
         rows = compare_results(json.loads(baseline_path.read_text()), result)
         print(format_comparison(rows))
+
+    gate_failed = False
+    if args.gate:
+        gate_path = Path(args.gate)
+        if not gate_path.is_file():
+            raise SystemExit(
+                f"--gate: no such file: {gate_path}\n"
+                "  Record one with --save-baseline, and commit it."
+            )
+        outcome = evaluate_gate(json.loads(gate_path.read_text()), result)
+        print(format_gate(outcome))
+        gate_failed = not outcome["passed"]
 
     if args.fail_on_regression is not None:
         if not rows:
@@ -1925,9 +2191,15 @@ if __name__ == "__main__":
         if offenders:
             for row in offenders:
                 print(f"  ⚠️  {row['metric']}: {row['pct']:+.1f}% (limit {threshold}%)")
-            raise SystemExit(1)
+            gate_failed = True
 
     if args.quiet:
         print(json.dumps(result))
     else:
         print_report(result)
+
+    # The gate is the last word, and it exits non-zero rather than printing a
+    # verdict nobody reads. `--quiet` still has to run before this so a CI job
+    # that pipes the JSON onward gets it either way.
+    if gate_failed:
+        raise SystemExit(1)

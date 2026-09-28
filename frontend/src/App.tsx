@@ -1,115 +1,135 @@
 /**
- * App.tsx — Root component.
+ * App.tsx — the workspace shell.
  *
- * Enhancements:
- * - Tracks `activeRepoUrl` — the repo the user has selected for scoped chat
- * - Fetches `indexedRepos` list alongside `indexedFiles`
- * - Passes `activeRepoUrl` + `setActiveRepoUrl` down to IngestPanel (for the
- *   repo selector + clear button) and ChatWindow (for scoped retrieval)
+ * WHAT THIS FILE IS
+ * -----------------
+ * A layout, not a product. It owns the four pieces of state every surface
+ * agrees on — which repository, which destination, which context file, and
+ * whether the drawer is open — and nothing else. The panels it renders were
+ * written before the shell existed and are still reachable from it.
+ *
+ * THE LAYOUT
+ * ----------
+ *   ┌ rail ┬──────────────────────────────────────┬ context ┐
+ *   │ nav  │ conversation / destination           │ evidence│
+ *   │      ├──────────────────────────────────────┤         │
+ *   │      │ composer                             │         │
+ *   └──────┴──────────────────────────────────────┴─────────┘
+ *   status bar: index · model · cost
+ *
+ * That replaces a 17-tab strip and a 401-line sidebar, which is the whole of
+ * the "it looks like a pile of unrelated tools" complaint: the structure now
+ * matches what the product does, and every surface is reachable from one of
+ * three places.
+ *
+ * WHY STATE LIVES HERE
+ * --------------------
+ * "Which repository am I on" was previously held in App *and* in localStorage
+ * *and* re-derived by three panels that each fetched their own copy. The header
+ * and the agent could therefore disagree about the scope of a question. It is
+ * read once here and passed down, and the panels that need it are told.
  */
 
-import { Suspense, lazy, useState, useEffect, useCallback } from "react";
-import { IngestPanel } from "./components/IngestPanel";
-import { ChatWindow } from "./components/ChatWindow";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
+import { Cloud, Cpu, Database, FolderTree, Github, HardDrive } from "lucide-react";
+import { ActivityRail } from "./components/shell/ActivityRail";
+import { TopBar } from "./components/shell/TopBar";
+import { ContextPanel, useContextPanelOpen } from "./components/shell/ContextPanel";
+import { AgentConversation } from "./components/agent/AgentConversation";
+import { ConnectGitHubDialog } from "./components/github/ConnectGitHubDialog";
+import { RepoBrowser } from "./components/github/RepoBrowser";
+import { CommandPalette, ShortcutsHelp } from "./components/CommandPalette";
 import { ReviewPanel } from "./components/ReviewPanel";
-import { AgentPanel } from "./components/AgentPanel";
 import { CodeWriterPanel } from "./components/CodeWriterPanel";
 import { HealthPanel } from "./components/HealthPanel";
-import { OrgPanel } from "./components/OrgPanel";
-import AnalyticsPanel from "./components/AnalyticsPanel";
-import PromptLibrary from "./components/PromptLibrary";
-import SnippetVault from "./components/SnippetVault";
-import ActivityFeed from "./components/ActivityFeed";
-import BulkOpsPanel from "./components/BulkOpsPanel";
 import FileTreePanel from "./components/FileTreePanel";
-import DiffViewer from "./components/DiffViewer";
-import NotificationsPanel from "./components/NotificationsPanel";
-import SlashCommandsPanel from "./components/SlashCommandsPanel";
-import TimeMachinePanel from "./components/TimeMachinePanel";
-import { ThemeToggle } from "./components/ThemeToggle";
-import { TabBar } from "./components/TabBar";
-import { MetricsBar } from "./components/MetricsBar";
+import { ChangesPanel } from "./components/ChangesPanel";
 import { ShareView } from "./components/ShareView";
-import { CommandPalette, ShortcutsHelp } from "./components/CommandPalette";
-import { IndexedFile, IndexedRepo } from "./types";
-import { DEFAULT_TAB, SHORTCUT_BY_KEY, TABS, type Tab } from "./navigation";
-import { OPEN_FILE_EVENT, openFileAt, parseOpenFileDetail } from "./lib/openFile";
+import { LibraryPanel } from "./components/shell/LibraryPanel";
+import { SettingsDialog } from "./components/shell/SettingsDialog";
+import { useGitHub, useModels } from "./hooks/useIntegrations";
+import { useTheme } from "./hooks/useTheme";
 import { apiFetch } from "./api";
+import { AuthGate } from "./components/AuthGate";
+import { DEFAULT_TAB, SHORTCUT_BY_KEY, type Tab } from "./navigation";
+import {
+  OPEN_FILE_EVENT,
+  openFileAt,
+  parseOpenFileDetail,
+  type OpenFileDetail,
+} from "./lib/openFile";
+import { repoDisplayName, repoSlugFromUrl } from "./lib/github";
+import type { IndexedFile, IndexedRepo } from "./types";
+import type { GitHubBranch } from "./types/workspace";
 
-// The dependency-graph panel is the one section whose weight earns loading on demand: it
-// pulls in force-graph plus the d3 force/scale/zoom family, and nothing else in the app
-// touches them, so they can all stay out of the first-paint bundle. Kept in step with
-// the vendor grouping in src/lib/chunking.ts by a test — the moment this import stops
-// being dynamic, that whole subtree is back on the critical path and every number in the
-// build output still looks fine.
+// The dependency graph is the one subtree whose weight earns loading on demand:
+// it pulls in force-graph plus the d3 force/scale/zoom family and nothing else
+// in the app touches them. Kept in step with the vendor grouping in
+// src/lib/chunking.ts by a test.
 const GraphPanel = lazy(() =>
   import("./components/GraphPanel").then((m) => ({ default: m.GraphPanel })),
 );
 
-/** Stand-in while a lazily imported panel's chunk is in flight. */
 function PanelLoader({ label }: { label: string }) {
   return (
     <div className="p-6 space-y-3" role="status" aria-live="polite">
-      <div className="text-xs text-gray-500 font-mono animate-pulse">{label}</div>
-      <div className="h-64 rounded-xl bg-gray-900/60 border border-gray-800 animate-pulse" />
+      <div className="sf-mute text-xs font-mono animate-pulse">{label}</div>
+      <div className="h-64 rounded-xl sf-raised border sf-line animate-pulse" />
     </div>
   );
 }
 
-
-// localStorage helpers for persisting activeRepoUrl across page refreshes
 const ACTIVE_REPO_KEY = "savflux:activeRepoUrl";
+const BRANCH_KEY = "savflux:branch";
+
 function loadActiveRepo(): string | null {
-  try { return localStorage.getItem(ACTIVE_REPO_KEY); } catch { return null; }
-}
-function saveActiveRepo(url: string | null): void {
   try {
-    if (url) localStorage.setItem(ACTIVE_REPO_KEY, url);
-    else localStorage.removeItem(ACTIVE_REPO_KEY);
-  } catch {}
+    return localStorage.getItem(ACTIVE_REPO_KEY);
+  } catch {
+    return null;
+  }
+}
+function loadBranch(): string {
+  try {
+    return localStorage.getItem(BRANCH_KEY) ?? "";
+  } catch {
+    return "";
+  }
 }
 
-/**
- * Share route — https://savflux.app/s/{id} (P1 #5.5).
- *
- * The early return used to sit above the workspace's hooks. React only
- * tolerates that because a share URL never turns into the app mid-session; the
- * moment the path can change (client-side routing, a "back to app" link on the
- * share page) the hook count changes between renders and React throws. This
- * component owns no hooks, so the workspace's hook order can no longer depend
- * on the route.
- */
+/** Share route — https://savflux.app/s/{id}. */
 function App() {
   const isShareRoute = (() => {
-    try { return window.location.pathname.startsWith("/s/"); } catch { return false; }
+    try {
+      return window.location.pathname.startsWith("/s/");
+    } catch {
+      return false;
+    }
   })();
-  return isShareRoute ? <ShareView /> : <Workspace />;
+  return isShareRoute ? <ShareView /> : <AuthGate><Workspace /></AuthGate>;
 }
 
 function Workspace() {
   const [indexedFiles, setIndexedFiles] = useState<IndexedFile[]>([]);
   const [indexedRepos, setIndexedRepos] = useState<IndexedRepo[]>([]);
   const [activeRepoUrl, setActiveRepoUrl] = useState<string | null>(loadActiveRepo);
-  const [activeRepoUrls, setActiveRepoUrls] = useState<string[]>([]); // multi-repo cross-search
+  const [branch, setBranch] = useState<string>(loadBranch);
+  const [branches, setBranches] = useState<GitHubBranch[]>([]);
+  const [defaultBranch, setDefaultBranch] = useState("");
+  const [branchesLoading, setBranchesLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>(DEFAULT_TAB);
-  // Source path of the file the user double-clicked in the graph — used to
-  // pre-select it in the Review panel when navigating graph → review
-  const [reviewTargetSource, setReviewTargetSource] = useState<string | null>(null);
-  // Line span to scroll to / highlight when the Review panel opens a file.
-  // Set when navigation came from a line-precise citation; null for a plain open.
-  const [reviewTargetLines, setReviewTargetLines] = useState<
-    { start: number; end: number; ranges?: string } | null
-  >(null);
-  const [historyTargetSource, setHistoryTargetSource] = useState<string | null>(null);
+  const [contextTarget, setContextTarget] = useState<OpenFileDetail | null>(null);
   const [isPaletteOpen, setPaletteOpen] = useState(false);
   const [isHelpOpen, setHelpOpen] = useState(false);
+  const [isGitHubOpen, setGitHubOpen] = useState(false);
+  const [isSettingsOpen, setSettingsOpen] = useState(false);
+  const [contextOpen, setContextOpen] = useContextPanelOpen();
 
-  // useCallback with no deps — but we use the functional form of setActiveRepoUrl
-  // so the callback always reads CURRENT state instead of a stale closure value.
-  // Without this, fetchIndexedFiles() captures `activeRepoUrl` at render time.
-  // If the user selects a repo and then triggers a re-fetch, the captured value
-  // is stale and the auto-deselect/auto-select logic runs incorrectly.
-  const fetchIndexedFiles = useCallback(async () => {
+  const github = useGitHub();
+  const models = useModels();
+  const theme = useTheme();
+
+  const fetchIndexed = useCallback(async () => {
     try {
       const [filesRes, reposRes] = await Promise.all([
         apiFetch("/api/v1/chat/indexed-files"),
@@ -118,83 +138,139 @@ function Workspace() {
       const filesData = await filesRes.json();
       const reposData = await reposRes.json();
       setIndexedFiles(filesData.files ?? []);
-
       const repos: IndexedRepo[] = reposData.repos ?? [];
       setIndexedRepos(repos);
-
-      // Use functional updater — reads current activeRepoUrl, not the closure value.
       setActiveRepoUrl((current) => {
         const next =
-          repos.length === 1 && !current ? repos[0].repo_url :
-          current && !repos.find((r) => r.repo_url === current) ? null :
-          current;
-        saveActiveRepo(next);
+          repos.length === 1 && !current
+            ? repos[0].repo_url
+            : current && !repos.find((r) => r.repo_url === current)
+              ? null
+              : current;
+        try {
+          if (next) localStorage.setItem(ACTIVE_REPO_KEY, next);
+          else localStorage.removeItem(ACTIVE_REPO_KEY);
+        } catch {
+          /* private mode */
+        }
         return next;
       });
     } catch {
-      // Silently fail — app works even if this endpoint is temporarily down
+      // The shell must render even if this endpoint is down — an unreachable
+      // index is a state to show, not a reason to show nothing.
     }
-  }, []); // setActiveRepoUrl and setIndexedFiles are stable — no deps needed
+  }, []);
 
   useEffect(() => {
-    fetchIndexedFiles();
-  }, [fetchIndexedFiles]);
+    void fetchIndexed();
+  }, [fetchIndexed]);
 
-  // P2 Notifications — poll unread count for tab badge (optional, not blocking)
-  // (Badge is shown inside NotificationsPanel; global polling could be added here if desired)
+  // Branches come from GitHub for the selected repository. A repository that
+  // is not on GitHub (uploaded files) simply has none, and the picker says so
+  // rather than pretending the list is empty for a different reason.
+  useEffect(() => {
+    const slug = repoSlugFromUrl(activeRepoUrl);
+    if (!slug || !github.status?.connected) {
+      setBranches([]);
+      setDefaultBranch("");
+      return;
+    }
+    let cancelled = false;
+    setBranchesLoading(true);
+    (async () => {
+      try {
+        const [branchesRes, repoRes] = await Promise.all([
+          apiFetch(`/api/v1/github/repos/${slug}/branches`),
+          apiFetch(`/api/v1/github/repos/${slug}`),
+        ]);
+        if (cancelled) return;
+        const [branchesData, repoData] = await Promise.all([
+          branchesRes.ok ? branchesRes.json() : Promise.resolve({ branches: [] }),
+          repoRes.ok ? repoRes.json() : Promise.resolve({ default_branch: "" }),
+        ]);
+        const nextBranches: GitHubBranch[] = branchesData.branches ?? [];
+        const nextDefault: string = repoData.default_branch ?? "";
+        setBranches(nextBranches);
+        setDefaultBranch(nextDefault);
+        setBranch((current) => {
+          const validCurrent = nextBranches.some((item) => item.name === current);
+          const next = validCurrent ? current : nextDefault || nextBranches[0]?.name || "";
+          try {
+            if (next) localStorage.setItem(BRANCH_KEY, next);
+            else localStorage.removeItem(BRANCH_KEY);
+          } catch {
+            /* private mode */
+          }
+          return next;
+        });
+      } catch {
+        if (!cancelled) {
+          setBranches([]);
+          setDefaultBranch("");
+        }
+      } finally {
+        if (!cancelled) setBranchesLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeRepoUrl, github.status?.connected]);
 
-  // Open a file in Review — raised by the file tree, the graph, and by
-  // line-precise chat citations (which also carry the span to scroll to).
+  // "Show me this code" — raised by citations anywhere in the app, and by the
+  // file tree. The context panel is the single place that answers it now, so
+  // clicking a citation never navigates away from the conversation.
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = parseOpenFileDetail((e as CustomEvent).detail);
       if (!detail) return;
-      setReviewTargetSource(detail.source);
-      setReviewTargetLines(
-        typeof detail.startLine === "number"
-          ? {
-              start: detail.startLine,
-              end: detail.endLine ?? detail.startLine,
-              ranges: detail.lineRanges,
-            }
-          : null,
-      );
-      setActiveTab("review");
+      setContextTarget(detail);
+      setContextOpen(true);
     };
     window.addEventListener(OPEN_FILE_EVENT as any, handler);
     return () => window.removeEventListener(OPEN_FILE_EVENT as any, handler);
-  }, []);
+  }, [setContextOpen]);
 
-  // P1 Time Machine — open file history from Code Writer
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const src = (e as CustomEvent).detail as string;
-      if (src) { setHistoryTargetSource(src); setActiveTab("history"); }
-    };
-    window.addEventListener("savflux:open-history" as any, handler);
-    return () => window.removeEventListener("savflux:open-history" as any, handler);
-  }, []);
-
-  // P2 Command Palette + Shortcuts (⌘K, /, ?, g + c/r/g/h/a)
+  // ⌘K, `/`, `?`, and the `g`+key sequences.
   useEffect(() => {
     let gPressed = false;
     let gTimer: number | null = null;
+
+    /**
+     * Is the user typing?
+     *
+     * Both `e.target` and `document.activeElement` are consulted, because they
+     * are not always the same element and a shortcut that fires while someone
+     * is typing is the worst kind of bug: the question "why is the JWT
+     * signature validated there?" threw the keyboard reference over the answer
+     * because the `?` arm had no input guard at all, and the `/` arm guards
+     * only `e.target` — which is `BODY` for a synthesised event, for some
+     * IME compositions, and for anything assistive technology dispatches.
+     */
+    const isTyping = (target: EventTarget | null): boolean => {
+      const el = (x: unknown): HTMLElement | null =>
+        x instanceof HTMLElement ? x : null;
+      for (const candidate of [el(target), el(document.activeElement)]) {
+        if (!candidate) continue;
+        if (
+          candidate.tagName === "INPUT" ||
+          candidate.tagName === "TEXTAREA" ||
+          candidate.isContentEditable
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
     const handler = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      const isInput = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
-      // Palette: ⌘K / Ctrl+K
+      const isInput = isTyping(e.target);
+      const modalOpen = isPaletteOpen || isHelpOpen || isGitHubOpen || isSettingsOpen;
+
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setPaletteOpen((v) => !v);
         return;
       }
-      // A pending `g` sequence outranks every single-key shortcut below.
-      // Two sections are named by a key that is itself a shortcut — `g g` for
-      // Dep. Graph and `g /` for Slash — and both used to be swallowed by the
-      // branches underneath: the `g` arm reset the prefix instead of consuming
-      // it, and `/` opened the palette. Neither tab could be reached by its
-      // documented shortcut.
-      if (gPressed && !isInput && !isPaletteOpen && !isHelpOpen && !e.metaKey && !e.ctrlKey) {
+      if (gPressed && !isInput && !modalOpen && !e.metaKey && !e.ctrlKey) {
         const pending = SHORTCUT_BY_KEY[e.key.toLowerCase()];
         gPressed = false;
         if (gTimer) { window.clearTimeout(gTimer); gTimer = null; }
@@ -204,27 +280,26 @@ function Workspace() {
           return;
         }
       }
-      // "/" to open palette when not typing
-      if (!isInput && e.key === "/" && !e.metaKey && !e.ctrlKey) {
+      if (!isInput && !modalOpen && e.key === "/" && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         setPaletteOpen(true);
         return;
       }
-      if (isPaletteOpen || isHelpOpen) return;
-      // "?" help (Shift+?)
-      if (e.key === "?" && !e.metaKey && !e.ctrlKey) {
+      if (modalOpen) return;
+      // `?` was reachable while typing. Every other single-key shortcut is
+      // guarded by `isInput` and this one was not, so asking "where do we
+      // validate the JWT signature?" in the composer threw up the keyboard
+      // reference over the answer — which is exactly the kind of thing that
+      // makes a product feel broken rather than unfinished.
+      if (!isInput && e.key === "?" && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         setHelpOpen(true);
         return;
       }
-      // Start a `g` sequence. Consumed above, so this arm only ever sees a
-      // leading `g`. The shortcut map is derived from TABS, so a new section
-      // gets its `g`+key from its own entry instead of a second edit here.
       if (e.key === "g" && !isInput && !e.metaKey && !e.ctrlKey) {
         gPressed = true;
         if (gTimer) window.clearTimeout(gTimer);
         gTimer = window.setTimeout(() => { gPressed = false; }, 800);
-        return;
       }
     };
     window.addEventListener("keydown", handler);
@@ -232,105 +307,175 @@ function Workspace() {
       window.removeEventListener("keydown", handler);
       if (gTimer) window.clearTimeout(gTimer);
     };
-  }, [isPaletteOpen, isHelpOpen]);
+  }, [isGitHubOpen, isHelpOpen, isPaletteOpen, isSettingsOpen]);
 
+  const repoOptions = useMemo(
+    () =>
+      indexedRepos.map((r) => ({
+        url: r.repo_url,
+        name: repoDisplayName(r.repo_url),
+      })),
+    [indexedRepos],
+  );
 
-  return (
-    <div className="flex h-screen bg-gray-950 text-white overflow-hidden">
-      <IngestPanel
-        indexedFiles={indexedFiles}
-        indexedRepos={indexedRepos}
-        activeRepoUrl={activeRepoUrl}
-        activeRepoUrls={activeRepoUrls}
-        onSetActiveRepo={(url) => { saveActiveRepo(url); setActiveRepoUrl(url); }}
-        onSetActiveRepoUrls={setActiveRepoUrls}
-        onFilesUpdated={fetchIndexedFiles}
-      />
+  const selectRepo = useCallback((url: string | null) => {
+    setActiveRepoUrl(url);
+    try {
+      if (url) localStorage.setItem(ACTIVE_REPO_KEY, url);
+      else localStorage.removeItem(ACTIVE_REPO_KEY);
+    } catch {
+      /* private mode */
+    }
+  }, []);
 
-      <div className="flex flex-col flex-1 overflow-hidden">
-        <div className="flex items-center gap-1 border-b border-gray-700 bg-gray-900 pl-2 pr-4">
-          {/* 17 sections do not fit on a laptop: the strip scrolls and exposes
-              prev/next arrows instead of clipping the tail off-screen. */}
-          <TabBar tabs={TABS} activeTab={activeTab} onSelect={setActiveTab} />
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            <button
-              onClick={() => setPaletteOpen(true)}
-              title="Command palette (⌘K)"
-              className="hidden sm:flex items-center gap-1.5 text-xs text-gray-400 hover:text-white bg-gray-800 hover:bg-gray-700 border border-gray-700 px-2.5 py-1 rounded-full"
-            >
-              <span className="text-gray-500">⌘K</span>
-            </button>
-            <ThemeToggle compact />
-          </div>
-        </div>
+  const selectBranch = useCallback((b: string) => {
+    setBranch(b);
+    try {
+      localStorage.setItem(BRANCH_KEY, b);
+    } catch {
+      /* private mode */
+    }
+  }, []);
 
-        <div
-          className="flex-1 overflow-hidden"
-          role="tabpanel"
-          id={`savflux-panel-${activeTab}`}
-          aria-labelledby={`savflux-tab-${activeTab}`}
-        >
-          {activeTab === "chat" && (
-            <ChatWindow
-              activeRepoUrl={activeRepoUrl}
-              hasIndexedFiles={indexedFiles.length > 0}
-              activeRepoUrls={activeRepoUrls.length > 0 ? activeRepoUrls : null}
-            />
-          )}
-          {activeTab === "review" && (
-            <ReviewPanel
-              indexedFiles={indexedFiles}
-              initialSelectedSource={reviewTargetSource}
-              initialTargetLines={reviewTargetLines}
-              onInitialSourceConsumed={() => {
-                setReviewTargetSource(null);
-                setReviewTargetLines(null);
-              }}
-            />
-          )}
-          {activeTab === "write"  && <CodeWriterPanel indexedFiles={indexedFiles} />}
-          {activeTab === "agent"  && <AgentPanel />}
-          {activeTab === "graph"  && (
-            <Suspense fallback={<PanelLoader label="Loading the dependency graph\u2026" />}>
-              <GraphPanel
-                indexedRepos={indexedRepos}
-                activeRepoUrl={activeRepoUrl}
-                onNavigateToReview={(source) => {
-                  setReviewTargetSource(source);
-                  setActiveTab("review");
-                }}
-              />
-            </Suspense>
-          )}
-          {activeTab === "health" && <HealthPanel activeRepoUrl={activeRepoUrl} />}
-          {activeTab === "org" && (
-            <OrgPanel
+  const hasIndex = indexedFiles.length > 0;
+  const githubConnected = Boolean(github.status?.connected && github.status?.valid);
+
+  const body = (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div
+        className="min-h-0 flex-1 overflow-hidden"
+        role="tabpanel"
+        id={`savflux-panel-${activeTab}`}
+        aria-labelledby={`savflux-tab-${activeTab}`}
+      >
+        {activeTab === "agent" && (
+          <AgentConversation
+            activeRepoUrl={activeRepoUrl}
+            hasIndexedFiles={hasIndex}
+            models={models.models}
+            onOpenGitHub={() => setGitHubOpen(true)}
+            // The empty state can index a public URL or an upload, so it has to
+            // tell the app the index changed — otherwise the button is pressed,
+            // the work happens, and the page still says there is nothing here.
+            onIndexed={fetchIndexed}
+          />
+        )}
+        {activeTab === "review" && <ReviewPanel indexedFiles={indexedFiles} onIndexed={fetchIndexed} />}
+        {activeTab === "write" && <CodeWriterPanel indexedFiles={indexedFiles} />}
+        {activeTab === "explorer" && <FileTreePanel onOpenFile={(src) => openFileAt(src)} onIndexed={fetchIndexed} />}
+        {activeTab === "graph" && (
+          <Suspense fallback={<PanelLoader label="Loading the dependency graph…" />}>
+            <GraphPanel
               indexedRepos={indexedRepos}
               activeRepoUrl={activeRepoUrl}
-              activeRepoUrls={activeRepoUrls}
-              onSetActiveRepo={(url) => { saveActiveRepo(url); setActiveRepoUrl(url); }}
-              onSetActiveRepoUrls={setActiveRepoUrls}
-              onFilesUpdated={fetchIndexedFiles}
+              onIndexed={fetchIndexed}
+              onNavigateToReview={(source) => {
+                openFileAt({ source });
+                setActiveTab("review");
+              }}
             />
-          )}
-          {activeTab === "analytics" && <AnalyticsPanel />}
-          {activeTab === "prompts" && <PromptLibrary onUsePrompt={(text) => { setActiveTab("chat"); window.dispatchEvent(new CustomEvent("savflux:use-prompt", { detail: text })); }} />}
-          {activeTab === "snippets" && <SnippetVault />}
-          {activeTab === "activity" && <ActivityFeed />}
-          {activeTab === "bulk" && <BulkOpsPanel onFilesUpdated={() => window.location.reload()} />}
-          {activeTab === "explorer" && <FileTreePanel onOpenFile={(src) => openFileAt(src)} />}
-          {activeTab === "diff" && <DiffViewer />}
-          {activeTab === "notifications" && <NotificationsPanel />}
-          {activeTab === "history" && (
-            <TimeMachinePanel
-              initialSource={historyTargetSource}
-              onInitialSourceConsumed={() => setHistoryTargetSource(null)}
-            />
-          )}
-          {activeTab === "slash" && <SlashCommandsPanel onUse={(prompt)=>{ setActiveTab("chat"); window.dispatchEvent(new CustomEvent("savflux:use-prompt", {detail: prompt})); }} />}
-        </div>
-        <MetricsBar />
+          </Suspense>
+        )}
+        {activeTab === "health" && <HealthPanel activeRepoUrl={activeRepoUrl} />}
+        {activeTab === "repos" && (
+          <RepoBrowser
+            status={github.status}
+            onConnect={() => setGitHubOpen(true)}
+            indexedRepos={indexedRepos}
+            indexedFiles={indexedFiles}
+            activeRepoUrl={activeRepoUrl}
+            onSelectRepo={selectRepo}
+            onIndexed={fetchIndexed}
+            models={models.models}
+            branch={branch}
+          />
+        )}
+        {activeTab === "changes" && (
+          <ChangesPanel
+            activeRepoUrl={activeRepoUrl}
+            selectedBranch={branch}
+            defaultBranch={defaultBranch}
+            branches={branches}
+            branchesLoading={branchesLoading}
+            githubConnected={githubConnected}
+            onConnectGitHub={() => setGitHubOpen(true)}
+          />
+        )}
+        {activeTab === "library" && (
+          <LibraryPanel
+            onIndexed={fetchIndexed}
+            onUsePrompt={(text) => {
+              setActiveTab("agent");
+              window.dispatchEvent(new CustomEvent("savflux:use-prompt", { detail: text }));
+            }}
+          />
+        )}
       </div>
+      <StatusFooter
+        indexCount={indexedFiles.length}
+        repoCount={indexedRepos.length}
+        activeRepoUrl={activeRepoUrl}
+        models={models.models}
+        githubConnected={githubConnected}
+        onOpenModels={() => setSettingsOpen(true)}
+        onOpenGitHub={() => setGitHubOpen(true)}
+      />
+    </div>
+  );
+
+  return (
+    <div className="flex h-screen overflow-hidden" style={{ background: "var(--sf-canvas)", color: "var(--sf-text)" }}>
+      <ActivityRail
+        active={activeTab}
+        onSelect={setActiveTab}
+        hasIndex={hasIndex}
+        githubConnected={githubConnected}
+        onConnectGitHub={() => setGitHubOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <TopBar
+          repos={repoOptions}
+          activeRepoUrl={activeRepoUrl}
+          onSelectRepo={selectRepo}
+          branch={branch}
+          branches={branches.map((b) => b.name)}
+          onSelectBranch={selectBranch}
+          branchesLoading={branchesLoading}
+          indexCount={indexedFiles.length}
+          github={github.status}
+          models={models.models}
+          modelsBusy={models.busy}
+          onSelectModel={(name) => void models.select(name)}
+          onConnectGitHub={() => setGitHubOpen(true)}
+          onSignOut={() => window.dispatchEvent(new Event("savflux:signout"))}
+          onOpenCommandPalette={() => setPaletteOpen(true)}
+          contextOpen={contextOpen}
+          onToggleContext={() => setContextOpen(!contextOpen)}
+          isDark={theme.isDark}
+          onToggleTheme={theme.toggle}
+        />
+
+        <div className="relative flex min-h-0 flex-1">
+          {body}
+          <ContextPanel
+            open={contextOpen}
+            onClose={() => {
+              if (contextTarget) {
+                setContextTarget(null);
+                return;
+              }
+              setContextOpen(false);
+            }}
+            target={contextTarget}
+            onClearTarget={() => setContextTarget(null)}
+            indexedFiles={indexedFiles}
+            repoUrl={activeRepoUrl}
+          />
+        </div>
+      </div>
+
       <CommandPalette
         open={isPaletteOpen}
         onClose={() => setPaletteOpen(false)}
@@ -338,12 +483,120 @@ function Workspace() {
         indexedRepos={indexedRepos}
         activeRepoUrl={activeRepoUrl}
         activeTab={activeTab}
-        onSetActiveTab={setActiveTab}
-        onSetActiveRepo={(url) => { saveActiveRepo(url); setActiveRepoUrl(url); }}
-        onNavigateToFile={(source) => setReviewTargetSource(source)}
+        onSetActiveTab={(t) => setActiveTab(t as Tab)}
+        onSetActiveRepo={selectRepo}
+        onNavigateToFile={(source) => {
+          setContextTarget({ source });
+          setContextOpen(true);
+        }}
+        onOpenGitHub={() => setGitHubOpen(true)}
       />
       <ShortcutsHelp open={isHelpOpen} onClose={() => setHelpOpen(false)} />
+      <ConnectGitHubDialog
+        open={isGitHubOpen}
+        onClose={() => setGitHubOpen(false)}
+        status={github.status}
+        busy={github.busy}
+        error={github.error}
+        onConnect={github.connect}
+        onDisconnect={github.disconnect}
+      />
+      <SettingsDialog
+        open={isSettingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        models={models.models}
+        onSelectModel={(name) => void models.select(name)}
+        onSelectMixtureModels={models.selectMixture}
+        onSelectProvider={models.selectProvider}
+        onForgetProviderKey={models.forgetProviderKey}
+        providerBusy={models.busy}
+        providerError={models.error}
+        onOpenGitHub={() => {
+          setSettingsOpen(false);
+          setGitHubOpen(true);
+        }}
+        contextOpen={contextOpen}
+        onToggleContext={() => setContextOpen(!contextOpen)}
+      />
     </div>
+  );
+}
+
+/* ── Status bar ───────────────────────────────────────────────────────────── */
+
+function StatusFooter({
+  indexCount,
+  repoCount,
+  activeRepoUrl,
+  models,
+  githubConnected,
+  onOpenModels,
+  onOpenGitHub,
+}: {
+  indexCount: number;
+  repoCount: number;
+  activeRepoUrl: string | null;
+  models: ReturnType<typeof useModels>["models"];
+  githubConnected: boolean;
+  onOpenModels: () => void;
+  onOpenGitHub: () => void;
+}) {
+  return (
+    <footer
+      className="sf-surface flex h-[26px] shrink-0 items-center gap-4 border-t sf-line px-3 text-[11px]"
+      aria-label="Status"
+    >
+      <span className="sf-mute inline-flex items-center gap-1.5" title="Indexed files">
+        <HardDrive className="h-3 w-3" />
+        {indexCount} {indexCount === 1 ? "file" : "files"}
+        {repoCount > 0 && ` · ${repoCount} ${repoCount === 1 ? "repo" : "repos"}`}
+      </span>
+
+      {activeRepoUrl && (
+        <span className="sf-mute hidden min-w-0 items-center gap-1.5 sm:inline-flex">
+          <Database className="h-3 w-3 shrink-0" />
+          <span className="truncate">
+            {activeRepoUrl.replace(/^https?:\/\//, "").replace(/\.git$/, "")}
+          </span>
+        </span>
+      )}
+
+      <span className="flex-1" />
+
+      <button
+        type="button"
+        onClick={onOpenModels}
+        className="sf-mute inline-flex items-center gap-1.5 transition-colors hover:text-[var(--sf-text)]"
+        title={models?.available ? "Model settings" : models?.hint ?? "Model settings"}
+      >
+        <Cpu className="h-3 w-3" />
+        {models ? (models.provider === "ollama" ? models.chat_model : models.provider_model) : "no model"}
+        {models && !models.available && (
+          <span
+            className="inline-block h-1.5 w-1.5 rounded-full"
+            style={{ background: models.provider === "ollama" && !models.reachable ? "var(--sf-bad)" : "var(--sf-warn)" }}
+            aria-label={models.kind === "provider_key_missing" ? "provider API key missing" : models.reachable ? "model not installed" : "model runtime not running"}
+          />
+        )}
+      </button>
+
+      <button
+        type="button"
+        onClick={onOpenGitHub}
+        className="sf-mute inline-flex items-center gap-1.5 transition-colors hover:text-[var(--sf-text)]"
+        title={githubConnected ? "GitHub connected" : "Connect GitHub"}
+      >
+        {githubConnected ? <Github className="h-3 w-3" /> : <Cloud className="h-3 w-3" />}
+        {githubConnected ? "GitHub" : "not connected"}
+      </button>
+
+      {indexCount === 0 && (
+        <span className="sf-mute hidden items-center gap-1.5 md:inline-flex">
+          <FolderTree className="h-3 w-3" />
+          nothing indexed
+        </span>
+      )}
+    </footer>
   );
 }
 

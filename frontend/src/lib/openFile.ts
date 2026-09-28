@@ -39,6 +39,23 @@ export interface OpenFileDetail {
   lineRanges?: string;
 }
 
+/**
+ * The file name a `source` id refers to, without the repository prefix.
+ *
+ * `https://github.com/o/r::src/auth/tokens.py` → `tokens.py`. Splitting on the
+ * last `::` matters: `split("::").pop()` and `lastIndexOf` agree, but a naive
+ * `indexOf` would cut at the first separator it found, and a source is a URL
+ * followed by a path, not a path followed by a URL.
+ *
+ * The format is the storage contract, so the rule lives beside the type that
+ * documents it rather than in whichever component happened to need a label.
+ */
+export function sourceFileName(source: string): string {
+  const cut = source.lastIndexOf("::");
+  const path = cut === -1 ? source : source.slice(cut + 2);
+  return path.split("/").pop() || path;
+}
+
 /** A parsed inclusive line range. */
 export interface LineRange {
   start: number;

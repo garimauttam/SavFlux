@@ -166,6 +166,15 @@ def test_create_pr_pushes_once_the_exact_diff_is_confirmed(isolated_data_dir, cl
 
 
 def test_create_pr_still_explains_itself_without_a_token(isolated_data_dir, client, monkeypatch, fake_github_api):
+    """
+    Nothing was pushed, and the reason names something the reader can act on.
+
+    The assertion used to be `"GITHUB_TOKEN" in reason`, which was correct for a
+    product where the only way to connect was to export a shell variable — and
+    wrong the moment the Connect button existed, because a person who pasted a
+    token into SavFlux cannot find that variable anywhere. It is now: no push,
+    a usable command, and a message pointing at the thing that would fix it.
+    """
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     response = client.post("/api/v1/review/create-pr", json={
         "repo": "o/r", "head": "savflux/fix", "diff": DIFF,
@@ -174,7 +183,11 @@ def test_create_pr_still_explains_itself_without_a_token(isolated_data_dir, clie
     data = response.json()
 
     assert data["status"] == "manual"
-    assert "GITHUB_TOKEN" in data["reason"]
+    assert data["gh_command"].startswith("gh pr create --repo o/r"), (
+        "the whole point of a manual plan is that it is runnable"
+    )
+    assert "not connected" in data["reason"].lower()
+    assert "connect" in data["reason"].lower()
     fake_github_api.assert_not_called()
 
 
@@ -191,9 +204,17 @@ async def test_create_pr_via_api_wraps_transport_failures(monkeypatch):
     """
     No network, bad TLS, DNS failure — all of them must arrive as RuntimeError so
     the endpoint can hand back the `gh` command instead of a 500.
+
+    The seam moved. This used to patch `httpx.AsyncClient` and call
+    `create_pr_via_api` directly, because `create_pr_via_api` used to own the
+    POST. It no longer does — it delegates to `github_service.create_pull`, so
+    the transport is exercised there. Both halves are asserted below rather than
+    one, because the property has two parts that can fail separately: the
+    transport must be translated, and the translation must survive the hop.
     """
     import httpx
 
+    from app.services import github_service
     from app.services.pr_service import create_pr_via_api
 
     class UnreachableClient:
@@ -206,11 +227,22 @@ async def test_create_pr_via_api_wraps_transport_failures(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-        async def post(self, *args, **kwargs):
+        async def request(self, *args, **kwargs):
             raise httpx.ConnectError("no route to host")
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
     monkeypatch.setattr(httpx, "AsyncClient", UnreachableClient)
 
-    with pytest.raises(RuntimeError, match="could not reach"):
+    # 1. The transport failure becomes a readable, classified error …
+    with pytest.raises(github_service.GitHubError) as exc:
+        await github_service._request("GET", "/user")
+    assert exc.value.kind == "network"
+    assert "could not reach" in str(exc.value).lower()
+    # `GitHubError` subclasses RuntimeError, so every existing caller's
+    # `except RuntimeError` keeps working without knowing about this class.
+    assert isinstance(exc.value, RuntimeError)
+
+    # 2. … and it is still a RuntimeError after crossing back out of
+    #    `create_pr_via_api`, which is the contract the endpoint depends on.
+    with pytest.raises(RuntimeError, match="(?i)could not reach"):
         await create_pr_via_api("o/r", "head", "main", "title")

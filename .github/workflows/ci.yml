@@ -53,13 +53,17 @@ jobs:
         run: python -m pytest -v --tb=short
 
   # ── Backend: RAG eval (self-benchmark) ──────────────────────────────────────
-  # Runs the 42-query benchmark against the backend source as the corpus.
-  # Fails the CI if Hit Rate drops below 40% (regression guard).
+  # Runs the 44-query benchmark against the backend source as the corpus and
+  # gates every quality metric against a committed baseline.
+  #
+  # This used to run only on push to main, and only checked `hit_rate < 40`.
+  # The score is ~66, so that floor could not fail for any regression worth
+  # noticing, and skipping pull requests meant a retrieval break was discovered
+  # after it had already landed. Both are fixed: it runs on every PR, and
+  # `--gate` compares per metric against benchmarks/rag_offline_baseline.json.
   rag-eval:
-    name: RAG Benchmark (self-eval)
+    name: RAG Benchmark (regression gate)
     runs-on: ubuntu-latest
-    # Run only on push to main to keep PR checks fast
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout
@@ -75,7 +79,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r backend/requirements.txt
 
-      - name: Run RAG benchmark
+      - name: Run RAG benchmark and gate it
         env:
           LLM_PROVIDER: openai
           OPENAI_API_KEY: sk-ci-placeholder
@@ -87,12 +91,23 @@ jobs:
         #                with exponential backoff before the failure path disables
         #                it, turning a 2-second run into several minutes and
         #                corrupting the latency metric.
+        #
+        # --gate exits non-zero when a quality metric falls past its floor, and
+        # prints the per-metric table either way so the PR log says what moved.
+        # If a drop is an intended improvement, refresh the baseline in the same
+        # PR — the diff of that file is the record of the move.
         run: |
-          python eval_rag.py --quiet --embedder offline --no-rerank --json-out eval_results.json
-          echo "=== Benchmark Results ==="
-          cat eval_results.json | python3 -c "
-          import sys, json
-          d = json.load(sys.stdin)
+          python eval_rag.py --quiet --embedder offline --no-rerank \
+            --json-out eval_results.json \
+            --gate benchmarks/rag_offline_baseline.json
+
+      - name: Summarise
+        if: always()
+        run: |
+          test -f eval_results.json || exit 0
+          python3 -c "
+          import json
+          d = json.load(open('eval_results.json'))
           m = d['metrics']
           for leg, v in m['by_leg'].items():
               if v.get('hit_rate_at_k') is None:
@@ -102,15 +117,9 @@ jobs:
                         f'mrr={v[\"mean_reciprocal_rank_mrr\"]:.3f}  '
                         f'symbols={v[\"symbol_recall_pct\"]:>5.1f}%')
           print(f'  dense leg embedder: {m[\"dense_leg_embedder\"]}')
-          print(f'  avg latency: {m[\"avg_latency_ms\"]} ms/query')
           e = d['evaluation']
-          print('  corpus: ' + str(e['corpus_shape']) + ' shape, '+ str(e['dense_corpus']['units']) + ' units')
+          print('  corpus: ' + str(e['corpus_shape']) + ' shape, ' + str(e['dense_corpus']['units']) + ' units')
           print('  hit rate is ' + str(m['hit_rate_at_k_granularity']) + '-level (a unit of the expected file)')
-          hr = m['hit_rate_at_k']
-          if hr < 40:
-              print(f'FAIL: Hit Rate {hr}% is below the 40% regression threshold.')
-              sys.exit(1)
-          print(f'PASS: Hit Rate {hr}% meets the 40% threshold.')
           "
 
       - name: Upload benchmark results

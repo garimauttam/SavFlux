@@ -1,28 +1,16 @@
-"""
-test_auth.py — Tests for the API key authentication dependency.
+"""Single-owner API-key authentication tests.
 
-Verifies:
-  1. When API_KEY is not set, all requests pass through (open/dev mode).
-  2. When API_KEY is set, requests without the header get 401.
-  3. When API_KEY is set, requests with the wrong key get 401.
-  4. When API_KEY is set, requests with the correct key pass through.
-
-We test via the /api/v1/chat/indexed-files endpoint (cheap GET, no mocking needed
-beyond ChromaDB) so we exercise the full middleware stack.
+The owner key protects every /api/v1 route, not only routes which remembered
+an explicit FastAPI dependency. Local loopback remains zero-config only before
+a stored key exists; generated keys and explicit API_KEYs require sign-in.
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 
 def _make_client(api_key: str | None):
-    """
-    Spin up a fresh TestClient with the given API_KEY setting.
-    We need a new client per test because Settings is cached via lru_cache —
-    we patch get_settings in deps.py to return the desired key value.
-    """
     from app.core.config import Settings
 
     fake_settings = Settings(
@@ -30,53 +18,39 @@ def _make_client(api_key: str | None):
         openai_api_key="sk-test",
         api_key=api_key,
     )
-
+    expected_key = api_key or ""
     mock_chroma = MagicMock()
     mock_chroma._collection.get.return_value = {"metadatas": None}
 
     with patch("app.core.config.get_settings", return_value=fake_settings), \
-         patch("app.api.deps.get_settings", return_value=fake_settings), \
+         patch("app.services.owner_key.get_settings", return_value=fake_settings), \
+         patch("app.api.deps.effective_owner_key", return_value=expected_key), \
+         patch("app.services.owner_key.effective_owner_key", return_value=expected_key), \
+         patch("app.services.owner_key.load_or_create_owner_key", return_value=(expected_key, False)), \
          patch("app.services.ingestion_service.settings", fake_settings), \
          patch("openai.AsyncOpenAI"), \
          patch("chromadb.PersistentClient", return_value=mock_chroma), \
          patch("app.services.reranker._get_cross_encoder"), \
          patch("app.services.retrieval_service._get_vectorstore", return_value=mock_chroma):
-
         from main import app
-        with TestClient(app, raise_server_exceptions=False) as c:
-            yield c
+        with TestClient(app, raise_server_exceptions=False) as client:
+            yield client
 
 
-# ── Test 1: Open mode (no API_KEY configured) ─────────────────────────────────
-
-def test_no_api_key_configured_allows_all_requests():
-    """
-    When API_KEY is not set in settings, requests without a header pass through.
-    This is the default dev-mode behaviour — zero friction locally.
-    """
+def test_unconfigured_owner_key_fails_closed_even_for_loopback():
     for client in _make_client(api_key=None):
         response = client.get("/api/v1/chat/indexed-files")
-        assert response.status_code == 200
+        assert response.status_code == 503
+        assert "authentication is not configured" in response.json()["detail"].lower()
 
-
-# ── Test 2: Protected mode — missing header ───────────────────────────────────
 
 def test_missing_header_returns_401_when_key_is_set():
-    """
-    When API_KEY is configured, a request without X-API-Key must return 401.
-    """
     for client in _make_client(api_key="supersecret"):
         response = client.get("/api/v1/chat/indexed-files")
         assert response.status_code == 401
-        assert "API key" in response.json()["detail"]
 
-
-# ── Test 3: Protected mode — wrong key ────────────────────────────────────────
 
 def test_wrong_key_returns_401():
-    """
-    When API_KEY is configured, a request with the wrong key must return 401.
-    """
     for client in _make_client(api_key="supersecret"):
         response = client.get(
             "/api/v1/chat/indexed-files",
@@ -85,12 +59,7 @@ def test_wrong_key_returns_401():
         assert response.status_code == 401
 
 
-# ── Test 4: Protected mode — correct key ─────────────────────────────────────
-
 def test_correct_key_passes_through():
-    """
-    When API_KEY is configured and the correct key is sent, the request succeeds.
-    """
     for client in _make_client(api_key="supersecret"):
         response = client.get(
             "/api/v1/chat/indexed-files",
@@ -99,13 +68,34 @@ def test_correct_key_passes_through():
         assert response.status_code == 200
 
 
-# ── Test 5: /health is always unprotected ─────────────────────────────────────
+def test_api_routes_without_route_dependency_are_also_protected():
+    # /agent/tools did not previously declare Depends(require_api_key). The
+    # app-level gate means a future route cannot accidentally become public.
+    for client in _make_client(api_key="supersecret"):
+        assert client.get("/api/v1/agent/tools").status_code == 401
+        assert client.get(
+            "/api/v1/agent/tools", headers={"X-API-Key": "supersecret"}
+        ).status_code == 200
+
+
+def test_signin_check_never_returns_the_supplied_key():
+    for client in _make_client(api_key="supersecret"):
+        response = client.post(
+            "/api/v1/auth/session", headers={"X-API-Key": "supersecret"}
+        )
+        assert response.status_code == 200
+        assert response.json() == {"authenticated": True}
+        assert "supersecret" not in response.text
+
+
+def test_public_share_links_remain_public():
+    for client in _make_client(api_key="supersecret"):
+        with patch("app.services.share_service.get_share", return_value={"id": "abc1234567"}):
+            response = client.get("/api/v1/share/abc1234567")
+        assert response.status_code == 200
+
 
 def test_health_always_passes_without_key():
-    """
-    /health must never require an API key — Railway health checks don't send headers.
-    """
     for client in _make_client(api_key="supersecret"):
         response = client.get("/health")
-        # Health may return 200 or 503 depending on mock state — never 401
         assert response.status_code != 401

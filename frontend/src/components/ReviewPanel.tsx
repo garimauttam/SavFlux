@@ -13,6 +13,7 @@
 
 import { useState, useMemo, useEffect, useRef } from "react";
 import { formatDuration } from "../lib/stream";
+import { apiFetch } from "../api";
 import { EMPTY_TIMINGS, stagesFor, type ReviewTimings } from "../lib/timings";
 import { useLiveElapsed } from "./agent/AgentRunHeader";
 import { TimingBreakdown } from "./agent/TimingBreakdown";
@@ -47,6 +48,7 @@ import { PRReviewPanel } from "./PRReviewPanel";
 import { EvidenceViewer } from "./EvidenceViewer";
 import { ApplyFixPanel } from "./ApplyFixPanel";
 import { StopButton } from "./StopButton";
+import { IndexPrompt } from "./IndexPrompt";
 import { useReview } from "../hooks/useReview";
 import { useMultiReview, ReviewSection } from "../hooks/useMultiReview";
 import { CodeHighlight } from "../lib/highlight";
@@ -60,6 +62,8 @@ interface ReviewPanelProps {
   initialTargetLines?: { start: number; end: number; ranges?: string } | null;
   /** Called after the initial selection has been applied, so the parent can clear it. */
   onInitialSourceConsumed?: () => void;
+  /** Re-read the index after the user indexes from this page. */
+  onIndexed: () => void;
 }
 
 // ── Language → icon colour ────────────────────────────────────────────────────
@@ -745,6 +749,7 @@ export function ReviewPanel({
   initialSelectedSource,
   initialTargetLines,
   onInitialSourceConsumed,
+  onIndexed,
 }: ReviewPanelProps) {
   const single = useReview();
   const multi  = useMultiReview();
@@ -754,6 +759,12 @@ export function ReviewPanel({
 
   // File selection
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // The per-request file cap, read from the server rather than repeated here.
+  // A second hardcoded copy is how the page ended up offering "Review 238
+  // files" for a request the server refused at 200, with nothing on screen to
+  // explain the difference.
+  const [maxFilesPerRequest, setMaxFilesPerRequest] = useState<number>(2000);
+  const overLimit = selected.size > maxFilesPerRequest;
 
   // Sources that were sent for review — the scope of any "apply fix" afterwards.
   const [reviewedSources, setReviewedSources] = useState<string[]>([]);
@@ -778,6 +789,24 @@ export function ReviewPanel({
       lineRanges?: string;
     } | null
   >(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Best-effort. If this fails the page keeps its default and the server's
+    // own message is still the one shown — a missing hint must never be the
+    // reason a review cannot start.
+    apiFetch("/api/v1/review/limits")
+      .then((r: Response) => r.json())
+      .then((d: { max_files_per_request?: number }) => {
+        if (!cancelled && typeof d?.max_files_per_request === "number") {
+          setMaxFilesPerRequest(d.max_files_per_request);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // ── Graph / citation → Review navigation ──────────────────────────────────
   // Pre-selects the incoming file. When the navigation carried a cited line
@@ -889,7 +918,10 @@ export function ReviewPanel({
   const canReview = !isActive && (
     tab === "paste"
       ? pastedCode.trim().length > 0
-      : selected.size > 0
+      // `overLimit` is part of this, not a server-side surprise. The button
+      // said "Review 238 files" and the request was refused at 200; the count
+      // on the button has to mean the request will be accepted.
+      : selected.size > 0 && !overLimit
   );
 
   const hasOutput = isMulti ? multi.sections.length > 0 : !!single.review;
@@ -933,6 +965,7 @@ export function ReviewPanel({
     if (isActive) return isMulti ? "Reviewing..." : "Agent running...";
     if (tab === "paste") return "Run Code Review";
     if (selected.size === 0) return "Run Code Review";
+    if (overLimit) return `Too many files — ${maxFilesPerRequest} max`;
     return selected.size === 1 ? "Review 1 file" : `Review ${selected.size} files`;
   };
 
@@ -1014,11 +1047,12 @@ export function ReviewPanel({
           {tab === "file" && (
             <div className="flex flex-col flex-1 overflow-hidden">
               {indexedFiles.length === 0 ? (
-                <div className="flex-1 flex items-center justify-center p-6">
-                  <p className="text-xs text-gray-600 text-center">
-                    No files indexed yet.<br />Add a repo in the sidebar first.
-                  </p>
-                </div>
+                <IndexPrompt
+                  title="No files indexed yet"
+                  body="Index a public repository or upload a folder to review its files. No account needed."
+                  onIndexed={onIndexed}
+                  className="flex-1 p-6"
+                />
               ) : (
                 <>
                   {/* Select all row */}
@@ -1046,9 +1080,23 @@ export function ReviewPanel({
                     </button>
 
                     {selected.size > 0 && (
-                      <p className="mt-1.5 text-[11px] text-yellow-500/70 px-1">
+                      <p
+                        className={`mt-1.5 text-[11px] px-1 ${
+                          overLimit
+                            ? "text-red-400"
+                            : "text-yellow-500/70"
+                        }`}
+                      >
                         {selected.size} file{selected.size !== 1 ? "s" : ""} selected
                         {selected.size === 1 ? " — single review" : " — combined review"}
+                        {overLimit && (
+                          <span className="block mt-0.5">
+                            One request carries at most {maxFilesPerRequest}. Deselect{" "}
+                            {selected.size - maxFilesPerRequest} to continue — a larger
+                            selection is not a worse review, it is more batches and more
+                            time.
+                          </span>
+                        )}
                       </p>
                     )}
                   </div>
