@@ -11,6 +11,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { apiFetch } from "../api";
+import { IndexPrompt } from "./IndexPrompt";
 import { Folder, FolderOpen, FileCode, Search, ChevronRight, ChevronDown, X, Expand, Minimize2 } from "lucide-react";
 
 type TreeNode = {
@@ -25,7 +26,14 @@ type TreeNode = {
   chunk_count?: number;
 };
 
-export default function FileTreePanel({ onOpenFile }: { onOpenFile?: (source: string) => void }) {
+export default function FileTreePanel({
+  onOpenFile,
+  onIndexed,
+}: {
+  onOpenFile?: (source: string) => void;
+  /** Re-read the index after the user indexes from this page. */
+  onIndexed: () => void;
+}) {
   const [tree, setTree] = useState<TreeNode | null>(null);
   const [flat, setFlat] = useState<TreeNode[]>([]);
   const [totalFiles, setTotalFiles] = useState(0);
@@ -34,6 +42,17 @@ export default function FileTreePanel({ onOpenFile }: { onOpenFile?: (source: st
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Whether there is anything to show.
+   *
+   * `GET /api/v1/file-tree` always returns a root node — with nothing indexed
+   * it is `{name: "", children: [], file_count: 0}` — so testing `tree` for
+   * truthiness is always true and the empty state below was unreachable. It
+   * rendered `renderNode` on an empty root, which produces no output at all: a
+   * blank box with no explanation and no way forward.
+   */
+  const hasTree = !!tree && (tree.children?.length ?? 0) > 0;
 
   const fetchTree = useCallback(async () => {
     try {
@@ -175,8 +194,13 @@ export default function FileTreePanel({ onOpenFile }: { onOpenFile?: (source: st
       )}
 
       <div className="rounded-lg border border-white/10 bg-white/[0.03] overflow-hidden max-h-[60vh] overflow-y-auto">
-        {!tree ? (
-          <div className="text-sm text-gray-500 p-6 text-center">No files indexed yet — ingest a repo to see tree.</div>
+        {!hasTree ? (
+          <IndexPrompt
+            title="No files indexed yet"
+            body="Index a public repository or upload a folder, and the tree builds itself. No account needed."
+            onIndexed={onIndexed}
+            className="p-6 py-10"
+          />
         ) : (
           renderNode(tree, 0)
         )}

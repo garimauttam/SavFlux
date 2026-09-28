@@ -37,6 +37,7 @@ will never catch a broken default. Test the defaults themselves.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import typing
@@ -44,7 +45,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 
 ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
 REQUIREMENTS = Path(__file__).resolve().parents[1] / "requirements.txt"
@@ -218,6 +219,85 @@ def test_no_second_model_is_downloaded_before_a_review_can_run(default_settings)
     assert settings.ollama_chat_model
 
 
+# ── configs.json: the default that silently wins ─────────────────────────────
+
+#: Largest parameter count a free-tier machine starts. 8 GB of VRAM, or 16 GB of
+#: shared RAM with the OS already holding half of it. It is the same threshold
+#: `test_the_default_model_fits_a_modest_machine` uses, deliberately, so the two
+#: defaults cannot drift apart in the one direction that matters.
+FREE_TIER_MAX_B = 8.0
+
+CONFIGS_JSON = Path(__file__).resolve().parents[2] / "configs.json"
+
+
+def _shipped_configs() -> dict:
+    assert CONFIGS_JSON.is_file(), f"{CONFIGS_JSON} is missing"
+    return json.loads(CONFIGS_JSON.read_text(encoding="utf-8"))
+
+
+def _assert_runnable(model: str, where: str) -> None:
+    match = re.search(r":(\d+(?:\.\d+)?)b", model)
+    assert match, f"cannot read a parameter count from the {where} model {model!r}"
+    assert float(match.group(1)) <= FREE_TIER_MAX_B, (
+        f"{where} ships {model}, which is larger than a free-tier machine can run. "
+        f"configs.json overrides the config defaults for anyone without a .env, so "
+        f"this is the model a first-time user is told to download, and a download "
+        f"that does not fit is a dead end on the product's headline promise."
+    )
+
+
+def test_configs_json_ships_a_model_a_free_machine_can_run():
+    """
+    The blind spot this whole file is about, closed.
+
+    `configs.json` is read by `_load_json_configs` and passed into `Settings`,
+    and it wins over the pydantic defaults for anyone who has no `.env` — which
+    is every fresh clone. It shipped `qwen3-coder:30b` and
+    `deepseek-coder:33b` while `config.py` defaulted to `qwen2.5-coder:7b`, and
+    the test suite passed throughout, because every test constructed `Settings`
+    explicitly and never went near the file that actually decided the answer.
+
+    So the same rule, applied to the file that wins.
+    """
+    configs = _shipped_configs()
+    assert configs.get("llm_provider") == "ollama", (
+        "the shipped default is a paid provider; the README promises $0 and a "
+        "credit card is not a free tier"
+    )
+    _assert_runnable(str(configs.get("ollama_chat_model", "")), "configs.json's")
+
+
+def test_configs_json_does_not_force_a_second_download():
+    """
+    An empty review model falls back to the chat model, so a first run pulls
+    exactly one set of weights. `configs.json` named a *separate* 33B review
+    model, so the honest cost of "install SavFlux" was ~19 GB before the
+    flagship feature could run at all.
+    """
+    configs = _shipped_configs()
+    review = str(configs.get("ollama_review_model", "")).strip()
+    assert review == "", (
+        f"configs.json sets ollama_review_model={review!r}, so a fresh install "
+        "downloads a second model before the first review can run"
+    )
+
+
+def test_configs_json_does_not_shadow_the_env(monkeypatch, tmp_path):
+    """
+    The precedence itself, because it is what makes configs.json dangerous:
+    `.env` must still win, or a developer cannot override anything without
+    editing a tracked file.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OLLAMA_CHAT_MODEL", "tinyllama:1b")
+    get_settings.cache_clear()
+    try:
+        assert get_settings().ollama_chat_model == "tinyllama:1b"
+    finally:
+        monkeypatch.delenv("OLLAMA_CHAT_MODEL", raising=False)
+        get_settings.cache_clear()
+
+
 # ── Every accepted provider must be fully implemented ────────────────────────
 
 
@@ -229,16 +309,19 @@ def test_every_accepted_provider_produces_a_distinct_name():
 
     Being in the Literal is a promise that all four factory functions handle it.
     """
-    from app.services import llm_factory
+    from app.services import llm_factory, model_service
 
     original = llm_factory._settings
+    original_provider = model_service.active_provider
     names: dict[str, str] = {}
     try:
         for provider in sorted(_literal_providers()):
             llm_factory._settings = lambda p=provider: Settings(llm_provider=p)
+            model_service.active_provider = lambda p=provider: p
             names[provider] = llm_factory.get_provider_name()
     finally:
         llm_factory._settings = original
+        model_service.active_provider = original_provider
 
     assert len(set(names.values())) == len(names), (
         f"two providers report the same name, so one has no branch: {names}"
@@ -249,17 +332,82 @@ def test_every_accepted_provider_produces_a_distinct_name():
         )
 
 
+def test_every_hosted_provider_is_wrapped_with_the_local_fallback(monkeypatch):
+    from app.services import llm_factory, model_service
+
+    original_build = llm_factory._build_chat_llm
+    original_provider = model_service.active_provider
+    original_provider_key = model_service.provider_api_key
+    original_settings = llm_factory._settings
+    calls = []
+
+    class FakePrimary:
+        def with_fallbacks(self, fallbacks):
+            return {"fallbacks": fallbacks}
+
+    try:
+        monkeypatch.setattr(model_service, "active_provider", lambda: "openrouter")
+        monkeypatch.setattr(model_service, "provider_api_key", lambda _provider=None: "sk-test-key")
+        monkeypatch.setattr(llm_factory, "_settings", lambda: Settings(llm_provider="ollama"))
+        monkeypatch.setattr(
+            llm_factory,
+            "_build_chat_llm",
+            lambda provider, streaming, review=False: calls.append(provider) or FakePrimary(),
+        )
+        llm_factory.get_chat_llm.cache_clear()
+        result = llm_factory.get_chat_llm()
+        assert calls == ["ollama", "openrouter"]
+        assert result["fallbacks"]
+    finally:
+        llm_factory._build_chat_llm = original_build
+        llm_factory._settings = original_settings
+        model_service.active_provider = original_provider
+        model_service.provider_api_key = original_provider_key
+        llm_factory.get_chat_llm.cache_clear()
+
+
+def test_missing_hosted_key_routes_to_the_internal_local_model(monkeypatch):
+    from app.services import llm_factory, model_service
+
+    original_build = llm_factory._build_chat_llm
+    original_provider = model_service.active_provider
+    original_provider_key = model_service.provider_api_key
+    original_settings = llm_factory._settings
+    calls = []
+    local = object()
+    try:
+        monkeypatch.setattr(model_service, "active_provider", lambda: "openai")
+        monkeypatch.setattr(model_service, "provider_api_key", lambda _provider=None: "")
+        monkeypatch.setattr(llm_factory, "_settings", lambda: Settings(llm_provider="openai"))
+        monkeypatch.setattr(
+            llm_factory,
+            "_build_chat_llm",
+            lambda provider, streaming, review=False: calls.append(provider) or local,
+        )
+        llm_factory.get_chat_llm.cache_clear()
+        assert llm_factory.get_chat_llm() is local
+        assert calls == ["ollama"]
+    finally:
+        llm_factory._build_chat_llm = original_build
+        llm_factory._settings = original_settings
+        model_service.active_provider = original_provider
+        model_service.provider_api_key = original_provider_key
+        llm_factory.get_chat_llm.cache_clear()
+
+
 def test_hosted_probe_kwargs_are_none_for_the_local_provider():
     """
     /health probes a hosted endpoint with the OpenAI client. Ollama has none, so
     it must report None — otherwise a fully local install would be reported
     unhealthy for lacking a hosted API key it does not need.
     """
-    from app.services import llm_factory
+    from app.services import llm_factory, model_service
 
     original = llm_factory._settings
+    original_provider = model_service.active_provider
     try:
         llm_factory._settings = lambda: Settings(llm_provider="ollama")
+        model_service.active_provider = lambda: "ollama"
         assert llm_factory.get_hosted_client_kwargs() is None
         assert llm_factory.get_hosted_display_name() == "Local"
         assert llm_factory.get_hosted_model_name() == ""
@@ -267,9 +415,11 @@ def test_hosted_probe_kwargs_are_none_for_the_local_provider():
         llm_factory._settings = lambda: Settings(
             llm_provider="deepseek", deepseek_api_key="sk-x"
         )
+        model_service.active_provider = lambda: "deepseek"
         assert llm_factory.get_hosted_client_kwargs() is not None
     finally:
         llm_factory._settings = original
+        model_service.active_provider = original_provider
 
 
 def test_free_providers_never_use_paid_embeddings():
@@ -299,15 +449,21 @@ def test_free_providers_never_use_paid_embeddings():
 
     original_settings = llm_factory._settings
     original_require = llm_factory._require_key
+    from app.services import model_service
+    original_active_provider = model_service.active_provider
+    original_provider_api_key = model_service.provider_api_key
 
     def fail_if_a_key_is_required(name, value):
         raise AssertionError(f"{name} was required on a free provider")
 
     try:
         llm_factory._require_key = fail_if_a_key_is_required
-        for provider in ("ollama", "deepseek"):
+        from app.services import model_service
+        for provider in ("ollama", "deepseek", "openrouter"):
             calls.clear()
             llm_factory._settings = lambda p=provider: Settings(llm_provider=p)
+            model_service.active_provider = lambda p=provider: p
+            model_service.provider_api_key = lambda _provider=None: ""
             llm_factory.get_embedding_fn.cache_clear()
             llm_factory.get_embedding_fn()
             assert "huggingface" in calls, (
@@ -316,6 +472,8 @@ def test_free_providers_never_use_paid_embeddings():
     finally:
         llm_factory._settings = original_settings
         llm_factory._require_key = original_require
+        model_service.active_provider = original_active_provider
+        model_service.provider_api_key = original_provider_api_key
         llm_factory.get_embedding_fn.cache_clear()
         sys.modules.pop("langchain_huggingface", None)
 

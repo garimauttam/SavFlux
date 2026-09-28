@@ -13,6 +13,7 @@ import {
   User, CalendarDays, Database,
 } from "lucide-react";
 import { IndexedFile } from "../types";
+import { IndexPrompt } from "./IndexPrompt";
 import { apiFetch } from "../api";
 
 interface Commit {
@@ -35,6 +36,8 @@ interface BlameLine {
 interface TimeMachinePanelProps {
   initialSource?: string | null;
   onInitialSourceConsumed?: () => void;
+  /** Re-read the index after the user indexes from this tab. */
+  onIndexed: () => void;
 }
 
 const AUTHOR_COLORS = [
@@ -48,7 +51,7 @@ function authorColor(author: string): string {
   return AUTHOR_COLORS[h % AUTHOR_COLORS.length];
 }
 
-export function TimeMachinePanel({ initialSource, onInitialSourceConsumed }: TimeMachinePanelProps) {
+export function TimeMachinePanel({ initialSource, onInitialSourceConsumed, onIndexed }: TimeMachinePanelProps) {
   const [files, setFiles] = useState<IndexedFile[]>([]);
   const [source, setSource] = useState<string>("");
   const [commits, setCommits] = useState<Commit[]>([]);
@@ -146,11 +149,14 @@ export function TimeMachinePanel({ initialSource, onInitialSourceConsumed }: Tim
           <h2 className="text-sm font-semibold text-white">Time Machine</h2>
         </div>
         <div className="flex-1 overflow-y-auto p-2">
-          {files.length === 0 && (
-            <p className="p-3 text-xs text-gray-600">
-              No git-backed files indexed. Index a GitHub repo to browse history.
-            </p>
-          )}
+          {files.length === 0 ? (
+            <IndexPrompt
+              title="No git-backed files"
+              body="Index a public repository to browse its history. No account needed."
+              onIndexed={onIndexed}
+              className="p-3 py-6"
+            />
+          ) : null}
           {files.map((f) => (
             <button
               key={f.source}

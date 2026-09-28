@@ -8,6 +8,8 @@ services:
       - "8000:8000"       # Map host port 8000 to container port 8000
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
       - CHROMA_PERSIST_DIRECTORY=/app/chroma_data
       # Whitelist the frontend origin.
       # In Docker Compose, the browser sees the frontend on localhost:80,
@@ -34,6 +36,8 @@ services:
         # In Docker Compose both services share the same host network (from the
         # browser's perspective), so we use localhost:8000.
         VITE_API_URL: http://localhost:8000
+        VITE_SUPABASE_URL: ${SUPABASE_URL}
+        VITE_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
     ports:
       - "80:80"           # nginx serves on port 80
     depends_on:

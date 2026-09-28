@@ -155,6 +155,9 @@ def _build_with(monkeypatch, **settings_overrides):
         "_settings",
         lambda: Settings(_env_file=None, llm_provider="ollama", **settings_overrides),
     )
+    from app.services import model_service
+    monkeypatch.setattr(model_service, "active_provider", lambda: "ollama")
+    monkeypatch.setattr(model_service, "provider_api_key", lambda _provider=None: "")
     captured = _intercept_embeddings(monkeypatch)
     try:
         llm_factory.get_embedding_fn()

@@ -35,6 +35,7 @@ except Exception:
     pass
 
 from fastapi import FastAPI, Request
+from app.core.auth_middleware import SupabaseAuthMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
@@ -43,7 +44,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.limiter import limiter
 
 from app.core.config import get_settings
-from app.api import ingest, chat, review, write, metrics, agent, prompts, analytics, share, trust, history, architecture, snippets, activity, bulk, file_tree, diff, notifications, slash, watcher, security, policy
+from app.api import ingest, chat, review, write, metrics, agent, prompts, analytics, share, trust, history, architecture, snippets, activity, bulk, file_tree, diff, notifications, slash, watcher, security, policy, github, models, auth, workspace
 
 logger = logging.getLogger(__name__)
 
@@ -112,16 +113,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"BM25 warmup skipped: {e}")
 
-    # Do not block socket binding on model downloads or a large BM25 rebuild.
-    # Requests can arrive immediately and pay the warmup cost only if needed.
-    warmup_tasks = [asyncio.create_task(warm_models()), asyncio.create_task(warm_bm25())]
+    if not settings.supabase_url or not settings.supabase_anon_key:
+        logger.error(
+            "Supabase Auth is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY; "
+            "private API routes will fail closed until then."
+        )
 
-    # ── P1 #6 File watcher — background incremental re-index ─────────────────
-    try:
-        from app.services.watcher_service import start_watcher_background
-        watcher_task = asyncio.create_task(start_watcher_background())
-    except Exception:
-        watcher_task = None
+    # Model weights are process-wide, but user indexes are isolated and warmed
+    # on first use inside that user's authenticated request context.
+    warmup_tasks = [asyncio.create_task(warm_models())]
+
+    # The old process-wide watcher has no user identity and therefore must not
+    # read or index a shared directory in multi-account mode. User-owned source
+    # updates remain explicit through the authenticated ingest endpoints.
+    watcher_task = None
 
     yield   # ← server is live and handling requests here
 
@@ -198,6 +203,11 @@ async def analytics_middleware(request: Request, call_next):
     return response
 
 
+# Supabase identity is verified before any private API route; CORS is registered
+# afterwards so even authentication errors include the proper browser headers.
+app.add_middleware(SupabaseAuthMiddleware)
+
+
 # ── CORS ───────────────────────────────────────────────────────────────────────
 # CORS = Cross-Origin Resource Sharing.
 # Without this, the browser blocks requests from localhost:3000 (React dev server)
@@ -237,6 +247,13 @@ app.include_router(slash.router, prefix="/api/v1")
 app.include_router(watcher.router, prefix="/api/v1")
 app.include_router(security.router, prefix="/api/v1")
 app.include_router(policy.router, prefix="/api/v1")
+# GitHub and the model picker are the two surfaces that make SavFlux usable as
+# a product rather than a demo: the first is how your code gets to GitHub at
+# all, the second is how you find out which free model is answering.
+app.include_router(github.router, prefix="/api/v1")
+app.include_router(models.router, prefix="/api/v1")
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(workspace.router, prefix="/api/v1")
 
 
 @app.get("/health")
@@ -255,14 +272,15 @@ async def health_check():
         get_hosted_model_name,
         get_provider_name,
     )
+    from app.services.model_service import active_chat_model, active_provider
+    active_provider_name = active_provider()
     checks: dict[str, str] = {}
     overall_ok = True
 
     # ── Check 1: LLM provider ─────────────────────────────────────────────────
-    # Supported providers: "ollama" | "deepseek" | "openai"  (see config.py Literal).
-    # Ollama is probed over its native /api/tags route; every hosted provider
-    # speaks the OpenAI HTTP API, so one openai.AsyncOpenAI probe covers them all.
-    if settings.llm_provider == "ollama":
+    # The user-selected provider can override the deployment default. Ollama is
+    # probed over /api/tags; hosted providers share an OpenAI-compatible probe.
+    if active_provider_name == "ollama":
         try:
             import httpx
             async with httpx.AsyncClient(
@@ -271,14 +289,14 @@ async def health_check():
             ) as client:
                 response = await client.get("/api/tags")
             response.raise_for_status()
-            checks["llm"] = f"ok (Ollama — {settings.ollama_chat_model})"
+            checks["llm"] = f"ok (Ollama — {active_chat_model()})"
         except Exception as e:
             checks["llm"] = f"error: {str(e)[:120]}"
             overall_ok = False
     else:
         hosted_kwargs = get_hosted_client_kwargs()
         if hosted_kwargs is None:
-            checks["llm"] = f"error: unknown LLM_PROVIDER={settings.llm_provider!r}"
+            checks["llm"] = f"error: unknown LLM_PROVIDER={active_provider_name!r}"
             overall_ok = False
         else:
             try:

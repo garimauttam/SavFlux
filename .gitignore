@@ -49,3 +49,10 @@ Thumbs.db
 # ── HuggingFace model cache (ms-marco-MiniLM-L-6-v2, ~80MB) ──────────────────
 # Downloaded once, cached forever — no need to commit
 .cache/
+
+# ── Benchmark run output ─────────────────────────────────────────────────────
+# A full run is ~28 kB of per-query detail and changes on every corpus edit.
+# `benchmarks/rag_offline_baseline.json` is the committed, trimmed record that
+# `--gate` compares against; this is just what a local run leaves behind.
+eval_results.json
+reports/

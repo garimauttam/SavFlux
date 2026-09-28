@@ -1152,11 +1152,10 @@ async def stream_multi_review(
                         "file": "📊 Overall Repo Summary"}
         summary_at = _time.monotonic()
 
-        # Parse mixture model list from config (comma-separated)
-        mixture_models: list[str] = [
-            m.strip() for m in (settings.summary_mixture_models or "").split(",")
-            if m.strip()
-        ]
+        # The app-selected mixture set overrides the deployment default; the
+        # status endpoint validates each picked model against installed Ollama tags.
+        from app.services.model_service import active_summary_mixture_models
+        mixture_models = active_summary_mixture_models()
 
         # Build coverage context to inject into the LLM summary prompt so the model
         # knows how many files had a full review vs. deterministic-only.

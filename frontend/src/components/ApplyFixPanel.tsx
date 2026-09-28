@@ -29,6 +29,7 @@ import {
   SkipForward,
   Wand2,
 } from "lucide-react";
+import { useRepoWriteAccess } from "../hooks/useIntegrations";
 import { IndexedFile } from "../types";
 import { DiffBlock } from "./DiffBlock";
 import { CreatePRDialog, repoSlugFromUrl } from "./CreatePRDialog";
@@ -92,6 +93,8 @@ export function ApplyFixPanel({ files, onPROpened }: ApplyFixPanelProps) {
   }, [pythonFiles]);
 
   const repoSlug = useMemo(() => repoSlugFromUrl(pythonFiles[0]?.repo_url), [pythonFiles]);
+  // What the connected account may actually do to this repository.
+  const { canWrite } = useRepoWriteAccess(repoSlug);
 
   if (pythonFiles.length === 0) {
     return (
@@ -243,13 +246,34 @@ export function ApplyFixPanel({ files, onPROpened }: ApplyFixPanelProps) {
                     branch {fix.patch.suggested_branch}
                   </span>
                 </p>
-                <button
-                  onClick={() => setDialogOpen(true)}
-                  className="flex items-center gap-1.5 rounded-lg border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-200 transition-colors hover:bg-violet-500/20"
-                >
-                  <GitPullRequest className="h-3.5 w-3.5" />
-                  Create PR…
-                </button>
+                {/* Only hidden when GitHub has said this account cannot push.
+                    `canWrite === null` keeps the button, because the `gh` CLI
+                    path works with no token at all and a control that vanishes
+                    while a request is in flight is worse than one that is
+                    briefly optimistic. Everything else here — the diff, Copy
+                    patch, the download — is unaffected either way, so a
+                    read-only user loses the push, not the fix. */}
+                {canWrite === false ? (
+                  <p
+                    className="flex items-center gap-1.5 text-[11.5px]"
+                    style={{ color: "var(--sf-warn)" }}
+                    title={
+                      "This token can read the repository but not push to it. " +
+                      "Recreate it with Contents: Read and write to enable this."
+                    }
+                  >
+                    <GitPullRequest className="h-3.5 w-3.5" />
+                    Read-only token — cannot open a pull request
+                  </p>
+                ) : (
+                  <button
+                    onClick={() => setDialogOpen(true)}
+                    className="flex items-center gap-1.5 rounded-lg border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-200 transition-colors hover:bg-violet-500/20"
+                  >
+                    <GitPullRequest className="h-3.5 w-3.5" />
+                    Create PR…
+                  </button>
+                )}
               </div>
               <DiffBlock
                 diff={fix.patch.diff}

@@ -1,7 +1,7 @@
 {
   "llm_provider": "ollama",
-  "ollama_chat_model": "qwen3-coder:30b",
-  "ollama_review_model": "deepseek-coder:33b",
+  "ollama_chat_model": "qwen2.5-coder:7b",
+  "ollama_review_model": "",
   "openai_chat_model": "gpt-4o",
   "openai_embedding_model": "text-embedding-3-small",
   "chroma_persist_directory": "./chroma_data",

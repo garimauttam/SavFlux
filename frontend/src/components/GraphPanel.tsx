@@ -21,6 +21,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import ForceGraph2D from "react-force-graph-2d";
 import { Network, Search, RefreshCw, Loader2, Info, X, ShieldAlert, Flame, TestTube2, ArrowUpRight, Zap, Filter, Download, Eye, EyeOff, Layers } from "lucide-react";
+import { IndexPrompt } from "./IndexPrompt";
 import { IndexedRepo } from "../types";
 import { apiFetch } from "../api";
 
@@ -72,9 +73,16 @@ interface GraphPanelProps {
   activeRepoUrl: string | null;
   /** Called when user double-clicks a node — navigates to Code Review */
   onNavigateToReview: (fileSource: string) => void;
+  /** Re-read the index after the user indexes from this page. */
+  onIndexed: () => void;
 }
 
-export function GraphPanel({ indexedRepos, activeRepoUrl, onNavigateToReview }: GraphPanelProps) {
+export function GraphPanel({
+  indexedRepos,
+  activeRepoUrl,
+  onNavigateToReview,
+  onIndexed,
+}: GraphPanelProps) {
   const [graphData, setGraphData]       = useState<GraphData | null>(null);
   const [loading, setLoading]           = useState(false);
   const [error, setError]               = useState<string | null>(null);
@@ -366,14 +374,16 @@ export function GraphPanel({ indexedRepos, activeRepoUrl, onNavigateToReview }: 
 
   if (indexedRepos.length === 0) {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center p-8">
-        <div className="w-14 h-14 rounded-2xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
+      <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
+        <div className="w-14 h-14 rounded-2xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center mb-4">
           <Network className="w-7 h-7 text-purple-400" />
         </div>
-        <div>
-          <h3 className="text-white font-semibold mb-1">No repo indexed yet</h3>
-          <p className="text-sm text-gray-500">Index a GitHub repo to see its dependency graph.</p>
-        </div>
+        <IndexPrompt
+          title="No repo indexed yet"
+          body="Index a public repository and its dependency graph builds itself. No account needed."
+          onIndexed={onIndexed}
+          size="md"
+        />
       </div>
     );
   }

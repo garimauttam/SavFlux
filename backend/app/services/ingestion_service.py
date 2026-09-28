@@ -33,6 +33,7 @@ from langchain_chroma import Chroma
 from chromadb.config import Settings as ChromaSettings
 
 from app.core.config import get_settings
+from app.core.paths import data_dir
 from app.services.llm_factory import LOCAL_EMBEDDING_PROVIDERS, get_embedding_fn
 from app.services.code_chunker import chunk_code_file
 from app.services.parent_child import children_of_all
@@ -102,7 +103,7 @@ def _get_vectorstore() -> Chroma:
     """
     import chromadb as _chromadb
     persistent_client = _chromadb.PersistentClient(
-        path=settings.chroma_persist_directory,
+        path=str(data_dir()),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
     return Chroma(
@@ -511,6 +512,15 @@ async def ingest_github_repo(
         if branch:
             clone_kwargs["branch"] = branch
 
+        # Private repositories need the connected account's credentials. They
+        # arrive as a git config option rather than a token in the URL, so the
+        # secret never lands in the clone's .git/config or in a `git remote -v`
+        # that someone pastes into a bug report. With nothing connected this is
+        # an empty dict and the clone behaves exactly as it did before.
+        from app.services.github_service import auth_clone_kwargs
+
+        clone_kwargs.update(auth_clone_kwargs())
+
         # We run git.Repo.clone_from in a thread because it's blocking I/O
         # asyncio.to_thread prevents it from blocking the FastAPI event loop
         await asyncio.to_thread(
@@ -884,6 +894,67 @@ async def clear_index(repo_url: str | None = None) -> dict:
             return {"status": "error", "message": str(e)}
 
 
+def friendly_ingest_error(exc: Exception) -> str:
+    """
+    Turn a failure into a sentence a person can act on.
+
+    WHY THIS EXISTS
+    ---------------
+    Ingestion used to return `str(e)`, so the most common failure on a fresh
+    machine — the embedding model cannot be downloaded — reached the UI as a
+    wall of Python:
+
+        (MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443):
+        Max retries exceeded with url: /sentence-transformers/...
+
+    That is not an error message, it is a stack trace that escaped. Nothing in
+    it says what failed, nothing in it says what to do, and it is the *first*
+    thing a new user sees after following the quickstart. The trace is still
+    logged; the log is where a trace belongs.
+
+    The mapping is deliberately narrow — only failures that have a known cause
+    and a known fix are translated. Anything unrecognised keeps its original
+    text, because a rewritten error that hides the real one is worse than an
+    ugly one.
+    """
+    text = str(exc)
+    lowered = f"{type(exc).__name__} {text}".lower()
+
+    # Embedding weights could not be fetched. By far the most common first-run
+    # failure, and the one with a one-line fix.
+    if "huggingface" in lowered and (
+        "max retries" in lowered or "connection" in lowered or "ssl" in lowered
+        or "couldn't connect" in lowered or "not found" in lowered
+    ):
+        model = get_settings().embedding_model
+        return (
+            f"Could not download the embedding model '{model}'. This is the model that "
+            f"decides which code the agent is allowed to read, so indexing cannot start "
+            f"without it. It is a one-time ~80 MB download: check the machine's network "
+            f"access to huggingface.co and try again."
+        )
+
+    # Private repository, no usable credentials.
+    if "authentication failed" in lowered or "could not read username" in lowered:
+        return (
+            "GitHub would not serve this repository. If it is private, connect your GitHub "
+            "account from the Repositories panel and index it from there."
+        )
+    if "repository not found" in lowered or "not found" in lowered and "repository" in lowered:
+        return (
+            "GitHub could not find that repository. Check the URL, and connect your account "
+            "if it is private."
+        )
+
+    if "disk" in lowered and "full" in lowered:
+        return "The disk is full — the index could not be written. Free some space and try again."
+
+    if isinstance(exc, MemoryError):
+        return "Ran out of memory while indexing. Close other programs, or index a smaller repository."
+
+    return text
+
+
 def _get_raw_collection():
     """
     Returns a raw ChromaDB collection without requiring an embedding function.
@@ -896,7 +967,7 @@ def _get_raw_collection():
     import chromadb
     from chromadb.config import Settings as ChromaSettings
     client = chromadb.PersistentClient(
-        path=settings.chroma_persist_directory,
+        path=str(data_dir()),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
     return client.get_or_create_collection(settings.chroma_collection_name)

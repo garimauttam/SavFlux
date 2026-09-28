@@ -45,6 +45,20 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
+      // `/health` is served by Fastapi at the *root*, not under /api/v1 — the
+      // README tells people to check it, and it is what the Health panel
+      // polls. The dev proxy only forwarded /api, so that request fell through
+      // to Vite, which answered with index.html for the SPA fallback, and the
+      // panel reported `Unexpected token '<', "<!DOCTYPE "... is not valid
+      // JSON` instead of the provider's real status.
+      //
+      // In production this path is not a problem: `VITE_API_URL` makes
+      // apiFetch("/health") an absolute request to the backend origin, which is
+      // exactly right. Only the dev proxy had the gap.
+      '/health': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
     },
   },
 })

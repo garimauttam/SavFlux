@@ -47,7 +47,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 def _make_fake_settings():
     """Return a Settings-like object with dummy values for all required fields."""
     from app.core.config import Settings
-    return Settings(llm_provider="openai", openai_api_key="sk-test-fake-key-for-tests")
+    return Settings(
+        llm_provider="openai",
+        openai_api_key="sk-test-fake-key-for-tests",
+        supabase_url="https://test-project.supabase.co",
+        supabase_anon_key="test-supabase-anon-key",
+    )
 
 
 @pytest.fixture()
@@ -119,8 +124,15 @@ def client():
     # Patch get_settings FIRST — ingestion_service calls it at module import time,
     # before any other patch can take effect. Without this, Settings() fails
     # because OPENAI_API_KEY is not set in the test environment.
+    async def verify_test_access_token(token: str):
+        from app.services.auth_service import InvalidAccessToken
+        if token != "test-access-token":
+            raise InvalidAccessToken("Invalid test session")
+        return {"id": "test-supabase-user", "email": "test@example.com"}
+
     with patch("app.core.config.get_settings", return_value=fake_settings), \
          patch("app.services.ingestion_service.settings", fake_settings), \
+         patch("app.core.auth_middleware.verify_access_token", new=verify_test_access_token), \
          patch("openai.AsyncOpenAI"), \
          patch("chromadb.PersistentClient") as mock_chroma, \
          patch("app.services.reranker._get_cross_encoder"):
@@ -128,7 +140,12 @@ def client():
         # Make heartbeat() a no-op so the health check's ChromaDB check passes
         mock_chroma.return_value.heartbeat.return_value = True
 
-        # NOW import main — patches are already in place
+        # NOW import main — patches are already in place. Auth is deterministic
+        # and request data is scoped to this stable test-only Supabase identity.
         from main import app
-        with TestClient(app, raise_server_exceptions=False) as c:
+        with TestClient(
+            app,
+            raise_server_exceptions=False,
+            headers={"Authorization": "Bearer test-access-token"},
+        ) as c:
             yield c

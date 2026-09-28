@@ -30,6 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.paths import data_dir
 
 settings = get_settings()
 
@@ -51,7 +52,7 @@ def _get_indexed_files_sync() -> list[dict[str, Any]]:
         import chromadb
         from chromadb.config import Settings as ChromaSettings
         client = chromadb.PersistentClient(
-            path=settings.chroma_persist_directory,
+            path=str(data_dir()),
             settings=ChromaSettings(anonymized_telemetry=False),
         )
         coll = client.get_or_create_collection(settings.chroma_collection_name)

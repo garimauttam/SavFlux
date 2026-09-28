@@ -446,7 +446,7 @@ async def _run_agent(
         title = f"Apply verified fixes to {len(fixed)} file(s)"
         markers, patch_result = await run_tool(
             "build_patch", "build_patch: rendering the diff…",
-            changes=fixed, title=title, summary=goal,
+            changes=fixed, title=title, summary=goal, repo_url=repo_url,
             findings=[{"title": "verified autofix"}],
         )
         for marker in markers:

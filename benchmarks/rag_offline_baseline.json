@@ -1,0 +1,154 @@
+{
+  "metrics": {
+    "total_queries": 44,
+    "hit_rate_at_k": 63.64,
+    "hit_rate_at_k_granularity": "file",
+    "mean_reciprocal_rank_mrr": 0.456,
+    "symbol_recall_pct": 69.11,
+    "span_hit_rate_at_k": 50.0,
+    "span_mrr": 0.31,
+    "span_precision_at_k_pct": 10.91,
+    "span_scored_queries": 44,
+    "granularity_note": "file level = any unit from the ground-truth file; span level = a unit from that file whose own text contains an expected symbol, so a windowed leg can legitimately serve the model the right region and still miss here",
+    "answerable_queries": 44,
+    "unanswerable_queries": 0,
+    "hit_rate_at_k_answerable": 63.64,
+    "avg_latency_ms": 135.7,
+    "latency_ms": {
+      "avg": 135.71,
+      "p50": 124.95,
+      "p95": 188.56,
+      "max": 203.35,
+      "samples": 44
+    },
+    "stage_ms": {
+      "dense": {
+        "avg": 121.95,
+        "p50": 112.38,
+        "p95": 174.65,
+        "max": 181.33,
+        "samples": 44
+      },
+      "lexical": {
+        "avg": 13.52,
+        "p50": 12.31,
+        "p95": 22.32,
+        "max": 27.9,
+        "samples": 44
+      },
+      "fuse": {
+        "avg": 0.19,
+        "p50": 0.16,
+        "p95": 0.25,
+        "max": 0.31,
+        "samples": 44
+      },
+      "score": {
+        "avg": 0.1,
+        "p50": 0.1,
+        "p95": 0.14,
+        "max": 0.16,
+        "samples": 44
+      },
+      "plan": {
+        "avg": 0.05,
+        "p50": 0.04,
+        "p95": 0.05,
+        "max": 0.3,
+        "samples": 44
+      },
+      "rerank": {
+        "avg": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "max": 0.0,
+        "samples": 44
+      }
+    },
+    "harness_ms": {
+      "avg": 0.1,
+      "p50": 0.1,
+      "p95": 0.14,
+      "max": 0.16,
+      "samples": 44
+    },
+    "latency_scope": "retrieval, fusion and reranking per query; excludes harness-side symbol scoring, which is reported separately as `harness_ms`",
+    "precision_at_k_pct": 17.27,
+    "by_leg": {
+      "bm25_only": {
+        "hit_rate_at_k": 68.18,
+        "mean_reciprocal_rank_mrr": 0.454,
+        "span_hit_rate_at_k": 56.82,
+        "span_mrr": 0.358,
+        "symbol_recall_pct": 68.29
+      },
+      "dense_only": {
+        "hit_rate_at_k": 38.64,
+        "mean_reciprocal_rank_mrr": 0.212,
+        "span_hit_rate_at_k": 25.0,
+        "span_mrr": 0.131,
+        "symbol_recall_pct": 44.72
+      },
+      "fused": {
+        "hit_rate_at_k": 63.64,
+        "mean_reciprocal_rank_mrr": 0.456,
+        "span_hit_rate_at_k": 50.0,
+        "span_mrr": 0.31,
+        "symbol_recall_pct": 69.11
+      },
+      "fused_reranked": {
+        "hit_rate_at_k": null,
+        "mean_reciprocal_rank_mrr": null,
+        "span_hit_rate_at_k": null,
+        "span_mrr": null,
+        "symbol_recall_pct": null,
+        "note": "reranking disabled (--no-rerank)"
+      }
+    },
+    "dense_leg_embedder": "offline-hashing (NOT a quality model)",
+    "embed_index_ms": 391.31,
+    "embed_units_per_second": 8139.33
+  },
+  "evaluation": {
+    "top_k": 5,
+    "dataset_queries": 44,
+    "dataset_sha256": "80f75eb38ef9bfb920aa17aa2a528c73eb89f789e333cdfdfd4fe0d1c6b40170",
+    "retrieval": "dense + BM25 (weighted two-branch RRF) (reranking disabled)",
+    "corpus_shape": "chunks",
+    "corpus_source_files": 168,
+    "units_per_expected_file": {
+      "min": 2,
+      "median": 9,
+      "p90": 29,
+      "max": 30,
+      "queries_with_no_unit": 0
+    },
+    "dense_corpus": {
+      "units": 2141,
+      "windows": 3185
+    },
+    "corpus_sha256": "36b7cab251bd9b4d8450338c5af7610bc2ce7c8ebacc1ed711bd9cdf8267cdac",
+    "metric_depth": {
+      "rule": "top-k-slice-v1",
+      "top_k": 5,
+      "note": "every @K metric counts positions 1..K of the leg's ranking; the candidate list the reranker is choosing from is deeper than that"
+    },
+    "ground_truth": {
+      "matching": "exact-basename-v2",
+      "span_metric": "expected symbol inside the retrieved unit",
+      "unanswerable": [],
+      "ground_truth_files": 17,
+      "audit": "each ground truth resolved to exactly one corpus file"
+    }
+  },
+  "models": {
+    "retrieval": "dense + BM25 (weighted two-branch RRF) + cross-encoder reranking",
+    "dense_embedder_mode": "offline",
+    "provider": "ollama",
+    "embedder": "sentence-transformers/all-MiniLM-L6-v2",
+    "embedder_device": "auto",
+    "embedder_batch_size": "32",
+    "reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  },
+  "baseline_format": "rag-baseline-v1"
+}

@@ -45,7 +45,10 @@ async def _post_and_hang_up(app, path: str, body: dict, *, hang_up_after: int = 
         "raw_path": path.encode("utf-8"),
         "query_string": b"",
         "root_path": "",
-        "headers": [(b"content-type", b"application/json")],
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer test-access-token"),
+        ],
         "client": ("127.0.0.1", 5555),
         "server": ("testserver", 80),
     }
@@ -202,7 +205,7 @@ def _scenario(tmp_path, *, blind_poll: bool) -> dict:
     return asyncio.run(scenario())
 
 
-def test_a_client_that_hangs_up_changes_the_route_says_nothing_worse(tmp_path, isolated_data_dir):
+def test_a_client_that_hangs_up_changes_the_route_says_nothing_worse(tmp_path, isolated_data_dir, client):
     """
     The response ends, and no review is completed for the reader who left.
 
@@ -220,7 +223,7 @@ def test_a_client_that_hangs_up_changes_the_route_says_nothing_worse(tmp_path, i
     assert run["finished"] == [], f"reviews completed for a reader who left: {run['finished']}"
 
 
-def test_a_disconnect_the_poll_never_sees_completes_no_reviews(tmp_path, isolated_data_dir):
+def test_a_disconnect_the_poll_never_sees_completes_no_reviews(tmp_path, isolated_data_dir, client):
     """
     With `Request.is_disconnected` suppressed, the run still produces no verdicts.
 

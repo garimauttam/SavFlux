@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 
 from app.core.paths import data_file
+from app.core.config import get_settings
+from app.core.tenant import current_user_id
 
 _LOCK = threading.Lock()
 _MAX_SHARES = 500
@@ -83,9 +85,28 @@ def create_share(
 
 
 def get_share(share_id: str) -> dict[str, Any] | None:
-    for s in _load().get("shares", []):
-        if s.get("id") == share_id:
-            return s
+    """Resolve a capability URL within its owner, without exposing share lists."""
+    if not isinstance(share_id, str) or not share_id.isalnum() or len(share_id) != 10:
+        return None
+    if current_user_id():
+        directories = [data_file("shared_links.json").parent]
+    else:
+        # Public links intentionally cross the auth boundary, but only the
+        # unguessable share ID is queried. Private list/delete endpoints remain
+        # scoped to the authenticated owner's data directory.
+        root = Path(get_settings().chroma_persist_directory) / "users"
+        try:
+            directories = [path for path in root.iterdir() if path.is_dir()]
+        except OSError:
+            directories = []
+    for directory in directories:
+        try:
+            payload = json.loads((directory / "shared_links.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for share in payload.get("shares", []) if isinstance(payload, dict) else []:
+            if share.get("id") == share_id:
+                return share
     return None
 
 

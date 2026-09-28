@@ -7,21 +7,20 @@ providers means finding every ChatOpenAI() call across multiple files.
 With this factory, the entire provider swap is one env var + this one file.
 
 SUPPORTED PROVIDERS:
-  openai   → ChatOpenAI (GPT-4o) + OpenAIEmbeddings (text-embedding-3-small)
-             Requires: OPENAI_API_KEY
+  openai     → ChatOpenAI + OpenAIEmbeddings (text-embedding-3-small)
+               Requires: OPENAI_API_KEY; hosted and metered
 
-  deepseek → OpenAI-compatible DeepSeek API + local HuggingFaceEmbeddings
-             Requires: DEEPSEEK_API_KEY; embeddings remain local and free
-             Fallback: Ollama (local) if the API call fails
+  deepseek   → OpenAI-compatible DeepSeek API + local HuggingFaceEmbeddings
+               Requires: DEEPSEEK_API_KEY; local fallback if the API call fails
 
-  ollama   → local ChatOllama (any model pulled via `ollama pull`)
-             Requires: Ollama running at OLLAMA_BASE_URL; no API key, no quota
-             Embeddings: all-MiniLM-L6-v2 runs locally
+  openrouter → OpenAI-compatible model catalog + local HuggingFaceEmbeddings
+               Requires: OPENROUTER_API_KEY; model selected in Settings
 
-ADDING A NEW PROVIDER:
-  1. Add it to the Literal type in config.py
-  2. Add an elif branch in _build_chat_llm()
-  3. No other files need to change
+  ollama     → local ChatOllama (any model pulled via `ollama pull`)
+               Requires: Ollama running at OLLAMA_BASE_URL; no API key or quota
+
+Hosted providers use the selected local Ollama model as a fallback when available.
+Provider selection, key lookup and model names are centralized in model_service.py.
 """
 
 from functools import lru_cache
@@ -69,8 +68,8 @@ def get_review_llm(model_name: str = "", streaming: bool = True) -> Any:
     )
 
 
-@lru_cache(maxsize=4)  # keys: (streaming=True/False) × (review=True/False)
-def get_chat_llm(streaming: bool = False, review: bool = False) -> Any:
+@lru_cache(maxsize=128)
+def _get_chat_llm_cached(streaming: bool, review: bool, tenant_key: str) -> Any:
     """
     Return a cached chat LLM for the configured provider.
 
@@ -84,19 +83,37 @@ def get_chat_llm(streaming: bool = False, review: bool = False) -> Any:
     Fallback chain (Ollama primary):
       Ollama (no hosted fallback — fully local)
     """
-    s = _settings()
-    primary = _build_chat_llm(s.llm_provider, streaming, review=review)
-    fallbacks: list[Any] = []
+    from app.services.model_service import active_provider, provider_api_key
 
-    if s.llm_provider == "deepseek":
-        # If the hosted DeepSeek API fails (402, 429, network), fall back to
-        # a local Ollama model so reviews still complete offline.
+    provider = active_provider()
+    fallback = None
+    if provider != "ollama":
+        # Hosted providers always have an internal-model fallback. The fallback
+        # is explicit in Settings; a missing key routes straight to local instead
+        # of constructing a provider client that cannot authenticate.
         try:
-            fallbacks.append(_build_chat_llm("ollama", streaming, review=review))
+            fallback = _build_chat_llm("ollama", streaming, review=review)
         except Exception:
             pass
+        if not provider_api_key(provider):
+            if fallback is not None:
+                return fallback
+            raise ValueError(f"No {provider.title()} key is configured and the local fallback could not be initialized.")
 
+    primary = _build_chat_llm(provider, streaming, review=review)
+    fallbacks = [fallback] if fallback is not None else []
     return primary.with_fallbacks(fallbacks) if fallbacks else primary
+
+
+def get_chat_llm(streaming: bool = False, review: bool = False) -> Any:
+    """Return a model cached by user, so one account can never receive another's key."""
+    from app.core.tenant import current_user_id
+    tenant_key = current_user_id() or "__local__"
+    return _get_chat_llm_cached(streaming, review, tenant_key)
+
+
+# Preserve the cache controls used by settings changes and unit tests.
+get_chat_llm.cache_clear = _get_chat_llm_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def _build_chat_llm(provider: str, streaming: bool = False, *, review: bool = False) -> Any:
@@ -104,11 +121,14 @@ def _build_chat_llm(provider: str, streaming: bool = False, *, review: bool = Fa
     s = _settings()
     if provider == "ollama":
         from langchain_community.chat_models import ChatOllama
-        model = (
-            (s.ollama_review_model or s.ollama_chat_model)
-            if review
-            else s.ollama_chat_model
-        )
+        # The model comes from `model_service`, not from settings directly: the
+        # app's model picker writes a selection file, and this is what honours
+        # it. Falling back to the .env value inside that module means every other
+        # caller (health, review, the model router) sees the same model the UI
+        # shows, instead of the one named at process start.
+        from app.services.model_service import active_chat_model, active_review_model
+
+        model = active_review_model() if review else active_chat_model()
         return ChatOllama(
             model=model,
             base_url=s.ollama_base_url,
@@ -118,28 +138,28 @@ def _build_chat_llm(provider: str, streaming: bool = False, *, review: bool = Fa
             num_predict=4096,
         )
 
-    elif provider == "deepseek":
-        _require_key("DEEPSEEK_API_KEY", s.deepseek_api_key)
+    elif provider in {"deepseek", "openai", "openrouter"}:
+        from app.services.model_service import active_provider_model, provider_api_key
+        api_key = provider_api_key(provider)
+        if not api_key:
+            raise ValueError(f"A {provider.title()} API key is required. Add one in Settings or use Ollama.")
         from langchain_openai import ChatOpenAI
+        if provider == "deepseek":
+            model = active_provider_model(provider)
+            base_url = s.deepseek_base_url
+        elif provider == "openrouter":
+            model = active_provider_model(provider)
+            base_url = s.openrouter_base_url
+        else:
+            model = active_provider_model(provider)
+            base_url = None
         return ChatOpenAI(
-            model=s.deepseek_chat_model,
-            api_key=s.deepseek_api_key,
-            base_url=s.deepseek_base_url,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
             temperature=0.1,
             streaming=streaming,
-            # max_retries=1: one retry is enough for transient 5xx; 402/429 won't
-            # recover on retry so we let the fallback chain handle them quickly.
             max_retries=1,
-        )
-
-    elif provider == "openai":
-        _require_key("OPENAI_API_KEY", s.openai_api_key)
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=s.openai_chat_model,
-            openai_api_key=s.openai_api_key,
-            temperature=0.1,
-            streaming=streaming,
         )
 
     else:
@@ -172,7 +192,7 @@ def _resolve_embedding_device(configured: str) -> str:
 #: "the benchmark uses whatever the product uses" is not a safe rule. The set lives here,
 #: next to the branch that implements it, so that adding a provider cannot silently leave
 #: a caller's allowlist behind.
-LOCAL_EMBEDDING_PROVIDERS = frozenset({"deepseek", "ollama"})
+LOCAL_EMBEDDING_PROVIDERS = frozenset({"deepseek", "ollama", "openrouter"})
 
 
 def build_local_embeddings(model_name: str) -> Any:
@@ -207,27 +227,30 @@ def build_local_embeddings(model_name: str) -> Any:
     )
 
 
-@lru_cache(maxsize=1)
-def get_embedding_fn() -> Any:
-    """
-    Return a cached embedding function.
-
-    IMPORTANT: the model used at index time must match the model used at query time.
-    Mixing embedding models produces garbage retrieval. Re-index after switching.
-
-    deepseek / ollama providers use a local HuggingFace model — see
-    `embedding_model`, `embedding_batch_size` and `embedding_device` in config.
-    openai uses text-embedding-3-small (paid, 1536 dims).
-    """
+@lru_cache(maxsize=128)
+def _get_embedding_fn_cached(tenant_key: str) -> Any:
+    """Per-account embedder cache; hosted credentials must never cross tenants."""
     s = _settings()
-    if s.llm_provider in LOCAL_EMBEDDING_PROVIDERS:
+    from app.services.model_service import active_provider, provider_api_key
+    provider = active_provider()
+    if provider in LOCAL_EMBEDDING_PROVIDERS:
         return build_local_embeddings(s.embedding_model)
-    _require_key("OPENAI_API_KEY", s.openai_api_key)
-    from langchain_openai import OpenAIEmbeddings
-    return OpenAIEmbeddings(
-        model=s.openai_embedding_model,
-        openai_api_key=s.openai_api_key,
-    )
+    if provider == "openai":
+        api_key = provider_api_key(provider)
+        if not api_key:
+            raise ValueError("An OpenAI key is required for OpenAI embeddings. Add one in Settings or switch to a local-embedding provider.")
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(model=s.openai_embedding_model, openai_api_key=api_key)
+    raise ValueError(f"Provider {provider!r} has no supported embedding route.")
+
+
+def get_embedding_fn() -> Any:
+    """Return the active account's embedder, never another account's cached client."""
+    from app.core.tenant import current_user_id
+    return _get_embedding_fn_cached(current_user_id() or "__local__")
+
+
+get_embedding_fn.cache_clear = _get_embedding_fn_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def get_provider_name() -> str:
@@ -240,15 +263,19 @@ def get_provider_name() -> str:
     retrieval problem if they name a model that is not the one running.
     """
     s = _settings()
-    if s.llm_provider == "ollama":
-        return f"Ollama ({s.ollama_chat_model}) + {s.embedding_model} embeddings"
-    if s.llm_provider == "deepseek":
-        review_model = s.ollama_review_model or s.ollama_chat_model
-        return (
-            f"DeepSeek ({s.deepseek_chat_model}) → Ollama ({review_model}) fallback "
-            f"+ {s.embedding_model}"
-        )
-    return f"OpenAI ({s.openai_chat_model}) + {s.openai_embedding_model}"
+    from app.services.model_service import (
+        active_chat_model,
+        active_provider_model,
+        read_selection,
+    )
+
+    selected_provider = read_selection().get("provider")
+    provider = selected_provider if selected_provider in {"ollama", "deepseek", "openai", "openrouter"} else s.llm_provider
+    if provider == "ollama":
+        return f"Ollama ({active_chat_model()}) + {s.embedding_model} embeddings"
+    if provider in {"deepseek", "openai", "openrouter"}:
+        return f"{provider.title()} ({active_provider_model(provider)}) → Ollama ({active_chat_model()}) fallback"
+    return f"Unknown provider ({provider})"
 
 
 def get_hosted_display_name() -> str:
@@ -259,12 +286,9 @@ def get_hosted_display_name() -> str:
     `ok (DeepSeek — deepseek-chat)` rather than leaking a base URL.
     Returns "Local" when the active provider has no hosted component.
     """
-    s = _settings()
-    if s.llm_provider == "deepseek":
-        return "DeepSeek"
-    if s.llm_provider == "openai":
-        return "OpenAI"
-    return "Local"
+    from app.services.model_service import active_provider
+
+    return {"deepseek": "DeepSeek", "openai": "OpenAI", "openrouter": "OpenRouter"}.get(active_provider(), "Local")
 
 
 def get_hosted_client_kwargs() -> dict[str, Any] | None:
@@ -276,21 +300,24 @@ def get_hosted_client_kwargs() -> dict[str, Any] | None:
     /health never has to know which settings field holds which key.
     """
     s = _settings()
-    if s.llm_provider == "deepseek":
-        return {"api_key": s.deepseek_api_key, "base_url": s.deepseek_base_url}
-    if s.llm_provider == "openai":
-        return {"api_key": s.openai_api_key}
+    from app.services.model_service import active_provider, provider_api_key
+
+    provider = active_provider()
+    if provider == "deepseek":
+        return {"api_key": provider_api_key(provider), "base_url": s.deepseek_base_url}
+    if provider == "openai":
+        return {"api_key": provider_api_key(provider)}
+    if provider == "openrouter":
+        return {"api_key": provider_api_key(provider), "base_url": s.openrouter_base_url}
     return None
 
 
 def get_hosted_model_name() -> str:
     """Model name for the active hosted provider ("" when fully local)."""
-    s = _settings()
-    if s.llm_provider == "deepseek":
-        return s.deepseek_chat_model
-    if s.llm_provider == "openai":
-        return s.openai_chat_model
-    return ""
+    from app.services.model_service import active_provider, active_provider_model
+
+    provider = active_provider()
+    return active_provider_model(provider) if provider != "ollama" else ""
 
 
 def _require_key(name: str, value: Any) -> None:

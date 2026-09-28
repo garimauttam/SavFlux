@@ -29,21 +29,33 @@ Both are fixed by resolving the directory lazily, on every call, from one place.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from app.core.config import get_settings
+from app.core.tenant import current_user_id
+
+
+def user_data_dir(user_id: str, *, base: Path | None = None) -> Path:
+    """Private persistent root for one verified Supabase user."""
+    root = base or Path(get_settings().chroma_persist_directory)
+    tenant = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
+    return root / "users" / tenant
 
 
 def data_dir() -> Path:
     """
-    Return the directory holding all local SavFlux state, creating it if needed.
+    Return this request's private SavFlux data root, creating it if needed.
 
-    Resolved on every call so a changed `CHROMA_PERSIST_DIRECTORY` takes effect
-    immediately rather than at the next process restart.
+    Every account receives its own Chroma database, Git mirrors, provider keys,
+    model selection, and app-state files. The process-level root is never used
+    for authenticated user data.
     """
-    directory = Path(get_settings().chroma_persist_directory)
+    base = Path(get_settings().chroma_persist_directory)
+    user_id = current_user_id()
+    directory = user_data_dir(user_id, base=base) if user_id else base
     try:
-        directory.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     except Exception:
         # A read-only or racing filesystem must never take the API down —
         # callers all degrade gracefully when the file cannot be read/written.
@@ -52,5 +64,5 @@ def data_dir() -> Path:
 
 
 def data_file(name: str) -> Path:
-    """Path to a named state file inside the data directory."""
+    """Path to a named state file inside the current user's private data root."""
     return data_dir() / name

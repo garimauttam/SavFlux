@@ -1,22 +1,32 @@
 /**
- * CommandPalette.tsx — P2 Command Palette + Shortcuts (⌘K)
+ * CommandPalette.tsx — ⌘K over everything, derived from `navigation.ts`.
  *
- * $0, no deps, ~10KB. Fuzzy palette over:
- *  - Tabs: Chat / Review / Write / Graph / Health / Agent
- *  - Indexed files (filter by name, jump to Review)
- *  - Indexed repos (switch active repo)
- *  - Actions: Re-index, Health report, Export, Watcher toggle, Theme
- *  - Help (?), with vim-style j/k + Enter
+ * WHY IT CHANGED
+ * --------------
+ * The palette listed twelve actions by hand, each naming a tab that no longer
+ * existed the moment a section moved. `onSetActiveTab("prompts")` compiled
+ * perfectly and did nothing, because `prompts` is a sub-tab of the Library panel
+ * now — so "Prompt library" in the palette was a dead entry, and there was no
+ * test that could notice because the type still allowed the value.
  *
- * Opens on ⌘K / Ctrl+K / "/" (when not typing). Closable via Esc.
+ * So there is one source of action metadata: `navigation.ts`. A destination the
+ * rail can reach, the palette can reach, and a `g`+key can reach, and they are
+ * generated from the same nine entries. Adding a section is one object, and the
+ * three surfaces cannot disagree about what it is called or which key opens it.
  */
 
-import React, { useEffect, useMemo, useState } from "react";
-import { Search, Activity, FileCode, Database, HelpCircle, Bookmark, Code2, Clock, Layers, FolderTree, GitCompare, Bell, Terminal } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  BookOpen,
+  Database,
+  FileCode,
+  Github,
+  HelpCircle,
+  Search,
+  SunMoon,
+} from "lucide-react";
 import { IndexedFile, IndexedRepo } from "../types";
-// Sections come from navigation.ts, the same list the tab strip renders, so a
-// palette entry can no longer disagree with the tab it opens.
-import { TABS, type Tab } from "../navigation";
+import { NAV_GROUPS, TABS, type Tab } from "../navigation";
 
 interface Props {
   open: boolean;
@@ -28,6 +38,7 @@ interface Props {
   onSetActiveTab: (t: Tab) => void;
   onSetActiveRepo: (url: string | null) => void;
   onNavigateToFile: (source: string) => void;
+  onOpenGitHub: () => void;
 }
 
 function fuzzyScore(query: string, target: string): number {
@@ -37,118 +48,164 @@ function fuzzyScore(query: string, target: string): number {
   if (t === q) return 100;
   if (t.startsWith(q)) return 80;
   if (t.includes(q)) return 60;
-  // Subsequence bonus
   let qi = 0;
   for (let ti = 0; ti < t.length && qi < q.length; ti++) {
     if (t[ti] === q[qi]) qi++;
   }
-  if (qi === q.length) return 30;
-  return -1;
+  return qi === q.length ? 30 : -1;
 }
 
-export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, activeRepoUrl, activeTab, onSetActiveTab, onSetActiveRepo, onNavigateToFile }: Props) {
+export function CommandPalette({
+  open,
+  onClose,
+  indexedFiles,
+  indexedRepos,
+  activeRepoUrl,
+  activeTab,
+  onSetActiveTab,
+  onSetActiveRepo,
+  onNavigateToFile,
+  onOpenGitHub,
+}: Props) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
-  const inputRef = React.useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (open) {
       setQuery("");
       setSelected(0);
-      setTimeout(() => inputRef.current?.focus(), 50);
+      window.setTimeout(() => inputRef.current?.focus(), 50);
     }
   }, [open]);
 
-  // Build command list
   const commands = useMemo(() => {
     const q = query.trim();
-    type Item = { id: string; label: string; sub?: string; score: number; icon: React.ElementType; action: () => void };
+    type Item = {
+      id: string;
+      label: string;
+      sub?: string;
+      group: string;
+      score: number;
+      icon: React.ElementType;
+      action: () => void;
+    };
     const items: Item[] = [];
 
-    // Tabs
-    // Built from TABS: label, icon, order and shortcut all come from the
-    // section list the tab strip renders.
-    const tabDefs = TABS.map((t) => ({ id: t.id, label: t.label, icon: t.Icon, keys: `g ${t.shortcut}` }));
-    tabDefs.forEach((t) => {
-      const score = q ? fuzzyScore(q, `${t.label} ${t.id} ${t.keys}`) : 10;
-      if (score >= 0) items.push({ id: `tab:${t.id}`, label: `Go to ${t.label}`, sub: t.keys, score: score + 5, icon: t.icon, action: () => { onSetActiveTab(t.id); onClose(); } });
-    });
+    // Destinations — label, icon, group and shortcut all come from navigation.ts.
+    for (const group of NAV_GROUPS) {
+      for (const t of group.items) {
+        const score = q ? fuzzyScore(q, `${t.label} ${t.id} ${t.hint} g ${t.shortcut}`) : 10;
+        if (score < 0) continue;
+        items.push({
+          id: `tab:${t.id}`,
+          label: `Go to ${t.label}`,
+          sub: `g ${t.shortcut} · ${t.hint}`,
+          group: group.label,
+          score: score + 5,
+          icon: t.Icon,
+          action: () => {
+            onSetActiveTab(t.id);
+            onClose();
+          },
+        });
+      }
+    }
 
-    // Indexed files
-    indexedFiles.slice(0, 200).forEach((f) => {
-      const score = q ? fuzzyScore(q, `${f.file_name} ${f.source} ${f.language}`) : -1;
+    indexedFiles.slice(0, 400).forEach((f) => {
+      const score = q ? fuzzyScore(q, `${f.file_name} ${f.source}`) : -1;
       if (!q || score >= 0) {
         items.push({
           id: `file:${f.source}`,
           label: f.file_name,
           sub: f.source,
+          group: "Files",
           score: q ? score : 5,
           icon: FileCode,
+          // Opens in the context panel beside the conversation rather than
+          // navigating away from it — the old behaviour threw away the thread
+          // you were reading to look at one line of a file.
           action: () => {
             onNavigateToFile(f.source);
-            onSetActiveTab("review");
             onClose();
           },
         });
       }
     });
 
-    // Indexed repos
     indexedRepos.forEach((r) => {
       const isActive = activeRepoUrl === r.repo_url;
       const score = q ? fuzzyScore(q, r.repo_url) : -1;
       if (!q || score >= 0) {
         items.push({
           id: `repo:${r.repo_url}`,
-          label: isActive ? `Repo: ${r.repo_url} (active)` : `Switch to ${r.repo_url}`,
+          label: isActive ? `${r.repo_url} (active)` : `Switch to ${r.repo_url}`,
           sub: `${r.chunk_count} chunks`,
+          group: "Repositories",
           score: q ? score + (isActive ? 5 : 0) : 5,
           icon: Database,
           action: () => {
             onSetActiveRepo(r.repo_url);
-            onSetActiveTab("chat");
+            onSetActiveTab("agent");
             onClose();
           },
         });
       }
     });
 
-    // Actions
-    const actions: { label: string; sub: string; icon: React.ElementType; action: () => void }[] = [
-      { label: "Health report", sub: "Open Health tab", icon: Activity, action: () => { onSetActiveTab("health"); onClose(); } },
-      { label: "Toggle theme", sub: "Dark / Light / System", icon: Search, action: () => { onClose(); document.dispatchEvent(new KeyboardEvent("keydown", { key: "t" })); } },
-      { label: "Prompt library", sub: "g p — saved prompts & history", icon: Bookmark, action: () => { onSetActiveTab("prompts"); onClose(); } },
-      { label: "Snippet vault", sub: "g s — saved code snippets", icon: Code2, action: () => { onSetActiveTab("snippets"); onClose(); } },
-      { label: "Activity feed", sub: "g y — unified timeline", icon: Clock, action: () => { onSetActiveTab("activity"); onClose(); } },
-      { label: "Bulk operations", sub: "g b — file manager", icon: Layers, action: () => { onSetActiveTab("bulk"); onClose(); } },
-      { label: "File explorer", sub: "g e — folder tree", icon: FolderTree, action: () => { onSetActiveTab("explorer"); onClose(); } },
-      { label: "Diff viewer", sub: "g d — compare files", icon: GitCompare, action: () => { onSetActiveTab("diff"); onClose(); } },
-      { label: "Notifications", sub: "g i — inbox", icon: Bell, action: () => { onSetActiveTab("notifications"); onClose(); } },
-      { label: "Slash commands", sub: "g / — quick actions", icon: Terminal, action: () => { onSetActiveTab("slash"); onClose(); } },
-      { label: "Help — shortcuts", sub: "? to show help", icon: HelpCircle, action: () => { onClose(); document.dispatchEvent(new KeyboardEvent("keydown", { key: "?" })); } },
+    const actions: { id: string; label: string; sub: string; icon: React.ElementType; action: () => void }[] = [
+      {
+        id: "action:github",
+        label: "Connect GitHub",
+        sub: "browse repositories, branches and pull requests",
+        icon: Github,
+        action: () => {
+          onClose();
+          onOpenGitHub();
+        },
+      },
+      {
+        id: "action:theme",
+        label: "Toggle theme",
+        sub: "dark / light",
+        icon: SunMoon,
+        action: () => {
+          onClose();
+          document.documentElement.classList.toggle("dark");
+        },
+      },
+      {
+        id: "action:help",
+        label: "Help — keyboard shortcuts",
+        sub: "? opens this list too",
+        icon: HelpCircle,
+        action: () => {
+          onClose();
+          window.dispatchEvent(new CustomEvent("savflux:open-help"));
+        },
+      },
     ];
-    actions.forEach((a) => {
+    for (const a of actions) {
       const score = q ? fuzzyScore(q, `${a.label} ${a.sub}`) : 5;
-      if (score >= 0) items.push({ id: `action:${a.label}`, label: a.label, sub: a.sub, score, icon: a.icon, action: a.action });
-    });
+      if (score >= 0) {
+        items.push({ ...a, group: "Actions", score, action: a.action });
+      }
+    }
 
-    // Filter and sort: if query, keep only scored >=0, else show top 12
-    let filtered = q ? items.filter((i) => i.score >= 0) : items.slice(0, 12);
+    const filtered = q ? items.filter((i) => i.score >= 0) : items.slice(0, 12);
     filtered.sort((a, b) => b.score - a.score);
     return filtered.slice(0, 24);
-  }, [query, indexedFiles, indexedRepos, activeRepoUrl, onSetActiveTab, onSetActiveRepo, onNavigateToFile, onClose]);
+  }, [query, indexedFiles, indexedRepos, activeRepoUrl, onSetActiveTab, onSetActiveRepo, onNavigateToFile, onOpenGitHub, onClose]);
 
-  useEffect(() => {
-    setSelected(0);
-  }, [query]);
+  useEffect(() => setSelected(0), [query]);
 
   if (!open) return null;
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "ArrowDown") {
+    if (e.key === "ArrowDown" || e.key === "j") {
       e.preventDefault();
       setSelected((s) => (s + 1) % Math.max(1, commands.length));
-    } else if (e.key === "ArrowUp") {
+    } else if (e.key === "ArrowUp" || e.key === "k") {
       e.preventDefault();
       setSelected((s) => (s - 1 + commands.length) % Math.max(1, commands.length));
     } else if (e.key === "Enter") {
@@ -160,27 +217,37 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[20vh] bg-black/50 backdrop-blur-sm" onClick={onClose}>
+    <div
+      className="fixed inset-0 z-[90] flex items-start justify-center pt-[14vh]"
+      style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(3px)" }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Command palette"
+      onClick={onClose}
+    >
       <div
-        className="w-full max-w-lg bg-gray-800 border border-gray-700 rounded-xl shadow-2xl overflow-hidden mx-4"
+        className="mx-4 w-full max-w-xl overflow-hidden rounded-2xl border sf-line shadow-2xl shadow-black/60 sf-overlay"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={onKeyDown}
       >
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-700">
-          <Search className="w-4 h-4 text-gray-500" />
+        <div className="flex items-center gap-2.5 border-b sf-line px-4 py-3">
+          <Search className="h-4 w-4 shrink-0 sf-mute" />
           <input
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search files, repos, tabs… (⌘K, j/k, Enter)"
-            className="flex-1 bg-transparent text-sm text-white placeholder-gray-500 focus:outline-none"
+            placeholder="Search sections, files and repositories…"
+            aria-label="Search"
+            className="sf-text flex-1 bg-transparent text-[13.5px] outline-none placeholder:text-[var(--sf-text-mute)]"
           />
-          <span className="text-xs text-gray-600">Esc</span>
+          <kbd className="sf-mute rounded border sf-line px-1.5 py-0.5 text-[10px]">Esc</kbd>
         </div>
 
-        <div className="max-h-64 overflow-y-auto">
+        <div className="max-h-72 overflow-y-auto p-1.5">
           {commands.length === 0 ? (
-            <div className="px-3 py-6 text-center text-sm text-gray-500">No matches</div>
+            <p className="sf-mute px-3 py-8 text-center text-[13px]">
+              Nothing matches “{query}”.
+            </p>
           ) : (
             commands.map((c, idx) => {
               const Icon = c.icon;
@@ -188,65 +255,98 @@ export function CommandPalette({ open, onClose, indexedFiles, indexedRepos, acti
               return (
                 <button
                   key={c.id}
-                  onClick={() => c.action()}
+                  onClick={c.action}
                   onMouseEnter={() => setSelected(idx)}
-                  className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${isSel ? "bg-purple-600/20 text-white" : "text-gray-400 hover:bg-gray-700/60 hover:text-gray-200"}`}
+                  role="option"
+                  aria-selected={isSel}
+                  className={[
+                    "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] transition-colors",
+                    isSel ? "sf-accent-soft" : "sf-dim hover:bg-[var(--sf-raised)]",
+                  ].join(" ")}
                 >
-                  <Icon className={`w-4 h-4 shrink-0 ${isSel ? "text-purple-400" : "text-gray-600"}`} />
-                  <span className="truncate flex-1">{c.label}</span>
-                  {c.sub && <span className="text-xs text-gray-600 truncate max-w-[160px]">{c.sub}</span>}
+                  <Icon className={`h-4 w-4 shrink-0 ${isSel ? "sf-accent" : "sf-mute"}`} />
+                  <span className="min-w-0 flex-1 truncate">{c.label}</span>
+                  {c.sub && (
+                    <span className="sf-mute hidden max-w-[45%] truncate text-[11px] sm:block">
+                      {c.sub}
+                    </span>
+                  )}
                 </button>
               );
             })
           )}
         </div>
 
-        <div className="px-3 py-2 border-t border-gray-700 flex items-center justify-between text-xs text-gray-600">
+        <div className="sf-mute flex items-center justify-between border-t sf-line px-4 py-2 text-[11px]">
           <span>
-            {commands.length} results · <span className="text-gray-500">↑↓ j/k · Enter</span>
+            {commands.length} results · ↑↓ or j/k · Enter
           </span>
-          <span className="hidden sm:inline">Active: {activeTab}</span>
+          <span className="sf-dim">{TABS.find((t) => t.id === activeTab)?.label}</span>
         </div>
       </div>
     </div>
   );
 }
 
+/**
+ * Keyboard shortcuts, generated from the same list the rail renders.
+ *
+ * The previous version listed seventeen hardcoded `g`+key pairs, six of which
+ * named sections that had been renamed. There is no way for a hand-written
+ * list to stay true; this one cannot be wrong.
+ */
 export function ShortcutsHelp({ open, onClose }: { open: boolean; onClose: () => void }) {
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
-      <div className="w-full max-w-md bg-gray-800 border border-gray-700 rounded-xl shadow-2xl p-5 mx-4" onClick={(e) => e.stopPropagation()}>
-        <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
-          <HelpCircle className="w-4 h-4 text-purple-400" /> Keyboard Shortcuts
+    <div
+      className="fixed inset-0 z-[90] flex items-center justify-center p-4"
+      style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(3px)" }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Keyboard shortcuts"
+      onClick={onClose}
+    >
+      <div
+        className="mx-4 w-full max-w-md rounded-2xl border sf-line p-5 shadow-2xl shadow-black/60 sf-surface"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") onClose();
+        }}
+      >
+        <h3 className="sf-text mb-3 flex items-center gap-2 text-[14px] font-semibold">
+          <BookOpen className="h-4 w-4 sf-accent" /> Keyboard shortcuts
         </h3>
-        <div className="space-y-2 text-sm">
-          <div className="flex justify-between"><span className="text-gray-400">Open palette</span><span className="font-mono text-gray-300">⌘K / Ctrl+K / /</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Navigate</span><span className="font-mono text-gray-300">j / k / ↑ ↓</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Select</span><span className="font-mono text-gray-300">Enter</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Close</span><span className="font-mono text-gray-300">Esc</span></div>
-          <div className="border-t border-gray-700 my-2" />
-          <div className="flex justify-between"><span className="text-gray-400">Go Chat</span><span className="font-mono text-gray-300">g c</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Review</span><span className="font-mono text-gray-300">g r</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Graph</span><span className="font-mono text-gray-300">g g</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Health</span><span className="font-mono text-gray-300">g h</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Org</span><span className="font-mono text-gray-300">g o</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Analytics</span><span className="font-mono text-gray-300">g n</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Prompts</span><span className="font-mono text-gray-300">g p</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Snippets</span><span className="font-mono text-gray-300">g s</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Activity</span><span className="font-mono text-gray-300">g y</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Bulk</span><span className="font-mono text-gray-300">g b</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Explorer</span><span className="font-mono text-gray-300">g e</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Diff</span><span className="font-mono text-gray-300">g d</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Inbox</span><span className="font-mono text-gray-300">g i</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Slash</span><span className="font-mono text-gray-300">g /</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Go Agent</span><span className="font-mono text-gray-300">g a</span></div>
-          <div className="flex justify-between"><span className="text-gray-400">Help</span><span className="font-mono text-gray-300">?</span></div>
+        <div className="space-y-1.5 text-[12.5px]">
+          <Row label="Open the palette" keys="⌘K · Ctrl+K · /" />
+          <Row label="Close anything" keys="Esc" />
+          <Row label="Move through the palette" keys="↑ ↓ · j k" />
+          <div className="my-2 h-px sf-line" />
+          {NAV_GROUPS.map((group) => (
+            <div key={group.id} className="space-y-1">
+              <p className="sf-mute pt-1 text-[10px] font-semibold uppercase tracking-[0.08em]">
+                {group.label}
+              </p>
+              {group.items.map((t) => (
+                <Row key={t.id} label={t.label} keys={`g ${t.shortcut}`} />
+              ))}
+            </div>
+          ))}
         </div>
-        <button onClick={onClose} className="mt-4 w-full py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm text-gray-300">
+        <button type="button" onClick={onClose} className="sf-btn sf-btn-secondary mt-4 w-full">
           Close
         </button>
       </div>
+    </div>
+  );
+}
+
+function Row({ label, keys }: { label: string; keys: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="sf-dim">{label}</span>
+      <kbd className="sf-mono sf-raised shrink-0 rounded border sf-line px-1.5 py-0.5 text-[11px] sf-text">
+        {keys}
+      </kbd>
     </div>
   );
 }

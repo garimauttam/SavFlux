@@ -123,7 +123,7 @@ interface CreatePRDialogProps {
   patch: PatchPayload;
   /** Repo prefilled from the indexed files, e.g. "owner/name". */
   defaultRepo?: string;
-  /** True when the backend has a GITHUB_TOKEN; otherwise we say so up front. */
+  /** True while a create request is in flight, so we say so up front. */
   isCreating: boolean;
   result: CreatePRResult | null;
   error: string | null;

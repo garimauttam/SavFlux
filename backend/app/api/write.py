@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from app.api.deps import require_api_key
+from app.core.paths import data_dir
 from app.limiter import limiter
 from app.services.write_agent import stream_code_write
 
@@ -34,7 +35,7 @@ def _get_allowed_roots() -> list[Path]:
     from app.core.config import get_settings
     s = get_settings()
     return [
-        Path(s.chroma_persist_directory).resolve(),
+        data_dir().resolve(),
         Path(tempfile.gettempdir()).resolve(),
         Path("/tmp").resolve(),   # macOS: /tmp → /private/tmp (mkdtemp uses this)
     ]

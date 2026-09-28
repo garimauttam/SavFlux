@@ -98,6 +98,8 @@ def _provider(monkeypatch, provider: str):
     # would then be measuring this machine's environment.
     monkeypatch.setattr("app.core.config.get_settings", lambda: Settings(), raising=True)
     monkeypatch.setattr("app.services.llm_factory.get_settings", lambda: Settings(), raising=True)
+    monkeypatch.setattr("app.services.model_service.active_provider", lambda: provider, raising=True)
+    monkeypatch.setattr("app.services.model_service.provider_api_key", lambda _provider=None: "sk-ci-placeholder", raising=True)
     return Settings
 
 

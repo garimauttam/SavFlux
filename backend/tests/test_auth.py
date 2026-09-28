@@ -1,111 +1,133 @@
-"""
-test_auth.py — Tests for the API key authentication dependency.
-
-Verifies:
-  1. When API_KEY is not set, all requests pass through (open/dev mode).
-  2. When API_KEY is set, requests without the header get 401.
-  3. When API_KEY is set, requests with the wrong key get 401.
-  4. When API_KEY is set, requests with the correct key pass through.
-
-We test via the /api/v1/chat/indexed-files endpoint (cheap GET, no mocking needed
-beyond ChromaDB) so we exercise the full middleware stack.
-"""
-
-import pytest
+"""Supabase bearer authentication and account-scoped API tests."""
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 
-def _make_client(api_key: str | None):
-    """
-    Spin up a fresh TestClient with the given API_KEY setting.
-    We need a new client per test because Settings is cached via lru_cache —
-    we patch get_settings in deps.py to return the desired key value.
-    """
+@contextmanager
+def _client():
     from app.core.config import Settings
+    from app.services.auth_service import InvalidAccessToken
 
-    fake_settings = Settings(
+    settings = Settings(
         llm_provider="openai",
         openai_api_key="sk-test",
-        api_key=api_key,
+        supabase_url="https://test-project.supabase.co",
+        supabase_anon_key="test-anon-key",
     )
 
-    mock_chroma = MagicMock()
-    mock_chroma._collection.get.return_value = {"metadatas": None}
+    async def verify(token: str):
+        if token != "valid-access-token":
+            raise InvalidAccessToken("Invalid or expired test session")
+        return {"id": "00000000-0000-4000-8000-000000000001", "email": "owner@example.com"}
 
-    with patch("app.core.config.get_settings", return_value=fake_settings), \
-         patch("app.api.deps.get_settings", return_value=fake_settings), \
-         patch("app.services.ingestion_service.settings", fake_settings), \
+    mock_chroma = MagicMock()
+    mock_chroma.heartbeat.return_value = True
+    with patch("app.core.config.get_settings", return_value=settings), \
+         patch("app.services.ingestion_service.settings", settings), \
+         patch("app.core.auth_middleware.verify_access_token", new=verify), \
          patch("openai.AsyncOpenAI"), \
          patch("chromadb.PersistentClient", return_value=mock_chroma), \
-         patch("app.services.reranker._get_cross_encoder"), \
-         patch("app.services.retrieval_service._get_vectorstore", return_value=mock_chroma):
-
+         patch("app.services.reranker._get_cross_encoder"):
         from main import app
-        with TestClient(app, raise_server_exceptions=False) as c:
-            yield c
+        with TestClient(app, raise_server_exceptions=False) as client:
+            yield client
 
 
-# ── Test 1: Open mode (no API_KEY configured) ─────────────────────────────────
-
-def test_no_api_key_configured_allows_all_requests():
-    """
-    When API_KEY is not set in settings, requests without a header pass through.
-    This is the default dev-mode behaviour — zero friction locally.
-    """
-    for client in _make_client(api_key=None):
+def test_missing_bearer_is_rejected_with_google_and_email_guidance():
+    with _client() as client:
         response = client.get("/api/v1/chat/indexed-files")
+        assert response.status_code == 401
+        assert "Google or email" in response.json()["detail"]
+
+
+def test_invalid_bearer_is_rejected():
+    with _client() as client:
+        response = client.get("/api/v1/chat/indexed-files", headers={"Authorization": "Bearer wrong"})
+        assert response.status_code == 401
+        assert "invalid" in response.json()["detail"].lower()
+
+
+def test_verified_bearer_protects_routes_and_scopes_account_session():
+    with _client() as client:
+        headers = {"Authorization": "Bearer valid-access-token"}
+        assert client.get("/api/v1/chat/indexed-files", headers=headers).status_code == 200
+        # The app-level middleware protects routes even if a route omitted a dependency.
+        assert client.get("/api/v1/agent/tools").status_code == 401
+        tools = client.get("/api/v1/agent/tools", headers=headers)
+        assert tools.status_code == 200
+
+        session = client.get("/api/v1/auth/session", headers=headers)
+        assert session.status_code == 200
+        assert session.json() == {
+            "authenticated": True,
+            "user": {"id": "00000000-0000-4000-8000-000000000001", "email": "owner@example.com"},
+        }
+        assert "valid-access-token" not in session.text
+
+
+def test_public_share_links_remain_capability_urls():
+    with _client() as client:
+        with patch("app.services.share_service.get_share", return_value={"id": "abc1234567"}):
+            response = client.get("/api/v1/share/abc1234567")
         assert response.status_code == 200
 
 
-# ── Test 2: Protected mode — missing header ───────────────────────────────────
-
-def test_missing_header_returns_401_when_key_is_set():
-    """
-    When API_KEY is configured, a request without X-API-Key must return 401.
-    """
-    for client in _make_client(api_key="supersecret"):
-        response = client.get("/api/v1/chat/indexed-files")
-        assert response.status_code == 401
-        assert "API key" in response.json()["detail"]
-
-
-# ── Test 3: Protected mode — wrong key ────────────────────────────────────────
-
-def test_wrong_key_returns_401():
-    """
-    When API_KEY is configured, a request with the wrong key must return 401.
-    """
-    for client in _make_client(api_key="supersecret"):
-        response = client.get(
-            "/api/v1/chat/indexed-files",
-            headers={"X-API-Key": "wrongkey"},
-        )
-        assert response.status_code == 401
-
-
-# ── Test 4: Protected mode — correct key ─────────────────────────────────────
-
-def test_correct_key_passes_through():
-    """
-    When API_KEY is configured and the correct key is sent, the request succeeds.
-    """
-    for client in _make_client(api_key="supersecret"):
-        response = client.get(
-            "/api/v1/chat/indexed-files",
-            headers={"X-API-Key": "supersecret"},
-        )
-        assert response.status_code == 200
-
-
-# ── Test 5: /health is always unprotected ─────────────────────────────────────
-
-def test_health_always_passes_without_key():
-    """
-    /health must never require an API key — Railway health checks don't send headers.
-    """
-    for client in _make_client(api_key="supersecret"):
+def test_health_is_public_for_platform_probes():
+    with _client() as client:
         response = client.get("/health")
-        # Health may return 200 or 503 depending on mock state — never 401
         assert response.status_code != 401
+
+
+def test_auth_service_reuses_recently_verified_identity_without_storing_bearer(monkeypatch):
+    import asyncio
+    from app.core.config import Settings
+    from app.services import auth_service
+
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"id": "user-cache-test", "email": "cached@example.com"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            calls.append(True)
+            return Response()
+
+    auth_service.clear_auth_cache()
+    monkeypatch.setattr(auth_service, "get_settings", lambda: Settings(
+        _env_file=None,
+        supabase_url="https://cache-test.supabase.co",
+        supabase_anon_key="test-anon-key",
+    ))
+    monkeypatch.setattr(auth_service.httpx, "AsyncClient", lambda **_kwargs: Client())
+    try:
+        first = asyncio.run(auth_service.verify_access_token("cache-test-token"))
+        second = asyncio.run(auth_service.verify_access_token("cache-test-token"))
+        assert first == second == {"id": "user-cache-test", "email": "cached@example.com"}
+        assert len(calls) == 1
+        assert "cache-test-token" not in repr(auth_service._verified_users)
+    finally:
+        auth_service.clear_auth_cache()
+
+
+def test_auth_service_fails_closed_when_supabase_is_not_configured(monkeypatch):
+    import asyncio
+    import pytest
+    from app.core.config import Settings
+    from app.services import auth_service
+
+    monkeypatch.setattr(auth_service, "get_settings", lambda: Settings(_env_file=None))
+    with pytest.raises(auth_service.AuthNotConfigured, match="not configured"):
+        asyncio.run(auth_service.verify_access_token("not-a-real-token"))

@@ -108,3 +108,93 @@ describe("light theme — accent buttons keep a readable label", () => {
     ).toEqual([]);
   });
 });
+
+/**
+ * ── The alpha neutrals ───────────────────────────────────────────────────
+ *
+ * The same rot, in a form nobody noticed. Tailwind emits `bg-black/30` and
+ * `bg-gray-800/60` as different class names from `bg-black` and `bg-gray-800`,
+ * so the solid remap above never matched them: 26 alpha variants were used in
+ * the components and none of them had a light-theme rule.
+ *
+ * It showed up as a grey slab — `bg-black/30` is the field background on
+ * FileTreePanel's search bar and DiffViewer's filter, and it rendered on the
+ * white page exactly as written, which reads as a broken control rather than an
+ * empty text input.
+ *
+ * This derives the required set from the components, so the next alpha utility
+ * someone adds fails here instead of shipping.
+ */
+/** A full utility, alpha included: "bg-black/30", "divide-gray-800/70". */
+const ALPHA_NEUTRAL =
+  /(?<![\w-])((?:bg|border|divide)-(?:gray|slate|zinc|neutral|stone|white|black)(?:-\d{2,3})?)\/(\d{1,3})(?![\w/-])/g;
+
+/**
+ * `.divide-*` only ever styles the borders *between siblings*, so a rule
+ * written as a bare `.divide-gray-800/70` matches nothing at all and would
+ * pass any existence check silently.
+ */
+function selectorFor(util: string): string {
+  return util.startsWith("divide-")
+    ? `html:not(.dark) .${util} > :not([hidden])`
+    : `html:not(.dark) .${util}`;
+}
+
+describe("lightTheme: alpha neutral utilities", () => {
+  const used = new Set<string>();
+  for (const source of Object.values(components)) {
+    for (const [, util, alpha] of source.matchAll(ALPHA_NEUTRAL)) {
+      used.add(`${util}/${alpha}`);
+    }
+  }
+
+  // index.css escapes the slash in these selectors, because a bare `/` would
+  // close the rule early. Un-escaping just the slashes means every comparison
+  // below is against plain `bg-black/30` text, with no second regex to keep in
+  // step — and unlike stripping every backslash, it leaves the `\.` in
+  // `html:not\(.dark\)` intact for the pattern to match.
+  const css = readFileSync(INDEX_CSS, "utf8").replace(/\\\//g, "/");
+
+  const declared = new Set(
+    [...css.matchAll(
+      /html:not\(.dark\) \.((?:bg|border|divide)-(?:gray|slate|zinc|neutral|stone|white|black)(?:-\d{2,3})?)\/(\d{1,3})\b/g,
+    )].map((m) => `${m[1]}/${m[2]}`),
+  );
+
+  it("finds the utilities it is meant to be checking", () => {
+    // Named rather than counted: these are the ones that were visibly broken,
+    // so a regex that quietly stopped matching fails here instead of letting
+    // the two tests below pass on nothing.
+    for (const known of [
+      "bg-black/30",      // the grey slab on FileTree + DiffViewer search fields
+      "border-white/10",  // 36 invisible hairlines on a white page
+      "bg-white/10",      // 31 panels that lost their surface separation
+    ]) {
+      expect(used, `${known} is no longer detected in the components`).toContain(known);
+    }
+  });
+
+  it("remaps every alpha neutral a component uses", () => {
+    const escaped = [...used].filter((u) => !declared.has(u)).sort();
+    expect(
+      escaped,
+      `These alpha neutrals keep their dark-theme value in light mode: ` +
+        `${escaped.join(", ")}. Add a rule for each under html:not(.dark).`,
+    ).toEqual([]);
+  });
+
+  it("remaps no alpha neutral that nothing uses", () => {
+    const stale = [...declared].filter((u) => !used.has(u)).sort();
+    expect(
+      stale,
+      `index.css remaps ${stale.join(", ")} but no component uses it. Stale rules ` +
+        `hide the missing ones — remove them.`,
+    ).toEqual([]);
+  });
+
+  it("writes every divide rule as a sibling selector", () => {
+    for (const util of [...used].filter((u) => u.startsWith("divide-"))) {
+      expect(css, `missing divide rule for ${util}`).toContain(selectorFor(util));
+    }
+  });
+});

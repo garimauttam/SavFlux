@@ -12,9 +12,12 @@
  * Anything without that prefix stays server-side only.
  */
 interface ImportMetaEnv {
-  /** Base URL of the FastAPI backend. Set to your Railway URL in Vercel's env vars. */
+  /** Base URL of the FastAPI backend. Set to your Railway URL in the frontend build environment. */
   readonly VITE_API_URL: string;
-  readonly VITE_API_KEY: string;
+  /** Public Supabase project URL (safe to include in the browser bundle). */
+  readonly VITE_SUPABASE_URL: string;
+  /** Supabase anon/publishable key; never use a service-role key in the frontend. */
+  readonly VITE_SUPABASE_ANON_KEY: string;
 }
 
 interface ImportMeta {

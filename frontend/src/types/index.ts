@@ -6,8 +6,38 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   sources?: SourceFile[];  // citations from the RAG retrieval
+  grounding?: GroundingReport; // what the finished answer cited, vs what it was given
   generationSteps?: string[]; // safe retrieval/model activity trace
   isStreaming?: boolean;   // true while the answer is being typed out
+}
+
+/** One `file:line` the answer claimed that the retrieved evidence does not contain. */
+export interface UnverifiedCitation {
+  reference: string;   // normalised, e.g. "auth.py:42-58"
+  file_name: string;
+  line_start: number;
+  line_end: number;
+  reason: "not_in_context" | "lines_outside_context";
+  detail: string;      // the same explanation, in full, for the tooltip
+}
+
+/**
+ * The result of checking a finished answer against its evidence.
+ *
+ * `is_clean` false means the reader should be told, not that the answer is
+ * wrong — a citation can point outside the retrieved set and still be a true
+ * statement about the repository. The check reports; it does not judge.
+ */
+export interface GroundingReport {
+  citations_claimed: number;
+  unverified: UnverifiedCitation[];
+  unverified_count: number;
+  /** The model said the retrieved code was not enough to answer. */
+  insufficient_evidence: boolean;
+  /** ...and then answered anyway, which is what the prompt asks it to do. */
+  delivered_anyway: boolean;
+  matched_phrase: string;
+  is_clean: boolean;
 }
 
 /** Trust level for a citation, derived from the cross-encoder relevance score.

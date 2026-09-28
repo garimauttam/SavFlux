@@ -10,6 +10,7 @@ Keeping them separate = testable, maintainable code.
 
 import json
 import asyncio
+import logging
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
@@ -23,9 +24,12 @@ from app.services.ingestion_service import (
     get_indexed_repos,
     ingestion_lock,
     normalize_repo_url,
+    friendly_ingest_error,
 )
 from app.services.dep_graph import build_dependency_graph
 from app.services.job_store import create_job, update_job, finish_job, get_job
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ingest", tags=["ingestion"])
 
@@ -94,7 +98,12 @@ async def ingest_github(request: GitHubIngestRequest, _: None = Depends(require_
                     progress_callback=progress_callback,
                 )
         except Exception as e:
-            final_result = {"status": "error", "message": str(e)}
+            # The trace goes to the log; the stream gets a sentence. See
+            # `friendly_ingest_error` — the untranslated version of this was a
+            # MaxRetryError URL reaching the first-run user as the only
+            # explanation of why their index was empty.
+            logger.exception("Ingestion failed for %s", request.repo_url)
+            final_result = {"status": "error", "message": friendly_ingest_error(e)}
         finally:
             finish_job(job_id, final_result)
             completed.set()
@@ -193,8 +202,13 @@ async def ingest_files(files: List[UploadFile] = File(...), _: None = Depends(re
         filename = f.filename or "uploaded_file"
         files_content.append((filename, content))
 
-    async with ingestion_lock:
-        result = await ingest_uploaded_files(files_content)
+    try:
+        async with ingestion_lock:
+            result = await ingest_uploaded_files(files_content)
+    except Exception as e:
+        # Same rule as the GitHub path: log the trace, send the sentence.
+        logger.exception("Upload ingestion failed (%d file(s))", len(files_content))
+        raise HTTPException(status_code=500, detail=friendly_ingest_error(e))
 
     if result["status"] == "error":
         raise HTTPException(status_code=422, detail=result["message"])

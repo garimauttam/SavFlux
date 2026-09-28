@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     #              and a default that needs a key makes that promise false.
     # "deepseek" → hosted DeepSeek API (cheap, paid), falls back to local Ollama
     # "openai"   → GPT-4o, paid
+    # "openrouter" → user-selected OpenAI-compatible models, paid/free tiers vary
     #
     # Every provider in this Literal must have a branch in llm_factory's
     # `_build_chat_llm`, `get_provider_name`, `get_hosted_client_kwargs` and
@@ -53,12 +54,17 @@ class Settings(BaseSettings):
     # missing feature, it is a startup crash: pydantic rejects the value before
     # any route runs. That is exactly what `.env.example` used to instruct users
     # to do, so test_provider_config.py now asserts the two agree.
-    llm_provider: Literal["ollama", "deepseek", "openai"] = "ollama"
+    llm_provider: Literal["ollama", "deepseek", "openai", "openrouter"] = "ollama"
 
     # --- OpenAI (used when llm_provider=openai) ---
     openai_api_key: Optional[str] = None
     openai_chat_model: str = "gpt-4o"
     openai_embedding_model: str = "text-embedding-3-small"
+
+    # --- OpenRouter (OpenAI-compatible API; optional BYOK provider) ---
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_chat_model: str = "openai/gpt-4o-mini"
 
     # --- Ollama (self-hosted local models) ---
     # Requires Ollama running at ollama_base_url with the model already pulled.
@@ -160,6 +166,24 @@ class Settings(BaseSettings):
     # (4.5ms each) and the remainder share batched calls. 12 single reviews plus
     # batching covers a 70-file repo in a fraction of the calls.
     review_llm_budget: int = 12
+    # review_max_files_per_request: how many files one multi-review request may
+    # carry. This is a REQUEST-SIZE guard, not a review-quality limit.
+    #
+    # The two are easy to confuse and only one of them is real. The pipeline
+    # does not put N files in one prompt: `review_planner` scores every file,
+    # answers most with the deterministic static analyzer, and sends at most
+    # `MAX_BATCH_SIZE` (4) files per batched call. A 5,000-file selection is the
+    # same shape of work as a 50-file one — more batches, not a bigger prompt.
+    #
+    # It was 200, and nothing explained why. Repo review does not even put file
+    # content in the request body (the payload carries paths; content is read
+    # back from the index), so a few thousand paths is well under the 10MB body
+    # limit in main.py. A real 1,000-file monorepo was refused by a number with
+    # no basis, while the UI showed "Review 1000 files" and offered no way out.
+    #
+    # The only cost of raising it is wall-clock time, governed by
+    # review_llm_budget and review_concurrency — not by this number.
+    review_max_files_per_request: int = 2000
     # review_cache_enabled: reuse a review when the file's content hash, language,
     # model and prompt version all match a previous run. Off = every review is a
     # fresh model call.
@@ -195,13 +219,12 @@ class Settings(BaseSettings):
     langchain_api_key: Optional[str] = None           # from smith.langchain.com
     langchain_project: str = "savflux"               # project name in LangSmith UI
 
-    # --- Authentication ---
-    # API key that protects all write/query endpoints.
-    # If unset (default), the server runs open — safe for local dev.
-    # In production (Railway), set API_KEY to a random secret so only your
-    # frontend can call the API.
-    # Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
-    api_key: Optional[str] = None
+    # --- Supabase Authentication ---
+    # Browser sign-in uses Supabase Auth (Google OAuth and email/password).
+    # The backend validates each access token against Supabase Auth before any
+    # private API request and scopes persisted data to the verified user UUID.
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
 
     # --- App ---
     # PORT: Railway injects the PORT env var and routes external traffic to it.
