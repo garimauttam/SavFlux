@@ -68,8 +68,8 @@ def get_review_llm(model_name: str = "", streaming: bool = True) -> Any:
     )
 
 
-@lru_cache(maxsize=4)  # keys: (streaming=True/False) × (review=True/False)
-def get_chat_llm(streaming: bool = False, review: bool = False) -> Any:
+@lru_cache(maxsize=128)
+def _get_chat_llm_cached(streaming: bool, review: bool, tenant_key: str) -> Any:
     """
     Return a cached chat LLM for the configured provider.
 
@@ -103,6 +103,17 @@ def get_chat_llm(streaming: bool = False, review: bool = False) -> Any:
     primary = _build_chat_llm(provider, streaming, review=review)
     fallbacks = [fallback] if fallback is not None else []
     return primary.with_fallbacks(fallbacks) if fallbacks else primary
+
+
+def get_chat_llm(streaming: bool = False, review: bool = False) -> Any:
+    """Return a model cached by user, so one account can never receive another's key."""
+    from app.core.tenant import current_user_id
+    tenant_key = current_user_id() or "__local__"
+    return _get_chat_llm_cached(streaming, review, tenant_key)
+
+
+# Preserve the cache controls used by settings changes and unit tests.
+get_chat_llm.cache_clear = _get_chat_llm_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def _build_chat_llm(provider: str, streaming: bool = False, *, review: bool = False) -> Any:
@@ -216,27 +227,30 @@ def build_local_embeddings(model_name: str) -> Any:
     )
 
 
-@lru_cache(maxsize=1)
-def get_embedding_fn() -> Any:
-    """
-    Return a cached embedding function.
-
-    IMPORTANT: the model used at index time must match the model used at query time.
-    Mixing embedding models produces garbage retrieval. Re-index after switching.
-
-    deepseek / ollama / OpenRouter providers use a local HuggingFace model — see
-    `embedding_model`, `embedding_batch_size` and `embedding_device` in config.
-    openai uses text-embedding-3-small (paid, 1536 dims).
-    """
+@lru_cache(maxsize=128)
+def _get_embedding_fn_cached(tenant_key: str) -> Any:
+    """Per-account embedder cache; hosted credentials must never cross tenants."""
     s = _settings()
-    if s.llm_provider in LOCAL_EMBEDDING_PROVIDERS:
+    from app.services.model_service import active_provider, provider_api_key
+    provider = active_provider()
+    if provider in LOCAL_EMBEDDING_PROVIDERS:
         return build_local_embeddings(s.embedding_model)
-    _require_key("OPENAI_API_KEY", s.openai_api_key)
-    from langchain_openai import OpenAIEmbeddings
-    return OpenAIEmbeddings(
-        model=s.openai_embedding_model,
-        openai_api_key=s.openai_api_key,
-    )
+    if provider == "openai":
+        api_key = provider_api_key(provider)
+        if not api_key:
+            raise ValueError("An OpenAI key is required for OpenAI embeddings. Add one in Settings or switch to a local-embedding provider.")
+        from langchain_openai import OpenAIEmbeddings
+        return OpenAIEmbeddings(model=s.openai_embedding_model, openai_api_key=api_key)
+    raise ValueError(f"Provider {provider!r} has no supported embedding route.")
+
+
+def get_embedding_fn() -> Any:
+    """Return the active account's embedder, never another account's cached client."""
+    from app.core.tenant import current_user_id
+    return _get_embedding_fn_cached(current_user_id() or "__local__")
+
+
+get_embedding_fn.cache_clear = _get_embedding_fn_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def get_provider_name() -> str:

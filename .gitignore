@@ -23,7 +23,6 @@ build/
 .env
 *.env
 !.env.example        # keep the template, not the real secrets
-owner_key
 
 # ── ChromaDB data — re-generated on first run, can be hundreds of MB ──────────
 chroma_data/

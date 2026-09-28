@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.paths import data_dir
 
 settings = get_settings()
 
@@ -21,7 +22,7 @@ def _get_collection():
     import chromadb
     from chromadb.config import Settings as ChromaSettings
     client = chromadb.PersistentClient(
-        path=settings.chroma_persist_directory,
+        path=str(data_dir()),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
     return client.get_or_create_collection(settings.chroma_collection_name)
@@ -72,13 +73,10 @@ def bulk_delete_sources(sources: list[str]) -> dict[str, Any]:
         except Exception as e:
             errors.append(f"{src}: {str(e)[:120]}")
 
-    # Also need to handle BM25 cache invalidation — trigger rebuild on next query
-    try:
-        from app.services.retrieval_service import _BM25_INDEX, _BM25_DIRTY
-        import app.services.retrieval_service as rs
-        rs._BM25_DIRTY = True  # type: ignore
-    except Exception:
-        pass
+    # The lexical cache is private to this user's index and invalidated after writes.
+    if deleted:
+        from app.services.retrieval_service import invalidate_bm25_cache
+        invalidate_bm25_cache()
 
     return {
         "deleted": deleted,

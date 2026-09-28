@@ -28,6 +28,8 @@ from chromadb.config import Settings as ChromaSettings
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.config import get_settings
+from app.core.paths import data_dir
+from app.core.tenant import current_user_id
 from langchain_core.documents import Document
 from app.services.citation_service import build_citations
 from app.services.grounding_check import check_grounding
@@ -168,9 +170,9 @@ def _diagnose_retrieval(
 # queries so the retriever surfaces files that call/import the queried symbol —
 # something pure vector search misses entirely.
 
-# Module-level cache: rebuild only when the doc count changes (same as BM25 cache)
-_dep_graph_cache: dict | None = None
-_dep_graph_doc_count: int = -1
+# Per-data-directory graph cache: identical document counts across accounts must not
+# cause one account's graph (and file names) to be reused for another.
+_dep_graph_cache: dict[str, tuple[dict, int]] = {}
 
 
 def _get_dep_graph_hints(query: str, vectorstore) -> list[str]:
@@ -186,17 +188,19 @@ def _get_dep_graph_hints(query: str, vectorstore) -> list[str]:
 
     Returns [] on any error — always optional, never blocks retrieval.
     """
-    global _dep_graph_cache, _dep_graph_doc_count
-
     try:
+        state_key = str(data_dir())
         current_count: int = vectorstore._collection.count()
-        if _dep_graph_cache is None or current_count != _dep_graph_doc_count:
+        cached = _dep_graph_cache.get(state_key)
+        if cached is None or current_count != cached[1]:
             from app.services.dep_graph import build_dependency_graph
-            _dep_graph_cache = build_dependency_graph(repo_url=None)
-            _dep_graph_doc_count = current_count
+            graph = build_dependency_graph(repo_url=None)
+            _dep_graph_cache[state_key] = (graph, current_count)
+        else:
+            graph = cached[0]
 
-        nodes: list[dict] = _dep_graph_cache.get("nodes", [])
-        edges: list[dict] = _dep_graph_cache.get("edges", [])
+        nodes: list[dict] = graph.get("nodes", [])
+        edges: list[dict] = graph.get("edges", [])
         if not nodes or not edges:
             return []
 
@@ -239,8 +243,9 @@ def _get_dep_graph_hints(query: str, vectorstore) -> list[str]:
 
 
 # Module-level cached BM25 index and version tracker
-_bm25_index_cache: BM25Index | None = None
+_bm25_index_cache: BM25Index | None = None  # legacy/local cache aliases used by tests
 _bm25_doc_count: int = -1
+_bm25_tenant_cache: dict[str, tuple[BM25Index | None, int]] = {}
 _bm25_rebuild_lock: asyncio.Lock | None = None
 
 
@@ -253,8 +258,26 @@ def _get_bm25_lock() -> asyncio.Lock:
 
 
 def _bm25_cache_path() -> Path:
-    """Path to the pickled BM25 index on disk, co-located with ChromaDB data."""
-    return Path(settings.chroma_persist_directory) / "bm25_index.pkl"
+    """Path to this user's pickled BM25 index, next to their Chroma database."""
+    return data_dir() / "bm25_index.pkl"
+
+
+def _bm25_state_key() -> str:
+    return str(_bm25_cache_path().parent)
+
+
+def _get_bm25_state() -> tuple[BM25Index | None, int]:
+    if current_user_id() is None:
+        return _bm25_index_cache, _bm25_doc_count
+    return _bm25_tenant_cache.get(_bm25_state_key(), (None, -1))
+
+
+def _set_bm25_state(index: BM25Index | None, doc_count: int) -> None:
+    global _bm25_index_cache, _bm25_doc_count
+    if current_user_id() is None:
+        _bm25_index_cache, _bm25_doc_count = index, doc_count
+    else:
+        _bm25_tenant_cache[_bm25_state_key()] = (index, doc_count)
 
 
 def _load_bm25_from_disk(expected_doc_count: int) -> BM25Index | None:
@@ -282,7 +305,7 @@ def _load_bm25_from_disk(expected_doc_count: int) -> BM25Index | None:
         return None
 
 
-def _save_bm25_to_disk(index: BM25Index, doc_count: int) -> None:
+def _save_bm25_to_disk(index: BM25Index, doc_count: int, cache_path: Path | None = None) -> None:
     """
     Atomically pickle the BM25 index to disk.
 
@@ -293,7 +316,7 @@ def _save_bm25_to_disk(index: BM25Index, doc_count: int) -> None:
     Write to a .tmp file first; os.replace() is atomic on POSIX — the target
     either has the old file or the new file, never a partial write.
     """
-    cache_path = _bm25_cache_path()
+    cache_path = cache_path or _bm25_cache_path()
     tmp_path = cache_path.with_suffix(".pkl.tmp")
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,13 +333,12 @@ def _save_bm25_to_disk(index: BM25Index, doc_count: int) -> None:
 
 
 def invalidate_bm25_cache() -> None:
-    """
-    Invalidate both the in-memory and on-disk BM25 caches.
-    Called after ingestion modifies ChromaDB so the next query rebuilds fresh.
-    """
-    global _bm25_index_cache, _bm25_doc_count
-    _bm25_index_cache = None
-    _bm25_doc_count = -1
+    """Invalidate the current account's derived retrieval caches after index writes."""
+    if current_user_id() is None:
+        _set_bm25_state(None, -1)
+    else:
+        _bm25_tenant_cache.pop(_bm25_state_key(), None)
+    _dep_graph_cache.pop(str(data_dir()), None)
     try:
         _bm25_cache_path().unlink(missing_ok=True)
     except Exception:
@@ -331,6 +353,9 @@ def save_bm25_on_shutdown() -> None:
     """
     if _bm25_index_cache is not None and _bm25_doc_count > 0:
         _save_bm25_to_disk(_bm25_index_cache, _bm25_doc_count)
+    for directory, (index, count) in list(_bm25_tenant_cache.items()):
+        if index is not None and count > 0:
+            _save_bm25_to_disk(index, count, Path(directory) / "bm25_index.pkl")
 
 
 def _bm25_corpus(rows: list[Document]) -> list[Document]:
@@ -376,22 +401,21 @@ def _get_bm25_index(vectorstore: Chroma) -> BM25Index | None:
     just to call len() for the cache check. .count() is a single SQLite COUNT(*)
     — O(1) vs O(N). The full .get() only runs on the rebuild branch.
     """
-    global _bm25_index_cache, _bm25_doc_count
     try:
         current_count: int = vectorstore._collection.count()
+        cached_index, cached_count = _get_bm25_state()
 
-        # 1. In-memory hit — most common path, no document fetch needed
-        if _bm25_index_cache is not None and current_count == _bm25_doc_count:
-            return _bm25_index_cache
+        # 1. In-memory hit — most common path, never shared between accounts.
+        if cached_index is not None and current_count == cached_count:
+            return cached_index
 
-        # 2. Try loading from disk (avoids rebuild after restart)
+        # 2. Try this user's disk cache (avoids rebuild after restart).
         disk_index = _load_bm25_from_disk(current_count)
         if disk_index is not None:
-            _bm25_index_cache = disk_index
-            _bm25_doc_count = current_count
-            return _bm25_index_cache
+            _set_bm25_state(disk_index, current_count)
+            return disk_index
 
-        # 3. Rebuild from ChromaDB (collection changed or no disk cache)
+        # 3. Rebuild only from the current user's Chroma collection.
         results = vectorstore._collection.get(include=["documents", "metadatas"])
         docs_raw = results.get("documents") or []
         metas_raw = results.get("metadatas") or []
@@ -399,10 +423,10 @@ def _get_bm25_index(vectorstore: Chroma) -> BM25Index | None:
             Document(page_content=content, metadata=meta or {})
             for content, meta in zip(docs_raw, metas_raw)
         ]
-        _bm25_index_cache = BM25Index(_bm25_corpus(rows))
-        _bm25_doc_count = current_count
-        _save_bm25_to_disk(_bm25_index_cache, current_count)
-        return _bm25_index_cache
+        index = BM25Index(_bm25_corpus(rows))
+        _set_bm25_state(index, current_count)
+        _save_bm25_to_disk(index, current_count)
+        return index
     except Exception as exc:
         logger.warning("BM25 index build failed (lexical search disabled): %s", exc)
         return None
@@ -464,8 +488,8 @@ FORMATTING:
 - Use markdown: headings (##, ###), bold, inline code, fenced code blocks with language tags.
 - Keep answers focused. If context is incomplete, end with a clear "To investigate further:" note."""
 
-@lru_cache(maxsize=1)
-def _get_vectorstore() -> Chroma:
+@lru_cache(maxsize=64)
+def _get_vectorstore_for_directory(persist_directory: str) -> Chroma:
     """
     Module-level singleton for the ChromaDB client.
 
@@ -487,14 +511,22 @@ def _get_vectorstore() -> Chroma:
     """
     import chromadb as _chromadb
     persistent_client = _chromadb.PersistentClient(
-        path=settings.chroma_persist_directory,
+        path=persist_directory,
         settings=ChromaSettings(anonymized_telemetry=False),
     )
     return Chroma(
         client=persistent_client,
         collection_name=settings.chroma_collection_name,
-        embedding_function=get_embedding_fn(),   # provider-aware: OpenAI or local MiniLM
+        embedding_function=get_embedding_fn(),   # provider-aware and tenant-keyed
     )
+
+
+def _get_vectorstore() -> Chroma:
+    """Return the persistent vector store for the current authenticated user."""
+    return _get_vectorstore_for_directory(str(data_dir()))
+
+
+_get_vectorstore.cache_clear = _get_vectorstore_for_directory.cache_clear  # type: ignore[attr-defined]
 
 
 async def stream_answer(
@@ -890,7 +922,7 @@ def _get_raw_collection():
     """
     import chromadb
     client = chromadb.PersistentClient(
-        path=settings.chroma_persist_directory,
+        path=str(data_dir()),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
     return client.get_or_create_collection(settings.chroma_collection_name)

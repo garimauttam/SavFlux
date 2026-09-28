@@ -47,7 +47,7 @@ async def _post_and_hang_up(app, path: str, body: dict, *, hang_up_after: int = 
         "root_path": "",
         "headers": [
             (b"content-type", b"application/json"),
-            (b"x-api-key", b"test-owner-key"),
+            (b"authorization", b"Bearer test-access-token"),
         ],
         "client": ("127.0.0.1", 5555),
         "server": ("testserver", 80),

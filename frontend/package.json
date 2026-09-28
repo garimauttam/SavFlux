@@ -13,6 +13,7 @@
     "report:bundle:gate": "node scripts/bundle-report.mjs --entry-budget-kb 320"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
     "@types/diff": "^7.0.2",
     "diff": "^9.0.0",
     "lucide-react": "^0.395.0",
@@ -20,7 +21,7 @@
     "react-dom": "^18.3.1",
     "react-force-graph-2d": "^1.29.1",
     "react-markdown": "^9.0.1",
-    "react-syntax-highlighter": "^15.5.0",
+    "react-syntax-highlighter": "^16.1.1",
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
@@ -28,18 +29,18 @@
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.1.0",
     "@testing-library/user-event": "^14.5.2",
-    "@types/node": "^22.10.2",
+    "@types/node": "^22.20.4",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@types/react-syntax-highlighter": "^15.5.13",
-    "@vitejs/plugin-react": "^4.3.1",
-    "@vitest/coverage-v8": "^2.1.9",
+    "@vitejs/plugin-react": "^5.2.0",
+    "@vitest/coverage-v8": "^4.1.11",
     "autoprefixer": "^10.4.19",
     "jsdom": "^25.0.1",
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4",
     "typescript": "^5.4.5",
-    "vite": "^5.3.1",
-    "vitest": "^2.1.9"
+    "vite": "^7.3.6",
+    "vitest": "^4.1.11"
   }
 }

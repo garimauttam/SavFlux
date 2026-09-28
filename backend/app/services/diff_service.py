@@ -15,6 +15,7 @@ import difflib
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.paths import data_dir
 
 settings = get_settings()
 
@@ -22,7 +23,7 @@ def _get_collection():
     import chromadb
     from chromadb.config import Settings as ChromaSettings
     client = chromadb.PersistentClient(
-        path=settings.chroma_persist_directory,
+        path=str(data_dir()),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
     return client.get_or_create_collection(settings.chroma_collection_name)

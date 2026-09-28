@@ -133,7 +133,7 @@ def test_workspace_status_api_is_authenticated_and_explains_empty_state(client, 
     denied = client.get(
         "/api/v1/workspace/status",
         params={"repo": repo},
-        headers={"X-API-Key": "bad-key"},
+        headers={"Authorization": "Bearer invalid-test-access-token"},
     )
     assert denied.status_code == 401
 

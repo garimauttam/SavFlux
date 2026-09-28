@@ -1,101 +1,133 @@
-"""Single-owner API-key authentication tests.
-
-The owner key protects every /api/v1 route, not only routes which remembered
-an explicit FastAPI dependency. Local loopback remains zero-config only before
-a stored key exists; generated keys and explicit API_KEYs require sign-in.
-"""
-
+"""Supabase bearer authentication and account-scoped API tests."""
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 
-def _make_client(api_key: str | None):
+@contextmanager
+def _client():
     from app.core.config import Settings
+    from app.services.auth_service import InvalidAccessToken
 
-    fake_settings = Settings(
+    settings = Settings(
         llm_provider="openai",
         openai_api_key="sk-test",
-        api_key=api_key,
+        supabase_url="https://test-project.supabase.co",
+        supabase_anon_key="test-anon-key",
     )
-    expected_key = api_key or ""
-    mock_chroma = MagicMock()
-    mock_chroma._collection.get.return_value = {"metadatas": None}
 
-    with patch("app.core.config.get_settings", return_value=fake_settings), \
-         patch("app.services.owner_key.get_settings", return_value=fake_settings), \
-         patch("app.api.deps.effective_owner_key", return_value=expected_key), \
-         patch("app.services.owner_key.effective_owner_key", return_value=expected_key), \
-         patch("app.services.owner_key.load_or_create_owner_key", return_value=(expected_key, False)), \
-         patch("app.services.ingestion_service.settings", fake_settings), \
+    async def verify(token: str):
+        if token != "valid-access-token":
+            raise InvalidAccessToken("Invalid or expired test session")
+        return {"id": "00000000-0000-4000-8000-000000000001", "email": "owner@example.com"}
+
+    mock_chroma = MagicMock()
+    mock_chroma.heartbeat.return_value = True
+    with patch("app.core.config.get_settings", return_value=settings), \
+         patch("app.services.ingestion_service.settings", settings), \
+         patch("app.core.auth_middleware.verify_access_token", new=verify), \
          patch("openai.AsyncOpenAI"), \
          patch("chromadb.PersistentClient", return_value=mock_chroma), \
-         patch("app.services.reranker._get_cross_encoder"), \
-         patch("app.services.retrieval_service._get_vectorstore", return_value=mock_chroma):
+         patch("app.services.reranker._get_cross_encoder"):
         from main import app
         with TestClient(app, raise_server_exceptions=False) as client:
             yield client
 
 
-def test_unconfigured_owner_key_fails_closed_even_for_loopback():
-    for client in _make_client(api_key=None):
-        response = client.get("/api/v1/chat/indexed-files")
-        assert response.status_code == 503
-        assert "authentication is not configured" in response.json()["detail"].lower()
-
-
-def test_missing_header_returns_401_when_key_is_set():
-    for client in _make_client(api_key="supersecret"):
+def test_missing_bearer_is_rejected_with_google_and_email_guidance():
+    with _client() as client:
         response = client.get("/api/v1/chat/indexed-files")
         assert response.status_code == 401
+        assert "Google or email" in response.json()["detail"]
 
 
-def test_wrong_key_returns_401():
-    for client in _make_client(api_key="supersecret"):
-        response = client.get(
-            "/api/v1/chat/indexed-files",
-            headers={"X-API-Key": "wrongkey"},
-        )
+def test_invalid_bearer_is_rejected():
+    with _client() as client:
+        response = client.get("/api/v1/chat/indexed-files", headers={"Authorization": "Bearer wrong"})
         assert response.status_code == 401
+        assert "invalid" in response.json()["detail"].lower()
 
 
-def test_correct_key_passes_through():
-    for client in _make_client(api_key="supersecret"):
-        response = client.get(
-            "/api/v1/chat/indexed-files",
-            headers={"X-API-Key": "supersecret"},
-        )
-        assert response.status_code == 200
-
-
-def test_api_routes_without_route_dependency_are_also_protected():
-    # /agent/tools did not previously declare Depends(require_api_key). The
-    # app-level gate means a future route cannot accidentally become public.
-    for client in _make_client(api_key="supersecret"):
+def test_verified_bearer_protects_routes_and_scopes_account_session():
+    with _client() as client:
+        headers = {"Authorization": "Bearer valid-access-token"}
+        assert client.get("/api/v1/chat/indexed-files", headers=headers).status_code == 200
+        # The app-level middleware protects routes even if a route omitted a dependency.
         assert client.get("/api/v1/agent/tools").status_code == 401
-        assert client.get(
-            "/api/v1/agent/tools", headers={"X-API-Key": "supersecret"}
-        ).status_code == 200
+        tools = client.get("/api/v1/agent/tools", headers=headers)
+        assert tools.status_code == 200
+
+        session = client.get("/api/v1/auth/session", headers=headers)
+        assert session.status_code == 200
+        assert session.json() == {
+            "authenticated": True,
+            "user": {"id": "00000000-0000-4000-8000-000000000001", "email": "owner@example.com"},
+        }
+        assert "valid-access-token" not in session.text
 
 
-def test_signin_check_never_returns_the_supplied_key():
-    for client in _make_client(api_key="supersecret"):
-        response = client.post(
-            "/api/v1/auth/session", headers={"X-API-Key": "supersecret"}
-        )
-        assert response.status_code == 200
-        assert response.json() == {"authenticated": True}
-        assert "supersecret" not in response.text
-
-
-def test_public_share_links_remain_public():
-    for client in _make_client(api_key="supersecret"):
+def test_public_share_links_remain_capability_urls():
+    with _client() as client:
         with patch("app.services.share_service.get_share", return_value={"id": "abc1234567"}):
             response = client.get("/api/v1/share/abc1234567")
         assert response.status_code == 200
 
 
-def test_health_always_passes_without_key():
-    for client in _make_client(api_key="supersecret"):
+def test_health_is_public_for_platform_probes():
+    with _client() as client:
         response = client.get("/health")
         assert response.status_code != 401
+
+
+def test_auth_service_reuses_recently_verified_identity_without_storing_bearer(monkeypatch):
+    import asyncio
+    from app.core.config import Settings
+    from app.services import auth_service
+
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"id": "user-cache-test", "email": "cached@example.com"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            calls.append(True)
+            return Response()
+
+    auth_service.clear_auth_cache()
+    monkeypatch.setattr(auth_service, "get_settings", lambda: Settings(
+        _env_file=None,
+        supabase_url="https://cache-test.supabase.co",
+        supabase_anon_key="test-anon-key",
+    ))
+    monkeypatch.setattr(auth_service.httpx, "AsyncClient", lambda **_kwargs: Client())
+    try:
+        first = asyncio.run(auth_service.verify_access_token("cache-test-token"))
+        second = asyncio.run(auth_service.verify_access_token("cache-test-token"))
+        assert first == second == {"id": "user-cache-test", "email": "cached@example.com"}
+        assert len(calls) == 1
+        assert "cache-test-token" not in repr(auth_service._verified_users)
+    finally:
+        auth_service.clear_auth_cache()
+
+
+def test_auth_service_fails_closed_when_supabase_is_not_configured(monkeypatch):
+    import asyncio
+    import pytest
+    from app.core.config import Settings
+    from app.services import auth_service
+
+    monkeypatch.setattr(auth_service, "get_settings", lambda: Settings(_env_file=None))
+    with pytest.raises(auth_service.AuthNotConfigured, match="not configured"):
+        asyncio.run(auth_service.verify_access_token("not-a-real-token"))

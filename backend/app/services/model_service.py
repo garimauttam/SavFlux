@@ -122,7 +122,7 @@ def active_provider() -> str:
 
 
 def provider_api_key(provider: str | None = None) -> str:
-    """Stored single-owner key takes precedence over environment configuration."""
+    """The authenticated user's stored key takes precedence over environment defaults."""
     provider = provider or active_provider()
     return _read_provider_keys().get(provider) or _environment_api_key(provider)
 
@@ -277,9 +277,15 @@ def reset_llm_cache() -> None:
     which is the "I changed it and nothing happened" bug, and worse than having
     no switch at all.
     """
-    from app.services.llm_factory import get_chat_llm
+    from app.services.llm_factory import get_chat_llm, get_embedding_fn
 
     get_chat_llm.cache_clear()
+    get_embedding_fn.cache_clear()
+    try:
+        from app.services.retrieval_service import _get_vectorstore
+        _get_vectorstore.cache_clear()
+    except Exception:
+        pass
 
 
 # ── Ollama discovery ─────────────────────────────────────────────────────────

@@ -1,18 +1,12 @@
-"""Authentication endpoints for the single-owner SavFlux instance.
-
-There is intentionally no registration endpoint: this version is single-tenant
-and has no user database. The operator's random owner key is the sign-in
-credential. A successful session check never returns or echoes the key.
-"""
-
+"""Account session endpoint for the Google/email Supabase Auth flow."""
 from fastapi import APIRouter, Depends
 
-from app.api.deps import require_api_key
+from app.api.deps import require_user
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
 
-@router.post("/session")
-async def validate_session(_: None = Depends(require_api_key)) -> dict[str, bool]:
-    """Validate the supplied X-API-Key and establish the frontend session."""
-    return {"authenticated": True}
+@router.get("/session")
+async def session(user: dict[str, str] = Depends(require_user)) -> dict[str, object]:
+    """Return only the verified account identity; never echo access tokens."""
+    return {"authenticated": True, "user": {"id": user["id"], "email": user.get("email", "")}}

@@ -33,6 +33,7 @@ from langchain_chroma import Chroma
 from chromadb.config import Settings as ChromaSettings
 
 from app.core.config import get_settings
+from app.core.paths import data_dir
 from app.services.llm_factory import LOCAL_EMBEDDING_PROVIDERS, get_embedding_fn
 from app.services.code_chunker import chunk_code_file
 from app.services.parent_child import children_of_all
@@ -102,7 +103,7 @@ def _get_vectorstore() -> Chroma:
     """
     import chromadb as _chromadb
     persistent_client = _chromadb.PersistentClient(
-        path=settings.chroma_persist_directory,
+        path=str(data_dir()),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
     return Chroma(
@@ -925,8 +926,6 @@ def friendly_ingest_error(exc: Exception) -> str:
         "max retries" in lowered or "connection" in lowered or "ssl" in lowered
         or "couldn't connect" in lowered or "not found" in lowered
     ):
-        from app.core.config import get_settings
-
         model = get_settings().embedding_model
         return (
             f"Could not download the embedding model '{model}'. This is the model that "
@@ -968,7 +967,7 @@ def _get_raw_collection():
     import chromadb
     from chromadb.config import Settings as ChromaSettings
     client = chromadb.PersistentClient(
-        path=settings.chroma_persist_directory,
+        path=str(data_dir()),
         settings=ChromaSettings(anonymized_telemetry=False),
     )
     return client.get_or_create_collection(settings.chroma_collection_name)

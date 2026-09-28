@@ -41,13 +41,24 @@ class _UsageTotals:
 
 
 _lock = threading.Lock()
-_totals = _UsageTotals()
+_totals_by_user: dict[str, _UsageTotals] = {}
+
+
+def _tenant_key(user_id: str | None = None) -> str:
+    if user_id is not None:
+        return user_id
+    from app.core.tenant import current_user_id
+    return current_user_id() or "__local__"
+
+
+def _totals_for(user_id: str | None = None) -> _UsageTotals:
+    return _totals_by_user.setdefault(_tenant_key(user_id), _UsageTotals())
 
 
 def get_totals() -> dict:
-    """Return a snapshot of current totals (safe to call from any thread)."""
+    """Return a snapshot of the current account's usage (safe across threads)."""
     with _lock:
-        t = _totals
+        t = _totals_for()
         # Cost estimate: local Ollama calls are free (0 API cost).
         # When using OpenAI (GPT-4o-mini) these are approximate charges.
         # GPT-4o-mini pricing: $0.15/1M prompt, $0.60/1M completion (as of 2024).
@@ -70,33 +81,28 @@ def get_totals() -> dict:
 def increment_request(kind: str) -> None:
     """Increment the per-kind request counter. kind = 'chat' | 'review' | 'write'."""
     with _lock:
+        totals = _totals_for()
         if kind == "chat":
-            _totals.chat_requests += 1
+            totals.chat_requests += 1
         elif kind == "review":
-            _totals.review_requests += 1
+            totals.review_requests += 1
         elif kind == "write":
-            _totals.write_requests += 1
+            totals.write_requests += 1
 
 
 def reset_totals() -> None:
-    """Reset all counters to zero (useful for testing)."""
-    global _totals
+    """Reset only the current account's counters."""
     with _lock:
-        _totals = _UsageTotals()
+        _totals_by_user[_tenant_key()] = _UsageTotals()
 
 
 class TokenUsageCallback(BaseCallbackHandler):
-    """
-    LangChain callback that records token usage after every LLM call.
+    """Per-call callback with the account identity captured before model execution."""
 
-    Attach to a single LLM call:
-        llm.with_config(callbacks=[TokenUsageCallback()])
-
-    Or attach globally to the LLM instance (affects all calls through it):
-        llm.callbacks = [TokenUsageCallback()]
-
-    We prefer per-call attachment so each service can opt in independently.
-    """
+    def __init__(self) -> None:
+        super().__init__()
+        from app.core.tenant import current_user_id
+        self.user_id = current_user_id()
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         usage = (response.llm_output or {}).get("token_usage") or {}
@@ -127,10 +133,11 @@ class TokenUsageCallback(BaseCallbackHandler):
         total = usage.get("total_tokens") or usage.get("total_token_count") or (prompt + completion)
 
         with _lock:
-            _totals.prompt_tokens += prompt
-            _totals.completion_tokens += completion
-            _totals.total_tokens += total
-            _totals.llm_calls += 1
+            totals = _totals_for(self.user_id)
+            totals.prompt_tokens += prompt
+            totals.completion_tokens += completion
+            totals.total_tokens += total
+            totals.llm_calls += 1
 
 
 def get_token_callback() -> TokenUsageCallback:

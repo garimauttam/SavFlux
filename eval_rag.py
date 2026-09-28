@@ -377,10 +377,10 @@ def _build_embedder(mode: str, model_pin: Optional[str] = None):
         except Exception as exc:  # noqa: BLE001 - any load failure is actionable here
             raise RuntimeError(_embedder_load_error(model_pin, exc)) from exc
 
-    from app.core.config import get_settings
+    from app.services.model_service import active_provider
 
     try:
-        provider = get_settings().llm_provider
+        provider = active_provider()
     except Exception as exc:  # pragma: no cover - unreadable config is still not permission to pay
         raise RuntimeError(
             f"Cannot read LLM_PROVIDER to decide whether the configured embedder is "

@@ -45,7 +45,7 @@ def test_provider_key_api_stores_secret_server_side_and_never_returns_it(
 def test_provider_key_api_requires_owner_authentication(client):
     denied = client.post(
         "/api/v1/models/provider",
-        headers={"X-API-Key": "not-the-owner-key"},
+        headers={"Authorization": "Bearer invalid-test-access-token"},
         json={"provider": "openai", "api_key": "sk-not-real-key"},
     )
     assert denied.status_code == 401

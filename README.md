@@ -8,17 +8,18 @@
 you a line number, the source that justifies it, a confidence score, and — when the
 fix is unambiguous — a patch that `git apply` accepts.
 
-Everything runs on free local models by default. No API key, no credit card, no
-trial that expires into a bill.
+Model inference can run on free local models by default; no paid model API key is
+required. SavFlux does require a Supabase project for account sign-in. No credit
+card or trial that expires into a bill is needed for the local-model path.
 
-[![Tests](https://img.shields.io/badge/tests-1294%20passing-2ea043?style=flat-square)](#-testing)
+[![Tests](https://img.shields.io/badge/tests-1296%20passing-2ea043?style=flat-square)](#-testing)
 [![Cost](https://img.shields.io/badge/cost-%240.00-2ea043?style=flat-square)](#-the-0-guarantee)
-[![First paint](https://img.shields.io/badge/first%20paint-245%20kB%20gz-0969da?style=flat-square)](#what-the-browser-downloads)
+[![First paint](https://img.shields.io/badge/first%20paint-301%20kB%20gz-0969da?style=flat-square)](#what-the-browser-downloads)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev)
 
-[Start here](#-quickstart-5-minutes) ·
+[Start here](#-quickstart) ·
 [What you can do](#-the-workspace) ·
 [GitHub + branches](#-github-end-to-end) ·
 [How it works](#-how-it-works) ·
@@ -331,7 +332,7 @@ For example, after connecting GitHub, compare a feature branch with `main`:
 
 ```bash
 curl -sS "$SAVFLUX_URL/api/v1/github/compare" \
-  -H "X-API-Key: $SAVFLUX_OWNER_KEY" \
+  -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"repo":"owner/repository","base":"main","head":"feature/my-change"}'
 ```
@@ -499,7 +500,7 @@ python eval_rag.py --embedder offline --no-rerank \
   --gate benchmarks/rag_offline_baseline.json
 ```
 
-This replaced `if hit_rate < 40: fail`. The score is **61.36**, so that floor could not
+This replaced `if hit_rate < 40: fail`. The score is **63.64**, so that floor could not
 fail for any regression worth noticing — retrieval could have collapsed a third and CI
 would have called it a pass. The gate catches a 16-point drop and names the six metrics
 that moved. Floors are absolute and sized in queries: over 44 queries one query is 2.27
@@ -545,18 +546,18 @@ lexical stand-in that quietly impersonates a model is worse than a failure.
 
 | metric (offline embedder, top-k 5, measured on this tree) | value |
 |---|:---:|
-| Hit Rate@5, file level | 61.36% |
-| Span Hit Rate@5, unit level | 45.45% |
-| MRR | 0.424 |
-| Symbol recall | 67.48% |
-| Precision@5 | 16.36% |
-| `bm25_only` → `dense_only` → `fused` hit@5 | 68.18% → 38.64% → 61.36% |
-| retrieval latency | 158 ms/query avg, 133 ms p50 |
+| Hit Rate@5, file level | 63.64% |
+| Span Hit Rate@5, unit level | 50.00% |
+| MRR | 0.456 |
+| Symbol recall | 69.11% |
+| Precision@5 | 17.27% |
+| `bm25_only` → `dense_only` → `fused` hit@5 | 68.18% → 38.64% → 63.64% |
+| retrieval latency | 136 ms/query avg, 125 ms p50 |
 | dense stage's share of that | ~90% |
 
 The last two rows are the same fact: the dense leg is a linear cosine scan over every
 window, so retrieval latency tracks corpus size, and adding files moves every number.
-Corpus here: 166 source files → 2,130 chunks → 3,168 embed windows (this tree; re-recorded with the baseline).
+Corpus here: 168 source files → 2,141 chunks → 3,185 embed windows (this tree; re-recorded with the baseline).
 
 **The instrument needed fixing before it could be trusted**, and the story is worth
 telling because both defects inflated the score:
@@ -570,7 +571,7 @@ telling because both defects inflated the score:
 Correcting both moved Hit Rate@5 from **79.55% to 59.09%** on one tree, retrieval code
 byte-identical — substring→exact alone took 79.55 to 77.27, and slicing to true `@K`
 removed eight more hits that had been scored at ranks 6 through 13. The CI threshold is
-40, so the gate passed before and passes now (61.36% on today's tree, 21.36 points of
+40, so the gate passed before and passes now (63.64% on today's tree, 23.64 points of
 headroom); what changed is that the margin is real. A benchmark that flatters you is
 not a guard.
 
@@ -595,7 +596,7 @@ Measured on this repo (2 CPU threads), reported by the harness as `embed_index_m
 
 | | deterministic offline-hashing leg | local MiniLM model |
 |---|:---:|:---:|
-| index 3,168 windows once (recorded baseline) | **356 ms** (8,897 windows/s) | Hardware-dependent; not measured in this CI environment |
+| index 3,185 windows once (recorded baseline) | **391 ms** (8,139 windows/s) | Hardware-dependent; not measured in this CI environment |
 | encode one query | a hash lookup (not a quality model) | Local model; no latency figure claimed here |
 | re-ingest an unchanged repo | **nothing embedded** | **nothing embedded** |
 
@@ -614,8 +615,8 @@ there rather than guess them.
 | Operation | Measured |
 |---|---|
 | AST analysis | **8.4 ms/file** (98-file repo in 853 ms) |
-| Full backend suite | **1,084 tests in ~28 s** (210 frontend, ~31 s) |
-| Dense index build (offline) | 356 ms for 3,168 windows in the latest run |
+| Full backend suite | **1,084 tests in ~22 s** (212 frontend tests in ~26 s) |
+| Dense index build (offline) | 391 ms for 3,185 windows in the latest run |
 | Patch generation | in-process `difflib`, no subprocess |
 
 ### What the browser downloads
@@ -626,8 +627,8 @@ imported to colour python, typescript, json and yaml.
 
 | | before | after |
 |---|---:|---:|
-| first paint (JS chunks + CSS, gz) | 479.57 kB | **247.7 kB** |
-| first-paint JS chunks, gz | 471.07 kB | 237.1 kB |
+| first paint (JS chunks + CSS, gz) | 479.57 kB | **301.2 kB** |
+| first-paint JS chunks, gz | 471.07 kB | 290.4 kB |
 | deferred (graph tab, on demand) | — | 65.6 kB |
 
 One `<CodeHighlight>` on `PrismLight` with a closed list of 40 grammars + 29 fence
@@ -679,11 +680,12 @@ a free-tier machine starts — plus a test that `.env` still wins.
 
 ---
 
-## 🚀 Quickstart (5 minutes)
+## 🚀 Quickstart
 
-**Prerequisites:** Python 3.11+, Node 18+, and [Ollama](https://ollama.com) for the
-free path. Keep Ollama running, then use **two terminals**: one for the backend and
-one for the frontend.
+**Prerequisites:** Python 3.11+, Node 18+, a Supabase project (Google OAuth and
+email/password enabled), and [Ollama](https://ollama.com) for the free local model.
+Keep Ollama running, then use **two terminals**: one for the backend and one for
+the frontend.
 
 ```bash
 git clone https://github.com/garimauttam/SavFlux && cd SavFlux
@@ -706,12 +708,12 @@ pip install -r requirements.txt
 ollama pull qwen2.5-coder:7b
 ```
 ```bash
-# .env.example already contains exactly this, so copying it is enough.
-cat > .env <<'EOF'
-LLM_PROVIDER=ollama
-OLLAMA_CHAT_MODEL=qwen2.5-coder:7b
-OLLAMA_BASE_URL=http://localhost:11434
-EOF
+# Start from the template, then set your Supabase project values in both env files.
+cp .env.example .env
+cp ../frontend/.env.example ../frontend/.env.local
+# Set SUPABASE_URL + SUPABASE_ANON_KEY in backend/.env.
+# Set VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY in frontend/.env.local.
+# Configure Google and Email providers and redirect URLs in Supabase Auth.
 ```
 
 Have more RAM? `qwen2.5-coder:14b` (~9 GB) is a straight quality upgrade, and
@@ -732,22 +734,31 @@ npm install && npm run dev
 
 **4 · Open** → http://localhost:5173
 
-SavFlux is single-owner by default, not a multi-user service. The first backend
-startup creates a random owner key, prints it once in the backend log, and saves
-it with restrictive file permissions at `chroma_data/owner_key`. Paste that key
-into the sign-in screen. If you miss the one-time log line, run
-`cat chroma_data/owner_key` from the backend directory. The browser keeps the
-key only for the current tab session; **do not set `VITE_API_KEY`**, which would
-bake a secret into the public frontend bundle.
+SavFlux uses Supabase Auth for **Google OAuth and email/password accounts**. Before
+running the app, create a Supabase project and configure:
 
-For a hosted instance, set a strong `API_KEY` in the deployment's secret manager
-and use HTTPS. Anyone holding it has owner-level access to that one instance,
-including its indexed code and GitHub connection. Do not run unrelated users on
-one instance: storage is not partitioned by user. Public sign-ups and per-user
-key vaults are not part of this single-owner login. The owner can still add a
-provider API key in **Settings → Model**; it is kept in the server data directory
-(`provider_api_keys.json`, mode `0600`), never returned by the API, and must be
-protected with the rest of the persistent deployment volume and its backups.
+1. In **Authentication → Providers**, enable Email and Google. Add your Google OAuth
+   client credentials in Supabase; set the local and deployed SavFlux URLs as allowed
+   redirect URLs. Configure custom SMTP before inviting real users.
+2. Set `SUPABASE_URL` and `SUPABASE_ANON_KEY` in the backend environment. Set the same
+   values as `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in `frontend/.env.local`
+   (copy `frontend/.env.example`). The anon/publishable key is public; **never put a
+   Supabase service-role key in the frontend**.
+3. For Docker Compose, export those four values before `docker compose up --build`.
+
+The UI includes sign-up, email verification, sign-in, password reset, and Google
+sign-in. Supabase verifies identity; SavFlux does not store passwords. The backend
+validates the Supabase access token before private API calls. Each verified account
+gets a separate data directory and Chroma index; GitHub tokens, provider keys,
+settings, history, and Agent worktrees are scoped to that account. Public share URLs
+remain capability links that a user can explicitly create.
+
+Existing data from the former single-owner layout remains untouched in the legacy
+data directory; it is **not automatically assigned** to the first new account, to
+avoid exposing private code to the wrong user. Re-index repositories after signing
+in. Provider API keys continue to be stored server-side with mode `0600` inside the
+account's private data directory, never in API responses; protect the persistent
+volume and its backups.
 
 First run downloads the MiniLM models (~120 MB) and caches them. Check
 `GET /health` — it reports each provider's real status. `/health` returns 503 when
@@ -1058,8 +1069,9 @@ A list this long is only worth reading if it is honest, so:
 
 ```bash
 cd backend && pytest -q                 # 1084 tests, ~22 s
-cd frontend && npx tsc --noEmit         # type check
-cd frontend && npx vitest run           # 210 tests, 24 files
+cd frontend && npm run build            # type check + production bundle
+cd frontend && npx vitest run           # 212 tests, 24 files
+cd frontend && npm run report:bundle:gate # 320 kB first-paint budget
 python3 scripts/bench_security.py       # reproduce the F1 table
 
 # the retrieval regression gate — the same command CI runs

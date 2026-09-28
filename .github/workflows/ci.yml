@@ -153,6 +153,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=moderate
+
       - name: TypeScript type-check
         run: npx tsc --noEmit
 

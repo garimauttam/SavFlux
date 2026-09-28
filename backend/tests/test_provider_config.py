@@ -449,15 +449,21 @@ def test_free_providers_never_use_paid_embeddings():
 
     original_settings = llm_factory._settings
     original_require = llm_factory._require_key
+    from app.services import model_service
+    original_active_provider = model_service.active_provider
+    original_provider_api_key = model_service.provider_api_key
 
     def fail_if_a_key_is_required(name, value):
         raise AssertionError(f"{name} was required on a free provider")
 
     try:
         llm_factory._require_key = fail_if_a_key_is_required
+        from app.services import model_service
         for provider in ("ollama", "deepseek", "openrouter"):
             calls.clear()
             llm_factory._settings = lambda p=provider: Settings(llm_provider=p)
+            model_service.active_provider = lambda p=provider: p
+            model_service.provider_api_key = lambda _provider=None: ""
             llm_factory.get_embedding_fn.cache_clear()
             llm_factory.get_embedding_fn()
             assert "huggingface" in calls, (
@@ -466,6 +472,8 @@ def test_free_providers_never_use_paid_embeddings():
     finally:
         llm_factory._settings = original_settings
         llm_factory._require_key = original_require
+        model_service.active_provider = original_active_provider
+        model_service.provider_api_key = original_provider_api_key
         llm_factory.get_embedding_fn.cache_clear()
         sys.modules.pop("langchain_huggingface", None)
 

@@ -219,13 +219,12 @@ class Settings(BaseSettings):
     langchain_api_key: Optional[str] = None           # from smith.langchain.com
     langchain_project: str = "savflux"               # project name in LangSmith UI
 
-    # --- Authentication ---
-    # Optional operator-managed owner key. When unset, a random key is generated
-    # and stored with mode 0600 in the data directory on first startup. The API
-    # is never remotely open; only localhost remains usable before a key exists.
-    # For hosted deployments, set API_KEY via the platform's secret manager.
-    # Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"
-    api_key: Optional[str] = None
+    # --- Supabase Authentication ---
+    # Browser sign-in uses Supabase Auth (Google OAuth and email/password).
+    # The backend validates each access token against Supabase Auth before any
+    # private API request and scopes persisted data to the verified user UUID.
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
 
     # --- App ---
     # PORT: Railway injects the PORT env var and routes external traffic to it.

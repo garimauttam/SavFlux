@@ -32,6 +32,7 @@ from pydantic import BaseModel, field_validator
 from pydantic_core import PydanticCustomError
 
 from app.api.deps import require_api_key
+from app.core.paths import data_dir
 from app.limiter import limiter
 from app.services.review_agent import stream_code_review, stream_fast_code_review
 from app.services.stream_protocol import is_protocol_token
@@ -75,7 +76,7 @@ def _get_allowed_roots() -> list[Path]:
     # startswith() check and the validator returns a 422.
     tmp_dir = Path(tempfile.gettempdir())
     roots = [
-        Path(s.chroma_persist_directory).resolve(),
+        data_dir().resolve(),
         tmp_dir.resolve(),   # resolved: /private/var/folders/.../T  (live paths)
         tmp_dir,             # unresolved: /var/folders/.../T        (post-rmtree paths)
         Path("/tmp").resolve(),  # resolved: /private/tmp            (mkdtemp, live)

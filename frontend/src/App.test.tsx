@@ -12,6 +12,16 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+// Auth is mocked; route reachability tests do not need a real Supabase project.
+const { supabaseAuth } = vi.hoisted(() => ({
+  supabaseAuth: {
+    getSession: vi.fn(),
+    onAuthStateChange: vi.fn(() => ({ data: { subscription: { unsubscribe: vi.fn() } } })),
+    signOut: vi.fn(),
+  },
+}));
+vi.mock("./lib/supabase", () => ({ supabase: { auth: supabaseAuth }, supabaseAuthConfigured: true }));
+
 // react-force-graph-2d needs a canvas; the graph's own behaviour is not what
 // this test is about, only that the destination mounts.
 vi.mock("react-force-graph-2d", () => ({ default: () => null }));
@@ -20,7 +30,10 @@ import App from "./App";
 import { TABS } from "./navigation";
 
 beforeEach(() => {
-  window.sessionStorage.setItem("savflux:ownerKey", "test-owner-key");
+  supabaseAuth.getSession.mockResolvedValue({
+    data: { session: { access_token: "app-test-token", user: { id: "test-user" } } },
+    error: null,
+  });
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {

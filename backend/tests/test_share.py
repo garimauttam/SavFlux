@@ -11,7 +11,19 @@ def _isolated_storage(isolated_data_dir):
     return isolated_data_dir
 
 
-def test_share_crud(_isolated_storage):
+@pytest.fixture()
+def _share_owner(_isolated_storage):
+    """Service-level CRUD runs as the authenticated owner of its private share."""
+    from app.core.tenant import reset_current_user_id, set_current_user_id
+
+    token = set_current_user_id("test-share-owner")
+    try:
+        yield
+    finally:
+        reset_current_user_id(token)
+
+
+def test_share_crud(_isolated_storage, _share_owner):
     from app.services.share_service import (
         create_share, get_share, list_shares, delete_share,
     )

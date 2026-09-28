@@ -11,7 +11,6 @@ It should NOT contain any business logic.
 """
 
 import asyncio
-import hmac
 import logging
 import os
 import time
@@ -36,6 +35,7 @@ except Exception:
     pass
 
 from fastapi import FastAPI, Request
+from app.core.auth_middleware import SupabaseAuthMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
@@ -113,35 +113,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"BM25 warmup skipped: {e}")
 
-    # Establish the single owner's credential before the API accepts traffic.
-    # A supplied environment API_KEY takes precedence and is never copied to disk.
-    # When no environment key exists, generate a random owner key once in the
-    # configured data directory and print it once so the local operator can sign in.
-    if not (settings.api_key or "").strip():
-        from app.services.owner_key import load_or_create_owner_key, read_stored_key
-        owner_key, created = load_or_create_owner_key()
-        if created:
-            if read_stored_key():
-                logger.warning(
-                    "SavFlux first-run owner key (copy it now; it will not be shown again): %s",
-                    owner_key,
-                )
-            else:
-                logger.error(
-                    "Could not persist the SavFlux owner key. Set API_KEY in the environment "
-                    "and configure a persistent data directory before exposing this instance."
-                )
+    if not settings.supabase_url or not settings.supabase_anon_key:
+        logger.error(
+            "Supabase Auth is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY; "
+            "private API routes will fail closed until then."
+        )
 
-    # Do not block socket binding on model downloads or a large BM25 rebuild.
-    # Requests can arrive immediately and pay the warmup cost only if needed.
-    warmup_tasks = [asyncio.create_task(warm_models()), asyncio.create_task(warm_bm25())]
+    # Model weights are process-wide, but user indexes are isolated and warmed
+    # on first use inside that user's authenticated request context.
+    warmup_tasks = [asyncio.create_task(warm_models())]
 
-    # ── P1 #6 File watcher — background incremental re-index ─────────────────
-    try:
-        from app.services.watcher_service import start_watcher_background
-        watcher_task = asyncio.create_task(start_watcher_background())
-    except Exception:
-        watcher_task = None
+    # The old process-wide watcher has no user identity and therefore must not
+    # read or index a shared directory in multi-account mode. User-owned source
+    # updates remain explicit through the authenticated ingest endpoints.
+    watcher_task = None
 
     yield   # ← server is live and handling requests here
 
@@ -218,43 +203,9 @@ async def analytics_middleware(request: Request, call_next):
     return response
 
 
-# ── API authentication ─────────────────────────────────────────────────────────
-# Route-level dependencies are retained as defence in depth and for API docs,
-# but this gate also covers endpoints added later without an auth dependency.
-# The only public API surface is a capability-based share URL; the owner key is
-# deliberately not required to view a share that its owner explicitly created.
-@app.middleware("http")
-async def authenticate_api_requests(request: Request, call_next):
-    path = request.url.path
-    if not path.startswith("/api/v1/") or request.method == "OPTIONS":
-        return await call_next(request)
-
-    # The sign-in check validates the key in its route dependency. Public share
-    # links are intentionally capability URLs (share IDs are unguessable).
-    public_session_check = path == "/api/v1/auth/session" and request.method == "POST"
-    public_share = path.startswith("/api/v1/share/") and request.method == "GET"
-    if public_session_check or public_share:
-        return await call_next(request)
-
-    from app.services.owner_key import effective_owner_key
-    expected = effective_owner_key()
-    provided = request.headers.get("X-API-Key", "")
-    if not expected:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "detail": (
-                    "SavFlux owner authentication is not configured. Set API_KEY, "
-                    "or restart with a writable persistent data directory."
-                )
-            },
-        )
-    if not hmac.compare_digest(provided, expected):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "SavFlux sign-in required. Enter the instance owner key."},
-        )
-    return await call_next(request)
+# Supabase identity is verified before any private API route; CORS is registered
+# afterwards so even authentication errors include the proper browser headers.
+app.add_middleware(SupabaseAuthMiddleware)
 
 
 # ── CORS ───────────────────────────────────────────────────────────────────────
