@@ -64,6 +64,7 @@ describe("usePublicIngest", () => {
     const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
     expect(url).toContain("/api/v1/ingest/github");
     expect(JSON.parse(String(init.body)).repo_url).toBe("https://github.com/pallets/click");
+    expect(JSON.parse(String(init.body)).branch).toBe("");
     await waitFor(() => expect(onIndexed).toHaveBeenCalledTimes(1));
     expect(result.current.error).toBeNull();
     expect(result.current.ingesting).toBeNull();
@@ -81,6 +82,21 @@ describe("usePublicIngest", () => {
 
     const init = fetchSpy.mock.calls[0][1] as RequestInit;
     expect(JSON.parse(String(init.body)).repo_url).toBe("https://github.com/pallets/click");
+    expect(JSON.parse(String(init.body)).branch).toBe("");
+  });
+
+  it("forwards the selected remote branch rather than silently indexing the default", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      sse([{ step: "complete", status: "success" }]),
+    );
+    const { result } = renderHook(() => usePublicIngest(() => {}));
+    await act(async () => {
+      await result.current.ingestUrl("https://github.com/owner/repo", " feature/auth ");
+    });
+    const init = fetchSpy.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toEqual({
+      repo_url: "https://github.com/owner/repo", branch: "feature/auth",
+    });
   });
 
   // The silent-failure regression.
@@ -123,10 +139,9 @@ describe("usePublicIngest", () => {
       await result.current.ingestUrl("https://github.com/pallets/click");
     });
 
-    // An unfinished stream is not a failure we can describe, so it is neither
-    // an error nor a claim of success.
-    expect(onIndexed).toHaveBeenCalledTimes(1);
-    expect(result.current.error).toBeNull();
+    // Do not advertise a selected branch as indexed after an interrupted job.
+    expect(onIndexed).not.toHaveBeenCalled();
+    expect(result.current.error).toMatch(/did not report success/);
   });
 
   it("reports an HTTP failure before the stream opens", async () => {

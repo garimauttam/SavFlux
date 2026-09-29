@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ArrowLeft, ArrowRight, Loader2, LockKeyhole, Mail, ShieldCheck } from "lucide-react";
+import { AuthUserContext } from "../lib/authUser";
 import { apiUrl } from "../api";
 import { supabase, supabaseAuthConfigured } from "../lib/supabase";
 
@@ -15,81 +16,130 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
-  const verifyBackendSession = useCallback(async (accessToken: string) => {
+  const verified = useRef<{ token: string; userId: string } | null>(null);
+  const pending = useRef<{ token: string; userId: string } | null>(null);
+  const generation = useRef(0);
+  const authRevision = useRef(0);
+  const [workspaceUserId, setWorkspaceUserId] = useState("");
+
+  const resetSession = useCallback((next: GateState) => {
+    generation.current += 1;
+    verified.current = null;
+    pending.current = null;
+    setWorkspaceUserId("");
+    setState(next);
+  }, []);
+
+  const verifyBackendSession = useCallback(async (accessToken: string, userId: string) => {
+    // SIGNED_IN can fire on tab focus, not just login. Rechecking an unchanged
+    // session must not unmount Workspace (and lose its navigation/drafts/jobs).
+    if (verified.current?.token === accessToken && verified.current.userId === userId) return;
+    if (pending.current?.token === accessToken && pending.current.userId === userId) return;
+    const sameUser = verified.current?.userId === userId;
+    const requestId = ++generation.current;
+    pending.current = { token: accessToken, userId };
+    if (!sameUser) {
+      verified.current = null;
+      setWorkspaceUserId("");
+      setState("checking");
+    }
+
     try {
       const response = await fetch(apiUrl("/api/v1/auth/session"), {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
+      if (requestId !== generation.current) return;
       if (response.ok) {
+        verified.current = { token: accessToken, userId };
+        setWorkspaceUserId(userId);
         setState("signed-in");
         setError("");
         return;
       }
       const payload = await response.json().catch(() => ({}));
-      setState("unavailable");
+      if (requestId !== generation.current) return;
+      // Invalid/revoked sessions fail closed. A temporary server failure on a
+      // refresh may keep the UI, but APIs still enforce auth on every request.
+      if (!sameUser || response.status === 401 || response.status === 403) resetSession("unavailable");
       setError(typeof payload?.detail === "string" ? payload.detail : `SavFlux could not verify your account (HTTP ${response.status}).`);
     } catch {
-      setState("unavailable");
+      if (requestId !== generation.current) return;
+      if (!sameUser) resetSession("unavailable");
       setError("Could not reach the SavFlux server. Check the connection and retry.");
+    } finally {
+      if (requestId === generation.current) pending.current = null;
     }
-  }, []);
+  }, [resetSession]);
 
   const check = useCallback(async () => {
     if (!supabase) {
-      setState("unavailable");
+      resetSession("unavailable");
       setError("");
       return;
     }
-    setState("checking");
-    const { data, error: sessionError } = await supabase.auth.getSession();
-    if (sessionError) {
-      setState("signed-out");
-      setError("Your saved sign-in could not be read. Please sign in again.");
-      return;
+    // Auth events take precedence over an older getSession read.
+    const revision = authRevision.current;
+    try {
+      const { data, error: sessionError } = await supabase.auth.getSession();
+      if (revision !== authRevision.current) return;
+      if (sessionError) {
+        resetSession("signed-out");
+        setError("Your saved sign-in could not be read. Please sign in again.");
+        return;
+      }
+      if (!data.session) {
+        resetSession("signed-out");
+        return;
+      }
+      await verifyBackendSession(data.session.access_token, data.session.user.id);
+    } catch {
+      if (revision !== authRevision.current) return;
+      resetSession("unavailable");
+      setError("Your saved sign-in could not be read. Please retry.");
     }
-    if (!data.session) {
-      setState("signed-out");
-      return;
-    }
-    await verifyBackendSession(data.session.access_token);
-  }, [verifyBackendSession]);
+  }, [resetSession, verifyBackendSession]);
 
   useEffect(() => {
     if (!supabase) return;
     void check();
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      setError("");
-      setNotice("");
+      authRevision.current += 1;
       if (event === "PASSWORD_RECOVERY") {
+        resetSession("signed-out");
+        setError("");
+        setNotice("");
         setMode("update-password");
-        setState("signed-out");
         return;
       }
       if (session?.access_token) {
-        setState("checking");
-        void verifyBackendSession(session.access_token);
+        void verifyBackendSession(session.access_token, session.user.id);
       } else {
-        setState("signed-out");
+        resetSession("signed-out");
       }
     });
     const onSignOut = () => {
+      authRevision.current += 1;
+      resetSession("signed-out");
       void supabase?.auth.signOut();
       setPassword("");
       setError("");
       setNotice("");
       setMode("signin");
-      setState("signed-out");
     };
     window.addEventListener("savflux:signout", onSignOut);
     return () => {
+      authRevision.current += 1;
+      generation.current += 1;
+      pending.current = null;
       subscription.unsubscribe();
       window.removeEventListener("savflux:signout", onSignOut);
     };
-  }, [check, verifyBackendSession]);
+  }, [check, resetSession, verifyBackendSession]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!supabase || busy) return;
+    const revision = authRevision.current;
     setBusy(true);
     setError("");
     setNotice("");
@@ -105,7 +155,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         if (updateError) throw updateError;
         setNotice("Your password has been updated.");
         const { data } = await supabase.auth.getSession();
-        if (data.session?.access_token) await verifyBackendSession(data.session.access_token);
+        if (revision === authRevision.current && data.session?.access_token) await verifyBackendSession(data.session.access_token, data.session.user.id);
       } else if (mode === "signup") {
         const { data, error: signupError } = await supabase.auth.signUp({
           email: email.trim(),
@@ -113,7 +163,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
           options: { emailRedirectTo: window.location.origin },
         });
         if (signupError) throw signupError;
-        if (data.session?.access_token) await verifyBackendSession(data.session.access_token);
+        if (revision === authRevision.current && data.session?.access_token) await verifyBackendSession(data.session.access_token, data.session.user.id);
         else setNotice("Check your email to verify your account, then sign in.");
       } else {
         const { data, error: signInError } = await supabase.auth.signInWithPassword({
@@ -121,7 +171,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
           password,
         });
         if (signInError) throw signInError;
-        if (data.session?.access_token) await verifyBackendSession(data.session.access_token);
+        if (revision === authRevision.current && data.session?.access_token) await verifyBackendSession(data.session.access_token, data.session.user.id);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sign-in failed. Please try again.");
@@ -148,7 +198,14 @@ export function AuthGate({ children }: { children: ReactNode }) {
     }
   }
 
-  if (state === "signed-in") return <>{children}</>;
+  if (state === "signed-in") return (
+    <AuthUserContext.Provider value={workspaceUserId} key={workspaceUserId}>
+      {error && <div role="alert" className="sf-raised border-b sf-line px-4 py-2 text-sm">
+        {error} <button type="button" className="underline" onClick={() => void check()}>Retry connection</button>
+      </div>}
+      {children}
+    </AuthUserContext.Provider>
+  );
 
   return (
     <main className="flex min-h-full items-center justify-center bg-[var(--sf-canvas)] px-5 py-12 text-[var(--sf-text)]">

@@ -99,3 +99,25 @@ describe("useMultiReview — a refused request is described, not dumped", () => 
     expect(message).toBe("Server error 500");
   });
 });
+
+it("keeps line findings scoped to source IDs and does not mistake them for completion", async () => {
+  const id = FILES[0].source;
+  const event = (meta: object) => `__STATUS__${JSON.stringify(meta)}__STATUS_END__\n`;
+  const annotation = { step: "finding", id, origin: "static", rule_id: "tls", line: 2, title: "Verify TLS", message: "A reason", remediation: "A fix", severity: "high" };
+  fetchMock.mockResolvedValue(new Response(
+    event({ step: "analysis", id, content_sha256: "hash", finding_count: 1 }) +
+    event(annotation) + event(annotation) + // duplicate events are idempotent
+    event({ ...annotation, id: "other/source.py" }) +
+    `__SECTION_START__${JSON.stringify({ id, file_name: "a.py" })}__SECTION_END__\n` +
+    'Static fallback report\n' +
+    event({ step: "complete", id, tier: "static", fallback_reason: "model call timed out", message: "Static fallback" })
+  ));
+  const { result } = renderHook(() => useMultiReview());
+  await act(async () => { await result.current.reviewFiles(FILES); });
+  expect(result.current.sections).toHaveLength(1);
+  expect(result.current.sections[0].findings).toHaveLength(1);
+  expect(result.current.sections[0].analysis?.contentHash).toBe("hash");
+  expect(result.current.sections[0].fallbackReason).toBe("model call timed out");
+  expect(result.current.llmReviewedCount).toBe(0);
+  expect(result.current.agentSteps.some(s => s.step === "finding")).toBe(false);
+});

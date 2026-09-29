@@ -24,8 +24,8 @@ describe("resolveLanguage", () => {
     expect(resolveLanguage("python")).toBe("python");
     expect(resolveLanguage("py")).toBe("python");
     expect(resolveLanguage("ts")).toBe("typescript");
-    expect(resolveLanguage("TSX")).toBe("typescript");
-    expect(resolveLanguage("jsx")).toBe("javascript");
+    expect(resolveLanguage("TSX")).toBe("tsx");
+    expect(resolveLanguage("jsx")).toBe("jsx");
     expect(resolveLanguage("sh")).toBe("bash");
     expect(resolveLanguage("shell-session")).toBe("bash");
     expect(resolveLanguage("dockerfile")).toBe("docker");
@@ -44,7 +44,15 @@ describe("resolveLanguage", () => {
   });
 
   it("resolves to nothing rather than to a guess", () => {
-    for (const raw of ["fortran", "cobol", "text", "", "   ", null, undefined]) {
+    for (const raw of [
+      "fortran",
+      "cobol",
+      "text",
+      "",
+      "   ",
+      null,
+      undefined,
+    ]) {
       expect(resolveLanguage(raw), String(raw)).toBeNull();
     }
     // `text` is in the list on purpose: a bare ``` fence for prose is common in review
@@ -58,7 +66,9 @@ describe("resolveLanguage", () => {
     for (const name of HIGHLIGHTABLE_LANGUAGES) {
       const resolved = resolveLanguage(name);
       expect(resolved, name).not.toBeNull();
-      expect(HIGHLIGHTABLE_LANGUAGES, `${name} -> ${resolved}`).toContain(resolved as string);
+      expect(HIGHLIGHTABLE_LANGUAGES, `${name} -> ${resolved}`).toContain(
+        resolved as string,
+      );
     }
     expect(HIGHLIGHTABLE_LANGUAGES.length).toBeGreaterThan(20);
   });
@@ -66,8 +76,12 @@ describe("resolveLanguage", () => {
 
 describe("CodeHighlight", () => {
   it("highlights a language it knows", () => {
-    const code = ["def verify(token):", "    return token == SECRET", ""].join("\n");
-    const { container } = render(<CodeHighlight language="python">{code}</CodeHighlight>);
+    const code = ["def verify(token):", "    return token == SECRET", ""].join(
+      "\n",
+    );
+    const { container } = render(
+      <CodeHighlight language="python">{code}</CodeHighlight>,
+    );
     // `token` is refractor's class for a grammar span. Asserting the class rather than
     // colours keeps this about "a grammar ran"; if highlighting silently stops working,
     // every fence would still look like a code block and no one would notice.
@@ -76,8 +90,10 @@ describe("CodeHighlight", () => {
   });
 
   it("shows a language it does not know, uncoloured but intact", () => {
-    const code = ["module Main where", "  main = putStrLn \"hi\"", ""].join("\n");
-    const { container } = render(<CodeHighlight language="haskell-not-registered">{code}</CodeHighlight>);
+    const code = ["module Main where", '  main = putStrLn "hi"', ""].join("\n");
+    const { container } = render(
+      <CodeHighlight language="haskell-not-registered">{code}</CodeHighlight>,
+    );
     expect(container.querySelectorAll(".token").length).toBe(0);
     expect(container.querySelector("code")?.textContent).toBe(code);
   });
@@ -85,7 +101,9 @@ describe("CodeHighlight", () => {
   it("does not lose indentation or trailing blank lines in either path", () => {
     const code = "  indented:\n    nested: 1\n";
     for (const language of ["yaml", "fortran"]) {
-      const { container, unmount } = render(<CodeHighlight language={language}>{code}</CodeHighlight>);
+      const { container, unmount } = render(
+        <CodeHighlight language={language}>{code}</CodeHighlight>,
+      );
       expect(container.textContent, language).toContain("  indented:");
       expect(container.textContent, language).toContain("    nested: 1");
       unmount();
@@ -96,7 +114,11 @@ describe("CodeHighlight", () => {
     // The fence chrome (border radius, padding overrides) is decided by the panels, and
     // an unlisted language must not silently land in a differently sized box.
     const { container } = render(
-      <CodeHighlight language="fortran" className="rounded-lg" customStyle={{ margin: 0, fontSize: "11px" }}>
+      <CodeHighlight
+        language="fortran"
+        className="rounded-lg"
+        customStyle={{ margin: 0, fontSize: "11px" }}
+      >
         x
       </CodeHighlight>,
     );

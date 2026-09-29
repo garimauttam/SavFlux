@@ -1,3 +1,6 @@
+/* Self-hosted: no font request or code leaves the application for typography. */
+@import "@fontsource/geist-mono/latin-400.css";
+
 /* Tailwind base styles */
 @tailwind base;
 @tailwind components;
@@ -12,7 +15,7 @@
 
 html, body, #root {
   height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-family: var(--sf-font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -28,6 +31,10 @@ html, body, #root {
  * class surviving a Tailwind purge.
  */
 :root {
+  --sf-font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --sf-font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sf-code-size: 13px;
+  --sf-code-leading: 22px;
   --sf-canvas: #08080a;
   --sf-surface: #0d0d10;
   --sf-raised: #141418;
@@ -106,6 +113,7 @@ html:not(.dark) ::-webkit-scrollbar-thumb:hover {
 
 /* ── Shell primitives ─────────────────────────────────────────────────────── */
 
+.sf-overlay { background: var(--sf-overlay); }
 .sf-surface { background: var(--sf-surface); }
 .sf-raised { background: var(--sf-raised); }
 .sf-line { border-color: var(--sf-line); }
@@ -113,7 +121,8 @@ html:not(.dark) ::-webkit-scrollbar-thumb:hover {
 .sf-dim { color: var(--sf-text-dim); }
 .sf-mute { color: var(--sf-text-mute); }
 .sf-accent { color: var(--sf-accent); }
-.sf-mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace; }
+.sf-mono { font-family: var(--sf-font-mono); }
+.sf-code-typography { font-family: var(--sf-font-mono); font-size: var(--sf-code-size); line-height: var(--sf-code-leading); }
 
 /* Icon buttons in the rail and the top bar. One class so 40+ controls share
  * one hover, one focus ring and one size. */
@@ -310,7 +319,6 @@ html:not(.dark) :is(
   .bg-emerald-500, .bg-emerald-600,
   .bg-green-600,
   .bg-indigo-600,
-  .bg-pink-500,
   .bg-purple-600,
   .bg-red-500,
   .bg-violet-500, .bg-violet-600
@@ -321,7 +329,6 @@ html:not(.dark) :is(
   .bg-emerald-500, .bg-emerald-600,
   .bg-green-600,
   .bg-indigo-600,
-  .bg-pink-500,
   .bg-purple-600,
   .bg-red-500,
   .bg-violet-500, .bg-violet-600
@@ -352,4 +359,131 @@ html:not(.dark) :is(
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* Panels remain mounted while animating; hidden panels cannot receive focus. */
+.sf-collapse { transition: width 220ms ease, opacity 180ms ease, visibility 220ms; overflow: hidden; }
+@media (prefers-reduced-motion: reduce) {
+  .sf-collapse, [data-testid="activity-rail"] { transition: none !important; }
+}
+.sf-review-comment { border: 1px solid var(--sf-accent-line); border-left: 3px solid var(--sf-accent); background: var(--sf-surface); }
+
+/* Keep the header usable when DevTools or another panel narrows the workspace. */
+.sf-topbar .sf-scope-control { min-width: 0; max-width: 26%; }
+.sf-topbar .sf-scope-control > button { max-width: 100%; }
+.sf-topbar .sf-model-control { min-width: 70px; max-width: 230px; }
+.sf-topbar .sf-model-control > button { max-width: 100%; }
+@media (max-width: 900px) { .sf-topbar .sf-topbar-search { display: none; } }
+@media (max-width: 700px) {
+  .sf-topbar { gap: 4px; padding-inline: 8px; }
+  .sf-topbar .sf-scope-control { max-width: 24%; }
+  .sf-topbar .sf-btn { padding-inline: 6px; }
+  .sf-topbar .sf-overlay { position: fixed; top: 52px; left: 68px; right: 8px; width: auto; max-height: calc(100dvh - 70px); overflow-y: auto; }
+}
+.sf-review-workspace { container-type: inline-size; }
+@container (max-width: 900px) {
+  .sf-review-notes { position: absolute; right: 0; top: 0; bottom: 0; z-index: 20; box-shadow: -12px 0 32px rgba(0,0,0,.25); }
+  .sf-review-notes[aria-hidden="false"] { width: min(360px, 90cqw) !important; }
+}
+@container (max-width: 600px) {
+  .sf-review-files { position: absolute; left: 0; top: 0; bottom: 0; z-index: 20; box-shadow: 12px 0 32px rgba(0,0,0,.25); }
+}
+
+/* Review source and proposals: shared semantic colors in both themes. */
+:root {
+  --review-code: #d4d4d4;
+  --review-keyword: #c586c0;
+  --review-string: #ce9178;
+  --review-function: #dcdcaa;
+  --review-number: #b5cea8;
+  --review-type: #4ec9b0;
+  --review-comment: #85a775;
+  --review-added: rgba(46,160,67,.15);
+  --review-removed: rgba(248,81,73,.14);
+  --review-issue: rgba(210,153,34,.10);
+}
+html:not(.dark) {
+  --review-code: #24292f;
+  --review-keyword: #cf222e;
+  --review-string: #0a3069;
+  --review-function: #8250df;
+  --review-number: #0550ae;
+  --review-type: #116329;
+  --review-comment: #57606a;
+  --review-added: #dafbe1;
+  --review-removed: #ffebe9;
+  --review-issue: #fff8c5;
+}
+.sf-review-folder, .sf-review-tree-file { display: flex; align-items: center; gap: 7px; width: 100%; min-height: 30px; padding: 5px 9px; color: var(--sf-text-dim); font-size: 12px; text-align: left; border-left: 2px solid transparent; }
+.sf-review-folder:hover, .sf-review-tree-file:hover { background: var(--sf-raised); color: var(--sf-text); }
+.sf-review-tree-file.is-current { background: var(--sf-accent-soft); border-left-color: var(--sf-accent); color: var(--sf-text); }
+.sf-review-folder svg { flex-shrink: 0; }
+.sf-review-file-dot { width: 5px; height: 5px; flex-shrink: 0; border-radius: 50%; background: var(--sf-text-mute); }
+.sf-review-file-dot.is-done { background: var(--sf-good); }
+.sf-review-file-dot.is-warning { background: var(--sf-warn); }
+.sf-review-scroll { background: var(--sf-canvas); overflow-anchor: auto; }
+.sf-file-anchor { scroll-margin-top: 12px; margin-bottom: 18px; }
+.sf-file-review { border: 1px solid var(--sf-line-strong); border-radius: 8px; background: var(--sf-surface); }
+.sf-file-review.is-current { border-color: var(--sf-accent-line); }
+.sf-file-header { display: flex; align-items: center; gap: 8px; min-height: 43px; padding: 6px 10px; background: var(--sf-raised); border-radius: 8px 8px 0 0; border-bottom: 1px solid var(--sf-line); }
+.sf-file-meta { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; padding: 7px 12px; font-size: 10px; color: var(--sf-text-dim); border-bottom: 1px solid var(--sf-line); }
+.sf-file-meta button { color: var(--sf-accent); }
+.sf-file-placeholder { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 140px; padding: 24px; font-size: 12px; }
+.sf-review-warning { display: flex; gap: 8px; font-size: 12px; padding: 12px; background: var(--review-issue); color: var(--sf-text); border-bottom: 1px solid var(--sf-line); }
+.sf-review-warning svg { flex-shrink: 0; }
+.sf-file-code { padding-block: 8px; }
+.sf-review-syntax { color: var(--review-code); font-family: var(--sf-font-mono); font-size: var(--sf-code-size); line-height: var(--sf-code-leading); }
+.sf-code-line { display: flex; align-items: stretch; min-height: var(--sf-code-leading); line-height: var(--sf-code-leading); font-family: var(--sf-font-mono); font-size: var(--sf-code-size); font-variant-ligatures: none; }
+.sf-code-line > code { font: inherit; display: block; flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; padding-right: 12px; }
+/* Highlight renderer keeps a newline in each row; pre-line layout must not add a second visual line. */
+.sf-code-line > code > span { white-space: pre-wrap; }
+.sf-line-number { flex: 0 0 48px; padding-right: 12px; text-align: right; color: var(--sf-text-dim); opacity: .7; user-select: none; font-variant-numeric: tabular-nums; }
+.sf-code-line.is-issue { background: var(--review-issue); box-shadow: inset 3px 0 var(--sf-warn); }
+.sf-code-line.is-focused { box-shadow: inset 3px 0 var(--sf-accent); background: var(--sf-accent-soft); }
+.sf-code-line.is-added { background: var(--review-added); }
+.sf-code-line.is-removed { background: var(--review-removed); }
+.sf-diff-sign { flex: 0 0 22px; user-select: none; color: var(--sf-text-dim); }
+.sf-context-gap { display: block; width: 100%; text-align: left; padding: 7px 12px; margin: 5px 0; color: var(--sf-accent); background: var(--sf-accent-soft); font-size: 11px; }
+.sf-context-gap:hover { box-shadow: inset 3px 0 var(--sf-accent); }
+.sf-review-syntax .token:is(.comment, .prolog, .doctype, .cdata) { color: var(--review-comment); }
+.sf-review-syntax .token:is(.keyword, .tag, .boolean, .atrule) { color: var(--review-keyword); }
+.sf-review-syntax .token:is(.string, .char, .attr-value, .regex) { color: var(--review-string); }
+.sf-review-syntax .token:is(.function, .function-variable) { color: var(--review-function); }
+.sf-review-syntax .token:is(.number, .constant) { color: var(--review-number); }
+.sf-review-syntax .token:is(.class-name, .builtin, .selector, .attr-name) { color: var(--review-type); }
+.sf-review-syntax .token:is(.punctuation, .operator) { color: var(--review-code); }
+.sf-fix-container { border: 1px solid var(--sf-line-strong); border-radius: 6px; overflow: hidden; }
+/* Comments are interleaved with Prism code rows: do not inherit preformatted
+   whitespace or code typography. Apply to the portal too for matching layout. */
+.sf-review-comment, .sf-fix-container, .sf-fix-dialog {
+  font-family: var(--sf-font-sans);
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+  min-width: 0;
+}
+.sf-fix-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 12px; background: var(--sf-raised); color: var(--sf-text); font-size: 12px; font-weight: 500; text-align: left; }
+.sf-fix-toggle > svg { color: var(--sf-accent); }
+.sf-fix-toggle:hover { background: var(--sf-accent-soft); }
+.sf-fix-expand { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows 180ms ease, opacity 180ms ease; }
+.sf-fix-expand.is-open { grid-template-rows: 1fr; opacity: 1; }
+.sf-fix-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--sf-line); background: var(--sf-raised); }
+.sf-fix-toolbar .sf-btn { font-size: 11px; }
+.sf-fix-toolbar [aria-pressed="true"] { background: var(--sf-accent-soft); color: var(--sf-accent); }
+.sf-fix-code { overflow: auto; max-height: 400px; padding-block: 8px; background: var(--sf-surface); }
+.sf-split-diff { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.sf-split-diff > section + section { border-left: 1px solid var(--sf-line-strong); }
+.sf-diff-heading { color: var(--sf-text-dim); font: 11px/2.5 -apple-system, BlinkMacSystemFont, sans-serif; padding-inline: 12px; border-bottom: 1px solid var(--sf-line); }
+.sf-fix-backdrop { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(0,0,0,.65); backdrop-filter: blur(4px); animation: sf-fix-in 150ms ease-out; }
+.sf-fix-dialog { width: min(1180px, 100%); max-height: 90dvh; display: flex; flex-direction: column; overflow: auto; border: 1px solid var(--sf-line-strong); border-radius: 12px; background: var(--sf-surface); box-shadow: 0 24px 80px rgba(0,0,0,.4); }
+.sf-fix-dialog > .sf-fix-code { max-height: none; min-height: 100px; flex: 1; }
+.sf-fix-dialog > .sf-fix-toolbar { flex-shrink: 0; }
+@keyframes sf-fix-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+@media (max-width: 700px) {
+  .sf-fix-backdrop { padding: 8px; }
+  .sf-fix-dialog { max-height: 95dvh; }
+  .sf-split-diff { grid-template-columns: minmax(0, 1fr); }
+  .sf-split-diff > section + section { border-left: 0; border-top: 1px solid var(--sf-line-strong); }
+  .sf-line-number { flex-basis: 36px; padding-right: 8px; }
+  .sf-file-header > .sf-mute.text-\[10px\] { display: none; }
 }

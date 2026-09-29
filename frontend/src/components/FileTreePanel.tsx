@@ -9,6 +9,8 @@
  *  - Breadcrumb + expand/collapse all, $0 no deps
  */
 
+import type { OnIndexed } from "../lib/repositorySelection";
+
 import { useEffect, useState, useCallback } from "react";
 import { apiFetch } from "../api";
 import { IndexPrompt } from "./IndexPrompt";
@@ -32,7 +34,7 @@ export default function FileTreePanel({
 }: {
   onOpenFile?: (source: string) => void;
   /** Re-read the index after the user indexes from this page. */
-  onIndexed: () => void;
+  onIndexed: OnIndexed;
 }) {
   const [tree, setTree] = useState<TreeNode | null>(null);
   const [flat, setFlat] = useState<TreeNode[]>([]);

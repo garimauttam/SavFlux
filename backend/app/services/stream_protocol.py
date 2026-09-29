@@ -168,7 +168,12 @@ def _dumps(payload: dict) -> str:
     # assert on marker text rather than parsed payloads. Compact JSON would save
     # ~2 bytes per field and break them for no benefit — a client parses this, it
     # does not read it.
-    return json.dumps(payload, ensure_ascii=False)
+    encoded = json.dumps(payload, ensure_ascii=False)
+    # Findings quote arbitrary source code. A literal delimiter inside a JSON
+    # string must not close the enclosing frame; JSON decoding restores it.
+    for marker in (STATUS_OPEN, STATUS_CLOSE, ERROR_OPEN, ERROR_CLOSE, SECTION_OPEN, SECTION_CLOSE):
+        encoded = encoded.replace(marker, "\\u005f" + marker[1:])
+    return encoded
 
 
 def status_event(message: str = "", **fields) -> str:
@@ -203,7 +208,7 @@ def section_event(**fields) -> str:
     is a framing helper rather than a format change: one place spells the
     markers out, and the section protocol cannot drift from the status one.
     """
-    return SECTION_OPEN + json.dumps(fields, ensure_ascii=False) + SECTION_CLOSE + "\n"
+    return SECTION_OPEN + _dumps(fields) + SECTION_CLOSE + "\n"
 
 
 def is_status_marker(chunk: str) -> bool:

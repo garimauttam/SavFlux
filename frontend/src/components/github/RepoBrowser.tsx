@@ -17,6 +17,9 @@
  * usually wrong.
  */
 
+import { readIngestStream } from "../../lib/ingestStream";
+import type { OnIndexed } from "../../lib/repositorySelection";
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
@@ -34,6 +37,7 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
+import { RepositoryIndexForm } from "../RepositoryIndexForm";
 import { repoDisplayName, repoSlugFromUrl } from "../../lib/github";
 import { apiFetch } from "../../api";
 import { apiError } from "../../hooks/useIntegrations";
@@ -47,7 +51,7 @@ interface RepoBrowserProps {
   activeRepoUrl: string | null;
   branch: string;
   onSelectRepo: (url: string | null) => void;
-  onIndexed: () => void;
+  onIndexed: OnIndexed;
   models: ModelStatus | null;
 }
 
@@ -73,7 +77,6 @@ export function RepoBrowser({
   const [ingesting, setIngesting] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ repo: string; message: string } | null>(null);
   const [clearing, setClearing] = useState<string | null>(null);
-  const [localUrl, setLocalUrl] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const connected = Boolean(status?.connected && status?.valid);
@@ -121,37 +124,17 @@ export function RepoBrowser({
           }),
         });
         if (!res.ok) throw new Error(await apiError(res, "Could not start the index"));
-        // The ingest endpoint answers with an SSE stream; read it to completion
-        // so the progress line reflects reality instead of a spinner that
-        // outlives the work.
-        const reader = res.body?.getReader();
-        if (reader) {
-          const decoder = new TextDecoder();
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            for (const line of decoder.decode(value, { stream: true }).split("\n")) {
-              const m = /^data:\s*(.*)$/.exec(line.trim());
-              if (!m) continue;
-              try {
-                const evt = JSON.parse(m[1]);
-                if (evt.message) {
-                  setProgress({
-                    repo: repo.full_name,
-                    message: evt.files_indexed
-                      ? `${evt.message} · ${evt.files_indexed} files`
-                      : evt.message,
-                  });
-                }
-                if (evt.status === "error") throw new Error(evt.message || "Ingest failed");
-              } catch (e) {
-                if (e instanceof Error && e.message !== "Unexpected end of JSON input") throw e;
-              }
-            }
-          }
-        }
-        onIndexed();
-        onSelectRepo(repo.clone_url ?? `https://github.com/${repo.full_name}`);
+        await readIngestStream(res, (event) => {
+          if (!event.message) return;
+          setProgress({
+            repo: repo.full_name,
+            message: event.files_indexed ? `${event.message} · ${event.files_indexed} files` : event.message,
+          });
+        });
+        onIndexed({
+          repoUrl: repo.clone_url ?? `https://github.com/${repo.full_name}`,
+          branch: repoSlugFromUrl(activeRepoUrl)?.toLowerCase() === repo.full_name.toLowerCase() ? branch : "",
+        });
       } catch (e) {
         setError(e instanceof Error ? e.message : "Ingest failed.");
       } finally {
@@ -162,9 +145,8 @@ export function RepoBrowser({
     [activeRepoUrl, branch, ingesting, onIndexed, onSelectRepo],
   );
 
-  const ingestUrl = useCallback(async () => {
-    const url = localUrl.trim();
-    if (!url || ingesting) return;
+  const ingestUrl = useCallback(async (url: string, selectedBranch: string) => {
+    if (!url || ingesting) return false;
     setIngesting(url);
     setError(null);
     setProgress({ repo: url, message: "Cloning…" });
@@ -174,44 +156,27 @@ export function RepoBrowser({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           repo_url: url,
-          branch: repoSlugFromUrl(activeRepoUrl)?.toLowerCase() === repoSlugFromUrl(url)?.toLowerCase() ? branch : "",
+          branch: selectedBranch,
         }),
       });
       if (!res.ok) throw new Error(await apiError(res, "Could not start the index"));
-      const reader = res.body?.getReader();
-      if (reader) {
-        const decoder = new TextDecoder();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          for (const line of decoder.decode(value, { stream: true }).split("\n")) {
-            const m = /^data:\s*(.*)$/.exec(line.trim());
-            if (!m) continue;
-            try {
-              const evt = JSON.parse(m[1]);
-              if (evt.message) {
-                setProgress({
-                  repo: url,
-                  message: evt.files_indexed
-                    ? `${evt.message} · ${evt.files_indexed} files`
-                    : evt.message,
-                });
-              }
-            } catch {
-              /* a non-JSON keep-alive line is not an error worth surfacing */
-            }
-          }
-        }
-      }
-      setLocalUrl("");
-      onIndexed();
+      await readIngestStream(res, (event) => {
+        if (!event.message) return;
+        setProgress({
+          repo: url,
+          message: event.files_indexed ? `${event.message} · ${event.files_indexed} files` : event.message,
+        });
+      });
+      onIndexed({ repoUrl: url, branch: selectedBranch });
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Indexing failed.");
+      return false;
     } finally {
       setIngesting(null);
       setProgress(null);
     }
-  }, [activeRepoUrl, branch, ingesting, localUrl, onIndexed]);
+  }, [ingesting, onIndexed]);
 
   const clearRepo = useCallback(
     async (url: string) => {
@@ -268,6 +233,30 @@ export function RepoBrowser({
             </p>
           </header>
 
+          {error && (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-xl border px-3.5 py-2.5 text-[12.5px]"
+              style={{
+                borderColor: "rgba(248,113,113,0.3)",
+                background: "rgba(248,113,113,0.1)",
+                color: "#fca5a5",
+              }}
+            >
+              <AlertTriangle className="mt-px h-4 w-4 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          {progress && (
+            <div className="flex items-center gap-2.5 rounded-xl border sf-line sf-raised px-3.5 py-2.5 text-[12.5px]">
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin sf-accent" />
+              <span className="sf-text">
+                <span className="sf-mono">{progress.repo}</span> — {progress.message}
+              </span>
+            </div>
+          )}
+
           {!connected ? (
             <div className="rounded-2xl border sf-line sf-surface p-8 text-center">
               <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-purple-500/10 text-purple-300">
@@ -312,30 +301,6 @@ export function RepoBrowser({
                   <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
                 </button>
               </div>
-
-              {error && (
-                <div
-                  role="alert"
-                  className="flex items-start gap-2 rounded-xl border px-3.5 py-2.5 text-[12.5px]"
-                  style={{
-                    borderColor: "rgba(248,113,113,0.3)",
-                    background: "rgba(248,113,113,0.1)",
-                    color: "#fca5a5",
-                  }}
-                >
-                  <AlertTriangle className="mt-px h-4 w-4 shrink-0" />
-                  <span>{error}</span>
-                </div>
-              )}
-
-              {progress && (
-                <div className="flex items-center gap-2.5 rounded-xl border sf-line sf-raised px-3.5 py-2.5 text-[12.5px]">
-                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin sf-accent" />
-                  <span className="sf-text">
-                    <span className="sf-mono">{progress.repo}</span> — {progress.message}
-                  </span>
-                </div>
-              )}
 
               {repos.length === 0 && !loading && (
                 <div className="rounded-2xl border sf-line sf-surface px-6 py-10 text-center">
@@ -480,7 +445,7 @@ export function RepoBrowser({
           {/* No account: a public URL or a folder of files still works. */}
           <section>
             <h2 className="sf-mute mb-2 text-[11px] font-semibold uppercase tracking-[0.08em]">
-              Without an account
+              Without a GitHub connection
             </h2>
             <div className="rounded-xl border sf-line sf-surface p-3.5">
               <p className="sf-mute text-[12px]">
@@ -488,29 +453,7 @@ export function RepoBrowser({
                 GitHub connection.
               </p>
               <div className="mt-3 flex flex-wrap items-center gap-2">
-                <input
-                  value={localUrl}
-                  onChange={(e) => setLocalUrl(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void ingestUrl();
-                  }}
-                  placeholder="https://github.com/owner/repo"
-                  className="sf-input sf-mono min-w-[220px] flex-1"
-                  aria-label="Public repository URL"
-                />
-                <button
-                  type="button"
-                  className="sf-btn sf-btn-primary"
-                  onClick={() => void ingestUrl()}
-                  disabled={!localUrl.trim() || Boolean(ingesting)}
-                >
-                  {ingesting === localUrl.trim() ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Cloud className="h-3.5 w-3.5" />
-                  )}
-                  Index
-                </button>
+                <RepositoryIndexForm busy={!!ingesting} onIndex={ingestUrl} />
                 <button
                   type="button"
                   className="sf-btn sf-btn-secondary"

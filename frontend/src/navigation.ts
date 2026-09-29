@@ -49,6 +49,7 @@ import {
   Terminal,
   Wand2,
   Zap,
+  UserRound,
 } from "lucide-react";
 
 export type Tab =
@@ -61,7 +62,8 @@ export type Tab =
   | "health"
   | "repos"
   | "changes"
-  | "library";
+  | "library"
+  | "profile";
 
 /** Sub-destinations inside the Library panel. */
 export type LibraryTab =
@@ -196,7 +198,15 @@ export const NAV_GROUPS: NavGroup[] = [
       },
     ],
   },
+  {
+    id: "account", label: "Account", items: [{
+      id: "profile", label: "Profile", hint: "Account, connections, models and privacy",
+      Icon: UserRound, color: "text-indigo-400", shortcut: "p",
+    }],
+  },
 ];
+
+
 
 /** Flat view of every destination, in rail order. */
 export const TABS: TabDef[] = NAV_GROUPS.flatMap((g) => g.items);

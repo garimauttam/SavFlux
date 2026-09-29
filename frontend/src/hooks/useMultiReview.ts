@@ -12,6 +12,7 @@
  */
 
 import { useState, useCallback } from "react";
+import { decodeFinding, findingKey, type ReviewFinding, type ReviewAnalysis } from "../lib/reviewFindings";
 import { IndexedFile } from "../types";
 import { apiFetch } from "../api";
 import { isAbortError, useStreamStop } from "../lib/cancel";
@@ -32,6 +33,9 @@ export interface ReviewSection {
   // that never reached a model should not look like one that did.
   tier?: string;
   cached?: boolean;
+  findings?: ReviewFinding[];
+  analysis?: ReviewAnalysis;
+  fallbackReason?: string;
 }
 
 /**
@@ -251,7 +255,7 @@ export function useMultiReview() {
         sectionId: string,
         status: ReviewSection["status"],
         statusMessage?: string,
-        provenance?: { tier?: string; cached?: boolean },
+        provenance?: { tier?: string; cached?: boolean; fallbackReason?: string },
       ) => {
         setState((prev) => ({
           ...prev,
@@ -265,6 +269,7 @@ export function useMultiReview() {
                   // tier must not erase the tier an earlier token reported.
                   tier: provenance?.tier ?? s.tier,
                   cached: provenance?.cached ?? s.cached,
+                  fallbackReason: provenance?.fallbackReason ?? s.fallbackReason,
                 }
               : s
           ),
@@ -320,12 +325,27 @@ export function useMultiReview() {
           if (segment.kind !== "status") continue;
 
           const meta: StatusMeta = decodeStatus(segment.payload);
+          if (meta.step === "analysis" || meta.step === "finding") {
+            const finding = meta.step === "finding" ? decodeFinding(meta) : null;
+            setState(prev => ({ ...prev, sections: prev.sections.map(section => {
+              if (section.id !== meta.id) return section;
+              if (meta.step === "analysis") return { ...section, findings: [], analysis: {
+                contentHash: typeof meta.content_sha256 === "string" ? meta.content_sha256 : "",
+                parseError: typeof meta.parse_error === "string" ? meta.parse_error : "",
+                findingCount: typeof meta.finding_count === "number" ? meta.finding_count : 0,
+              } };
+              if (!finding || section.findings?.some(f => findingKey(f) === findingKey(finding))) return section;
+              return { ...section, findings: [...(section.findings ?? []), finding] };
+            }) }));
+            continue;
+          }
           const message = typeof meta.message === "string" ? meta.message : "";
           const statusId = meta.id ?? currentSectionId;
           if (statusId) {
             updateSectionStatus(statusId, sectionStatusFromMeta(meta, message), message, {
               tier: typeof meta.tier === "string" ? meta.tier : undefined,
               cached: meta.cached === true ? true : undefined,
+              fallbackReason: typeof meta.fallback_reason === "string" ? meta.fallback_reason : undefined,
             });
           }
 
@@ -440,13 +460,14 @@ export function useMultiReview() {
     content.includes("deterministic static analysis") ||
     content.includes("Deterministic Score") ||
     // Static triage footer — matches the string injected by _static_triage() in multi_review_agent.py
-    content.includes("Static analysis (outside LLM review budget");
+    content.includes("Static analysis (outside LLM review budget") ||
+    content.includes("Static analysis only");
 
   const llmReviewedCount = fileSections.filter(
     (s) =>
       (s.status === "complete" || s.status === "error") &&
       s.content.length > 0 &&
-      !isDeterministicOnly(s.content)
+      s.tier !== "static" && !s.fallbackReason && !isDeterministicOnly(s.content)
   ).length;
 
   // reviewCoverage: 0–100% of file sections that got a real LLM review.

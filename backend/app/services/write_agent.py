@@ -136,7 +136,7 @@ async def stream_code_write(
         )
 
     increment_request("write")
-    llm = get_chat_llm(streaming=True).with_config(callbacks=[get_token_callback()])
+    llm = get_chat_llm(streaming=True, task="coding").with_config(callbacks=[get_token_callback()])
 
     if await stop():
         yield cancelled("Write stopped before it started — no context read, no model call")

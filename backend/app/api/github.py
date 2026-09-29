@@ -154,7 +154,7 @@ async def repos(
 
 @router.get("/repos/{owner}/{name}")
 async def repo(owner: str, name: str, _: None = Depends(require_api_key)):
-    await _require_connection()
+    # Metadata (including the default branch) is public for public repositories.
     try:
         return await gh.get_repo(f"{owner}/{name}")
     except gh.GitHubError as exc:
@@ -162,13 +162,17 @@ async def repo(owner: str, name: str, _: None = Depends(require_api_key)):
 
 
 @router.get("/repos/{owner}/{name}/branches")
-async def branches(owner: str, name: str, _: None = Depends(require_api_key)):
-    await _require_connection()
+async def branches(
+    owner: str, name: str, page: int = Query(1, ge=1),
+    _: None = Depends(require_api_key),
+):
+    # SavFlux authentication remains required. Only the separate GitHub
+    # connection is optional for this read-only public-repository operation.
     try:
-        items = await gh.list_branches(f"{owner}/{name}")
+        items = await gh.list_branches(f"{owner}/{name}", page=page)
     except gh.GitHubError as exc:
         raise _fail(exc)
-    return {"branches": items}
+    return {"branches": items, "next_page": page + 1 if len(items) == 100 else None}
 
 
 @router.post("/compare")

@@ -47,8 +47,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime import cycle
     from app.services.code_analysis.models import FileAnalysis
 
-#: Bump when the routing rules change. Recorded on every cached result so an
-#: answer produced under an older plan is never attributed to the new one.
+#: Bump when the routing rules change. Exposed in plan telemetry so clients can
+#: identify which routing rules were used for this run.
 PLANNER_VERSION = 2
 
 #: Sentinels used by the existing router in `multi_review_agent`.
@@ -243,21 +243,13 @@ def batch_id_for(files_slice: list[dict]) -> str:
     Stable id for a batch, derived from the content of its members.
 
     Deterministic on purpose: the same set of files in the same order produces the
-    same id, which is what makes the batch cache key and the UI's batch label agree
-    across processes.
+    same id, keeping telemetry and UI batch labels consistent across processes.
     """
     digest = hashlib.sha256()
     for file_info in files_slice:
         digest.update((file_info.get("file_name") or "").encode("utf-8"))
         digest.update((file_info.get("content") or "").encode("utf-8", errors="replace"))
     return digest.hexdigest()[:12]
-
-
-def chunk_hashes(files_slice: list[dict]) -> list[str]:
-    """Content digests of the batch's members, in order — the cache key's payload."""
-    from app.services.review_cache import hash_content
-
-    return [hash_content(f.get("content", "")) for f in files_slice]
 
 
 # ── The planner ───────────────────────────────────────────────────────────────

@@ -180,18 +180,11 @@ export function ContextPanel({
     container.scrollTop = Math.max(0, container.scrollTop + delta - container.clientHeight / 3);
   }, [firstCitedLine, file]);
 
-  if (!open) {
-    // Nothing. The toggle lives in the top bar next to the other view
-    // controls, rather than as a sliver floating on the right edge — a
-    // 20px tab hanging off the middle of the window reads as a rendering
-    // artefact, and it is invisible on every screen narrower than `xl`, which
-    // is exactly when a reader most wants the evidence beside the answer.
-    return null;
-  }
-
   return (
     <aside
-      className="sf-surface flex w-[min(440px,42vw)] shrink-0 flex-col border-l sf-line"
+      className="sf-collapse sf-surface flex shrink-0 flex-col border-l sf-line"
+      aria-hidden={!open}
+      style={{ width: open ? "min(440px,42vw)" : 0, opacity: open ? 1 : 0, visibility: open ? "visible" : "hidden", borderWidth: open ? undefined : 0 }}
       aria-label="Context"
       data-testid="context-panel"
     >
@@ -257,7 +250,7 @@ export function ContextPanel({
             </div>
           )}
           {file && (
-            <div className="sf-mono text-[11.5px] leading-[1.55]">
+            <div className="sf-code-typography">
               {runs.map((run) => (
                 <div
                   key={run.start}
@@ -271,8 +264,8 @@ export function ContextPanel({
                     customStyle={{
                       margin: 0,
                       borderRadius: 0,
-                      fontSize: "11.5px",
-                      lineHeight: 1.55,
+                      fontSize: "var(--sf-code-size)",
+                      lineHeight: "var(--sf-code-leading)",
                       background: "transparent",
                       display: "block",
                     }}

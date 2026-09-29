@@ -43,7 +43,7 @@ from app.core.paths import data_file
 _TIMEOUT = httpx.Timeout(6.0, connect=3.0)
 _SELECTION_FILE = "model_selection.json"
 _PROVIDER_KEYS_FILE = "provider_api_keys.json"
-_HOSTED_PROVIDERS = {"openai", "deepseek", "openrouter"}
+_HOSTED_PROVIDERS = {"openai", "deepseek", "openrouter", "groq", "gemini", "mistral"}
 
 
 class ModelNotInstalled(ValueError):
@@ -85,9 +85,11 @@ def _write_provider_keys(keys: dict[str, str]) -> None:
     """Write provider secrets with restrictive permissions and atomic replace."""
     path = _provider_keys_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
+    import tempfile
+    from pathlib import Path
+    fd, name = tempfile.mkstemp(prefix=".provider-keys-", dir=path.parent)
+    temp = Path(name)
     raw = json.dumps(keys, indent=2).encode("utf-8")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
@@ -109,12 +111,16 @@ def _write_provider_keys(keys: dict[str, str]) -> None:
 
 def _environment_api_key(provider: str) -> str:
     settings = get_settings()
-    field = {"openai": "openai_api_key", "deepseek": "deepseek_api_key", "openrouter": "openrouter_api_key"}.get(provider)
+    field = f"{provider}_api_key" if provider in _HOSTED_PROVIDERS else None
     return str(getattr(settings, field, "") or "") if field else ""
 
 
 def active_provider() -> str:
     """Provider chosen in Settings, or the deployment's LLM_PROVIDER."""
+    from app.services.provider_connections import resolve
+    route = resolve("chat")
+    if route:
+        return route["provider"]
     selected = read_selection().get("provider")
     if selected in {"ollama", *_HOSTED_PROVIDERS}:
         return selected
@@ -130,6 +136,9 @@ def provider_api_key(provider: str | None = None) -> str:
 def active_provider_model(provider: str | None = None) -> str:
     provider = provider or active_provider()
     selected = read_selection()
+    connection = selected.get("connections", {}).get(provider)
+    if selected.get("routing") and connection:
+        return connection["model"]
     if selected.get("provider") == provider and selected.get("provider_model"):
         return str(selected["provider_model"])
     settings = get_settings()
@@ -137,6 +146,7 @@ def active_provider_model(provider: str | None = None) -> str:
         "openai": "openai_chat_model",
         "deepseek": "deepseek_chat_model",
         "openrouter": "openrouter_chat_model",
+        "groq": "groq_chat_model", "gemini": "gemini_chat_model", "mistral": "mistral_chat_model",
     }.get(provider)
     if field:
         return str(getattr(settings, field))
@@ -168,6 +178,8 @@ def save_provider_config(provider: str, api_key: str = "", model: str = "") -> d
         model = ""
 
     selected = read_selection()
+    selected.pop("routing", None)  # Explicit legacy provider selection exits task routing.
+    selected.pop("embedding_provider", None)  # Legacy provider switch requires re-indexing, as before.
     selected["provider"] = provider
     if model.strip():
         selected["provider_model"] = model.strip()[:200]
@@ -280,6 +292,13 @@ def reset_llm_cache() -> None:
     from app.services.llm_factory import get_chat_llm, get_embedding_fn
 
     get_chat_llm.cache_clear()
+    from app.services.model_runtime import clear
+    clear()
+    try:
+        from app.services.multi_review_agent import _PROVIDER_CIRCUIT
+        _PROVIDER_CIRCUIT.record_success()
+    except ImportError:
+        pass
     get_embedding_fn.cache_clear()
     try:
         from app.services.retrieval_service import _get_vectorstore
@@ -351,7 +370,7 @@ async def models_status() -> dict:
     provider_model = active_provider_model(provider) if provider != "ollama" else chat
     provider_key = provider_api_key(provider) if provider in _HOSTED_PROVIDERS else ""
     mixture_models = active_summary_mixture_models()
-    embedding = settings.embedding_model
+    embedding = settings.openai_embedding_model if selected.get("embedding_provider", provider) == "openai" else settings.embedding_model
 
     probe = await _async_tags()
     reachable = bool(probe.get("models")) or await _ping()
@@ -386,9 +405,17 @@ async def models_status() -> dict:
         "openai": "Hosted · OpenAI",
         "openrouter": "Hosted · OpenRouter",
     }
+    from app.services.model_runtime import latest
+    from app.services.provider_connections import resolve
+    from app.services.provider_catalog import PROVIDERS
+    review_route = resolve("review")
     return {
+        "routing_mode": (selected.get("routing") or {}).get("mode", "single"),
+        "last_inference": latest(),
+        "effective_review_provider": review_route["provider"] if review_route else provider,
+        "effective_review_model": review_route.get("model", review) if review_route else (provider_model if provider != "ollama" else review),
         "provider": provider,
-        "provider_label": provider_labels.get(provider, provider),
+        "provider_label": provider_labels.get(provider, "Hosted · " + PROVIDERS.get(provider, {}).get("label", provider)),
         "provider_model": provider_model,
         "provider_source": "app" if selected.get("provider") else "env",
         "provider_key_configured": bool(provider_key),
@@ -408,7 +435,7 @@ async def models_status() -> dict:
         "summary_mixture_missing_models": missing_mixture_models,
         "summary_mixture_source": "app" if "summary_mixture_models" in selected else "env",
         "embedding_model": embedding,
-        "embedding_local": provider != "openai",
+        "embedding_local": selected.get("embedding_provider", provider) != "openai",
         "models": installed,
         "suggested": [s for s in SUGGESTED_MODELS if s["name"] not in names],
         "selection_source": "app" if selected.get("chat") else "env",
@@ -441,6 +468,9 @@ async def select_model(
             f"'{chat}' is not installed. Run `ollama pull {chat}` first, "
             f"or pick one of the installed models."
         )
+
+    if review and installed and review not in installed:
+        raise ModelNotInstalled(f"Review model {review!r} is not installed. Pull it first or choose an installed model.")
 
     normalized_mixture = None
     if summary_mixture_models is not None:

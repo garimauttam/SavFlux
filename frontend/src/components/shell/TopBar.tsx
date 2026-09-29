@@ -32,6 +32,7 @@ import {
   PanelRight,
   Search,
   Sun,
+  UserRound,
 } from "lucide-react";
 import { repoDisplayName } from "../../lib/github";
 import type { GitHubStatus, ModelStatus } from "../../types/workspace";
@@ -56,6 +57,7 @@ interface TopBarProps {
   onSelectModel: (name: string) => void;
   onConnectGitHub: () => void;
   onSignOut: () => void;
+  onOpenProfile?: () => void;
   onOpenCommandPalette: () => void;
   contextOpen: boolean;
   onToggleContext: () => void;
@@ -99,6 +101,7 @@ export function TopBar({
   onSelectModel,
   onConnectGitHub,
   onSignOut,
+  onOpenProfile,
   onOpenCommandPalette,
   contextOpen,
   onToggleContext,
@@ -111,7 +114,7 @@ export function TopBar({
   const menuRef = useDismiss(openMenu !== null, close);
 
   const connected = Boolean(github?.connected && github?.valid);
-  const modelState = models?.available ? "good" : models?.reachable ? "warn" : "bad";
+  const modelState = models?.last_inference?.ok === false ? "warn" : models?.available ? "good" : models?.reachable ? "warn" : "bad";
 
   const filteredModels = (models?.models ?? []).filter((m) =>
     modelQuery ? m.name.toLowerCase().includes(modelQuery.toLowerCase()) : true,
@@ -121,9 +124,9 @@ export function TopBar({
   );
 
   return (
-    <header className="sf-surface flex h-12 shrink-0 items-center gap-2 border-b sf-line px-3">
+    <header ref={menuRef} className="sf-topbar relative z-40 sf-surface flex h-12 shrink-0 items-center gap-2 border-b sf-line px-3">
       {/* Scope — which repository the agent is looking at */}
-      <div className="relative" ref={menuRef}>
+      <div className="sf-scope-control relative">
         <button
           type="button"
           onClick={() => setOpenMenu(openMenu === "repo" ? null : "repo")}
@@ -142,7 +145,7 @@ export function TopBar({
         {openMenu === "repo" && (
           <div
             role="listbox"
-            className="absolute left-0 top-11 z-50 w-[320px] overflow-hidden rounded-xl border sf-line shadow-2xl shadow-black/40 sf-overlay"
+            className="absolute left-0 top-11 z-50 w-[min(320px,calc(100vw-24px))] overflow-hidden rounded-xl border sf-line shadow-2xl shadow-black/40 sf-overlay"
           >
             <div className="border-b sf-line px-3 py-2 text-[11px] sf-mute">
               {repos.length} indexed {repos.length === 1 ? "repository" : "repositories"}
@@ -191,14 +194,15 @@ export function TopBar({
 
       {/* Branch — only meaningful once a repository is selected */}
       {activeRepoUrl && (
-        <div className="relative">
+        <div className="sf-scope-control relative">
           <button
             type="button"
             onClick={() => setOpenMenu(openMenu === "branch" ? null : "branch")}
-            className="sf-btn sf-btn-ghost max-w-[180px]"
+            className="sf-btn sf-btn-ghost max-w-[240px]"
             aria-haspopup="listbox"
             aria-expanded={openMenu === "branch"}
-            title="Branch used for the next index"
+            aria-label={`Selected branch: ${branch || "repository default"}`}
+            title={`Selected branch: ${branch || "repository default"}. Changing this applies to the next index; it does not change already indexed code.`}
           >
             <GitBranch className="h-3.5 w-3.5 shrink-0 opacity-70" />
             <span className="truncate">{branch || "default"}</span>
@@ -214,7 +218,7 @@ export function TopBar({
                   ? "Loading branches…"
                   : branches.length
                     ? "Branch to index"
-                    : "No branch list yet — index the repository to read its branches from GitHub."}
+                    : "Remote branches are unavailable or this repository is empty. Your selected branch is kept."}
               </div>
               <div className="max-h-72 overflow-y-auto p-1">
                 {branches.map((b) => (
@@ -244,7 +248,7 @@ export function TopBar({
       <button
         type="button"
         onClick={onOpenCommandPalette}
-        className="sf-btn sf-btn-ghost hidden md:inline-flex"
+        className="sf-topbar-search sf-btn sf-btn-ghost hidden md:inline-flex"
         title="Search files, sections and commands"
       >
         <Search className="h-3.5 w-3.5 opacity-70" />
@@ -255,7 +259,7 @@ export function TopBar({
       </button>
 
       {/* Model — the $0 promise, made visible */}
-      <div className="relative">
+      <div className="sf-model-control relative">
         <button
           type="button"
           onClick={() => { setOpenMenu(openMenu === "model" ? null : "model"); setModelQuery(""); }}
@@ -280,13 +284,13 @@ export function TopBar({
           )}
           <Cpu className="h-3.5 w-3.5 shrink-0 opacity-60" />
           <span className="truncate">
-            {models?.chat_model ?? (models === null ? "Checking…" : "No model")}
+            {models?.provider === "ollama" ? models.chat_model : models?.provider_model ?? models?.chat_model ?? (models === null ? "Checking…" : "No model")}
           </span>
           <ChevronDown className="h-3 w-3 shrink-0 opacity-50" />
         </button>
 
         {openMenu === "model" && (
-          <div className="absolute right-0 top-11 z-50 w-[380px] overflow-hidden rounded-xl border sf-line shadow-2xl shadow-black/40 sf-overlay">
+          <div className="absolute right-0 top-11 z-50 w-[min(380px,calc(100vw-24px))] max-h-[calc(100dvh-70px)] overflow-y-auto rounded-xl border sf-line shadow-2xl shadow-black/40 sf-overlay">
             <div className="border-b sf-line p-3">
               <p className="sf-text text-[12.5px] font-medium">
                 {models?.provider_label ?? "Local model"}
@@ -294,10 +298,10 @@ export function TopBar({
               </p>
               <p className="sf-mute mt-0.5 text-[11px]">
                 {models?.available
-                  ? "Answers run on this machine. Nothing is billed."
+                  ? models.provider === "ollama" ? "Local runtime detected; generation can still fail if memory is insufficient." : "Cloud configuration present; key validity and free quota are not guaranteed."
                   : models?.hint ?? "Checking the local model runtime…"}
               </p>
-              {models && !models.available && (
+              {models && !models.available && models.provider === "ollama" && (
                 <code className="sf-mono sf-raised mt-2 block w-full overflow-x-auto rounded-lg border sf-line px-2 py-1.5 text-[11px] sf-text">
                   {models.reachable
                     ? `ollama pull ${models.chat_model}`
@@ -306,6 +310,12 @@ export function TopBar({
               )}
             </div>
 
+            <div className="border-b sf-line p-3">
+              <button className="sf-btn sf-btn-secondary w-full text-xs" onClick={() => { close(); onOpenProfile?.(); }}>Manage API keys, models & routing</button>
+              <p className="sf-mute mt-2 text-[11px]">Review: {models?.effective_review_model ?? models?.review_model} · {models?.routing_mode === "tasks" ? "Task routing" : "Single provider"}</p>
+              {models?.last_inference && <p className="sf-dim mt-1 text-[11px]">Last call: {models.last_inference.provider} / {models.last_inference.model}. {models.last_inference.reason}</p>}
+              <p className="sf-mute mt-2 text-[11px]">Installed local models below configure the local primary / fallback, not the cloud route.</p>
+            </div>
             <div className="border-b sf-line p-2">
               <input
                 autoFocus
@@ -450,6 +460,7 @@ export function TopBar({
               </div>
             )}
             <div className="border-t sf-line p-1">
+              {onOpenProfile && <button type="button" onClick={() => { close(); onOpenProfile(); }} className="sf-btn sf-btn-ghost w-full justify-start px-3"><UserRound className="h-3.5 w-3.5" /> Profile & settings</button>}
               <button
                 type="button"
                 onClick={() => { close(); onSignOut(); }}

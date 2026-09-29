@@ -154,6 +154,12 @@ export function useModels(): ModelsState {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    const changed = () => { void refresh(); };
+    window.addEventListener("savflux:models-changed", changed);
+    return () => window.removeEventListener("savflux:models-changed", changed);
+  }, [refresh]);
+
   const select = useCallback(
     async (chat: string) => {
       setBusy(true);

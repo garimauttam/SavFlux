@@ -26,6 +26,7 @@ def model_state(tmp_path, monkeypatch):
         llm_provider="ollama",
         openai_api_key=None,
         openai_chat_model="gpt-4o",
+        openai_embedding_model="text-embedding-3-small",
         deepseek_api_key=None,
         deepseek_chat_model="deepseek-chat",
         deepseek_base_url="https://api.deepseek.com",

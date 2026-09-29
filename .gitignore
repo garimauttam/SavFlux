@@ -22,6 +22,7 @@ build/
 # ── Secrets — NEVER commit ────────────────────────────────────────────────────
 .env
 *.env
+.env.*
 !.env.example        # keep the template, not the real secrets
 
 # ── ChromaDB data — re-generated on first run, can be hundreds of MB ──────────

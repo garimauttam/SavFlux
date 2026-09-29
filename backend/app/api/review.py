@@ -28,7 +28,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from pydantic_core import PydanticCustomError
 
 from app.api.deps import require_api_key
@@ -975,27 +975,15 @@ async def create_pull_request(request: Request, body: CreatePRRequest,
     return plan
 
 
-# ── Review cache ──────────────────────────────────────────────────────────────
-#
-# The review pipeline caches each file's review against the hash of its content,
-# the model, and the prompt version. That cache is the reason a second review of
-# an unchanged repository costs a fraction of a second instead of a minute, so it
-# is worth being able to look at: `stats` reports size and hit rate, and the
-# delete endpoint exists so a user can force a cold review without hunting for a
-# file on disk.
+# ── Legacy review cache maintenance ──────────────────────────────────────────
+# New reviews neither read nor write this cache. These authenticated endpoints
+# remain so existing users can inspect/delete previously persisted results.
 
 
-@router.get("/cache")
+@router.get("/cache", dependencies=[Depends(require_api_key)])
 def review_cache_stats():
-    """
-    Report what the review cache holds and how well it is working.
-
-    `hits` counts reviews served from cache; `writes` counts reviews a model
-    actually produced. A high hit rate means an unchanged repository — which is
-    the normal case when someone re-runs a review on a branch they have not
-    touched.
-    """
-    return review_cache.stats()
+    """Inspect legacy entries; their presence does not enable review reuse."""
+    return {**review_cache.stats(), "enabled": False}
 
 
 @router.delete("/cache", dependencies=[Depends(require_api_key)])
@@ -1003,8 +991,54 @@ def clear_review_cache():
     """
     Drop every cached review. Returns the number of entries removed.
 
-    Requires an API key because it discards work that cost model calls to
-    produce; it does not delete anything else.
+    Requires a signed-in account. Deletes only that account's legacy cache,
+    not indexed code, saved preferences, or other users' data.
     """
     removed = review_cache.clear()
     return {"removed": removed, "entries": review_cache.stats()["entries"]}
+
+
+class ReviewSuggestionRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=2000)
+    content_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    line: int = Field(ge=1, strict=True)
+    end_line: int = Field(ge=1, strict=True)
+    title: str = Field(min_length=1, max_length=300)
+    reason: str = Field(max_length=2000)
+    remediation: str = Field(max_length=2000)
+
+
+@router.post("/suggestion", dependencies=[Depends(require_api_key)])
+@limiter.limit("10/minute")
+async def suggest_review_fix(request: Request, body: ReviewSuggestionRequest):
+    """Explicitly requested model proposal, checked against the user's indexed snapshot.
+
+    This endpoint never applies a change, caches a review, or reads arbitrary disk paths.
+    """
+    from app.services import review_suggestions as suggestions
+    if body.end_line < body.line:
+        raise HTTPException(status_code=422, detail="The finding's line range is invalid.")
+    try:
+        content = await asyncio.to_thread(suggestions.read_exact_source, body.source)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Could not read the code index. Please retry.")
+    if content is None:
+        raise HTTPException(status_code=404, detail="Source is not indexed for this account. Re-index before requesting a fix.")
+    if suggestions.source_hash(content) != body.content_sha256:
+        raise HTTPException(status_code=409, detail="The indexed source changed. Run a fresh review before generating a fix.")
+    if body.end_line > len(content.split("\n")):
+        raise HTTPException(status_code=422, detail="The finding is outside the indexed source.")
+    try:
+        return await suggestions.until_disconnect(
+            suggestions.propose_fix(content, body.source, body.line, body.end_line, body.title, body.reason, body.remediation),
+            request.is_disconnected,
+        )
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=499, detail="Suggestion request cancelled.")
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="The review model timed out. No changes were made. Let the repository review finish or press Stop, then retry one fix. If it still times out, choose a smaller local Review model or a configured free-tier provider in Profile settings.")
+    except suggestions.SuggestionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception:
+        logger.warning("Review suggestion provider failed")
+        raise HTTPException(status_code=502, detail="The model could not produce a fix. No changes were made.")

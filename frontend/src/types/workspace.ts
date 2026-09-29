@@ -99,7 +99,11 @@ export interface LocalModel {
 }
 
 export interface ModelStatus {
-  provider: "ollama" | "openai" | "deepseek" | "openrouter";
+  provider: "ollama" | "openai" | "deepseek" | "openrouter" | "groq" | "gemini" | "mistral";
+  routing_mode?: "single" | "tasks";
+  effective_review_provider?: string;
+  effective_review_model?: string;
+  last_inference?: { provider: string; model: string; ok: boolean; reason?: string; fallback: boolean; at: number } | null;
   provider_label: string;
   provider_model: string;
   provider_source: "app" | "env";

@@ -31,6 +31,7 @@ from app.core.config import get_settings
 from app.services.llm_factory import get_chat_llm, get_review_llm
 from app.services.agent_run import summarize_args
 from app.services.stream_protocol import error_event, status_event
+from app.services.review_annotations import INLINE_COMMENT_INSTRUCTIONS
 from app.services.token_counter import get_token_callback, increment_request
 from app.services.code_analysis import analyze_file
 from app.services.code_analysis.analyzer import build_llm_facts
@@ -411,7 +412,13 @@ async def stream_code_review(
 
     yield status_event(f"Analyzing `{file_name}`…", step="starting", mode="agentic")
 
-    llm_with_tools = llm.bind_tools(tools)
+    try:
+        llm_with_tools = llm.bind_tools(tools)
+    except (AttributeError, NotImplementedError):
+        yield status_event("Tool binding is unavailable; using static tools plus a model review.", step="model_capability", mode="fast")
+        async for token in stream_fast_code_review(file_name, file_content, language, repo_context, model_override, should_stop):
+            yield token
+        return
     max_iters  = 8
     max_secs   = 90
     start_time = time.monotonic()
@@ -533,7 +540,8 @@ async def stream_code_review(
         # `forced` flag tells a reader the model was cut off rather than done.
         yield _agentic_done(iterations=max_iters, forced=True)
     except Exception as e:
-        yield error_event(str(e))
+        from app.services.provider_catalog import safe_error
+        yield error_event(safe_error(e))
 
 
 # ── Fast review (multi-file batch mode) ───────────────────────────────────────
@@ -650,7 +658,8 @@ async def stream_fast_code_review(
         )
 
     except Exception as e:
-        yield error_event(str(e))
+        from app.services.provider_catalog import safe_error
+        yield error_event(safe_error(e))
 
 
 # ── Batched multi-file review ─────────────────────────────────────────────────
@@ -741,6 +750,7 @@ def _batch_prompt(files_slice: list[dict], repo_context_map: dict[str, str]) -> 
         + BATCH_FILE_MARKER.format(name="<filename as given above>") + "\n"
         "## 🐛 Bugs & Risks\n## 🔒 Security\n## ⚠️ Maintainability\n"
         "## 🔗 Cross-file Issues\n## ⚡ Fast Fixes\n## 📊 Score (1–10)\n"
+        "```savflux-comments\n{\"comments\": []}\n```\n"
         + BATCH_END_MARKER + "\n\n"
         "The header and footer lines must appear verbatim — an automated parser "
         "splits your answer with them, and a file left without a block is shown to "
@@ -766,7 +776,7 @@ async def stream_batch_code_review(
     prompt = _batch_prompt(files_slice, repo_context_map or {})
 
     messages = [
-        SystemMessage(content=BATCH_REVIEW_SYSTEM_PROMPT),
+        SystemMessage(content=BATCH_REVIEW_SYSTEM_PROMPT + INLINE_COMMENT_INSTRUCTIONS),
         HumanMessage(content=prompt),
     ]
 

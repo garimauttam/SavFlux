@@ -39,6 +39,10 @@ export default defineConfig({
     },
   },
   server: {
+    // Keep local auth redirects/CORS on the documented origin. A second server
+    // must fail clearly instead of leaving the browser on an older instance.
+    port: 5173,
+    strictPort: true,
     allowedHosts: allowedHosts.length > 0 ? allowedHosts : undefined,
     proxy: {
       '/api': {

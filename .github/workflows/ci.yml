@@ -12,6 +12,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  documentation:
+    name: Documentation links and structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check local documentation
+        run: |
+          python3 scripts/check_docs.py
+          python3 -m unittest discover -s scripts -p 'test_check_docs.py'
+
   # ── Backend: pytest ──────────────────────────────────────────────────────────
   backend-tests:
     name: Backend Tests (Python 3.11)
@@ -47,7 +60,7 @@ jobs:
           # HuggingFace — and on a sandbox without egress that is 5 retries with
           # exponential backoff (~30s per affected test) rather than a failure.
           # The suite goes from "apparent hang" to ~5s because of this line.
-          # Local runs need it too: see README's testing section.
+          # Local runs need it too: see docs/DEVELOPMENT.md.
           LLM_PROVIDER: openai
           OPENAI_API_KEY: sk-ci-placeholder
         run: python -m pytest -v --tb=short
@@ -143,15 +156,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version-file: frontend/.nvmrc
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Frontend setup checks
+        run: npm run test:setup
 
       - name: Audit npm dependencies
         run: npm audit --audit-level=moderate

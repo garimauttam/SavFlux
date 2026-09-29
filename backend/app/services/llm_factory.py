@@ -105,15 +105,25 @@ def _get_chat_llm_cached(streaming: bool, review: bool, tenant_key: str) -> Any:
     return primary.with_fallbacks(fallbacks) if fallbacks else primary
 
 
-def get_chat_llm(streaming: bool = False, review: bool = False) -> Any:
+def get_chat_llm(streaming: bool = False, review: bool = False, task: str = "") -> Any:
     """Return a model cached by user, so one account can never receive another's key."""
     from app.core.tenant import current_user_id
     tenant_key = current_user_id() or "__local__"
+    from app.services.provider_connections import resolve
+    role = task or ("review" if review else "chat")
+    route = resolve(role)
+    if route is not None:
+        return _get_routed_llm(streaming, role, tenant_key)
     return _get_chat_llm_cached(streaming, review, tenant_key)
 
 
 # Preserve the cache controls used by settings changes and unit tests.
-get_chat_llm.cache_clear = _get_chat_llm_cached.cache_clear  # type: ignore[attr-defined]
+def _clear_llm_caches():
+    _get_chat_llm_cached.cache_clear()
+    _get_routed_llm.cache_clear()
+
+
+get_chat_llm.cache_clear = _clear_llm_caches  # type: ignore[attr-defined]
 
 
 def _build_chat_llm(provider: str, streaming: bool = False, *, review: bool = False) -> Any:
@@ -138,7 +148,7 @@ def _build_chat_llm(provider: str, streaming: bool = False, *, review: bool = Fa
             num_predict=4096,
         )
 
-    elif provider in {"deepseek", "openai", "openrouter"}:
+    elif provider in {"deepseek", "openai", "openrouter", "groq", "gemini", "mistral"}:
         from app.services.model_service import active_provider_model, provider_api_key
         api_key = provider_api_key(provider)
         if not api_key:
@@ -150,6 +160,10 @@ def _build_chat_llm(provider: str, streaming: bool = False, *, review: bool = Fa
         elif provider == "openrouter":
             model = active_provider_model(provider)
             base_url = s.openrouter_base_url
+        elif provider in {"groq", "gemini", "mistral"}:
+            from app.services.provider_catalog import PROVIDERS
+            model = active_provider_model(provider)
+            base_url = PROVIDERS[provider]["base_url"]
         else:
             model = active_provider_model(provider)
             base_url = None
@@ -192,7 +206,7 @@ def _resolve_embedding_device(configured: str) -> str:
 #: "the benchmark uses whatever the product uses" is not a safe rule. The set lives here,
 #: next to the branch that implements it, so that adding a provider cannot silently leave
 #: a caller's allowlist behind.
-LOCAL_EMBEDDING_PROVIDERS = frozenset({"deepseek", "ollama", "openrouter"})
+LOCAL_EMBEDDING_PROVIDERS = frozenset({"deepseek", "ollama", "openrouter", "groq", "gemini", "mistral"})
 
 
 def build_local_embeddings(model_name: str) -> Any:
@@ -232,7 +246,8 @@ def _get_embedding_fn_cached(tenant_key: str) -> Any:
     """Per-account embedder cache; hosted credentials must never cross tenants."""
     s = _settings()
     from app.services.model_service import active_provider, provider_api_key
-    provider = active_provider()
+    from app.services.model_service import read_selection
+    provider = read_selection().get("embedding_provider") or active_provider()
     if provider in LOCAL_EMBEDDING_PROVIDERS:
         return build_local_embeddings(s.embedding_model)
     if provider == "openai":
@@ -269,11 +284,13 @@ def get_provider_name() -> str:
         read_selection,
     )
 
-    selected_provider = read_selection().get("provider")
-    provider = selected_provider if selected_provider in {"ollama", "deepseek", "openai", "openrouter"} else s.llm_provider
+    from app.services.provider_connections import resolve
+    route = resolve("chat")
+    selected_provider = route["provider"] if route else read_selection().get("provider")
+    provider = selected_provider if selected_provider in {"ollama", "deepseek", "openai", "openrouter", "groq", "gemini", "mistral"} else s.llm_provider
     if provider == "ollama":
         return f"Ollama ({active_chat_model()}) + {s.embedding_model} embeddings"
-    if provider in {"deepseek", "openai", "openrouter"}:
+    if provider in {"deepseek", "openai", "openrouter", "groq", "gemini", "mistral"}:
         return f"{provider.title()} ({active_provider_model(provider)}) → Ollama ({active_chat_model()}) fallback"
     return f"Unknown provider ({provider})"
 
@@ -288,7 +305,7 @@ def get_hosted_display_name() -> str:
     """
     from app.services.model_service import active_provider
 
-    return {"deepseek": "DeepSeek", "openai": "OpenAI", "openrouter": "OpenRouter"}.get(active_provider(), "Local")
+    return {"deepseek": "DeepSeek", "openai": "OpenAI", "openrouter": "OpenRouter", "groq": "Groq", "gemini": "Gemini", "mistral": "Mistral"}.get(active_provider(), "Local")
 
 
 def get_hosted_client_kwargs() -> dict[str, Any] | None:
@@ -303,6 +320,9 @@ def get_hosted_client_kwargs() -> dict[str, Any] | None:
     from app.services.model_service import active_provider, provider_api_key
 
     provider = active_provider()
+    if provider in {"groq", "gemini", "mistral"}:
+        from app.services.provider_catalog import PROVIDERS
+        return {"api_key": provider_api_key(provider), "base_url": PROVIDERS[provider]["base_url"]}
     if provider == "deepseek":
         return {"api_key": provider_api_key(provider), "base_url": s.deepseek_base_url}
     if provider == "openai":
@@ -327,3 +347,47 @@ def _require_key(name: str, value: Any) -> None:
             f"{name} is required when LLM_PROVIDER={_settings().llm_provider}. "
             "Set it in your .env file."
         )
+
+
+@lru_cache(maxsize=128)
+def _get_routed_llm(streaming: bool, task: str, tenant_key: str):
+    from app.services.provider_connections import resolve
+    from app.services.model_service import active_chat_model, active_review_model, provider_api_key
+    from app.services.provider_catalog import PROVIDERS
+    from app.services.model_runtime import RoutedModel
+    from langchain_openai import ChatOpenAI
+
+    route = resolve(task)
+    review = task in {'review', 'reasoning'}
+    local_name = active_review_model() if review else active_chat_model()
+    local = _build_chat_llm('ollama', streaming, review=review)
+    if route['provider'] == 'ollama':
+        return RoutedModel(local, None, 'ollama', local_name, local_name)
+    provider = route['provider']
+    key = provider_api_key(provider)
+    if not key:
+        from langchain_core.runnables import RunnableLambda
+        def missing_key(_input):
+            raise PermissionError()
+        return RoutedModel(RunnableLambda(missing_key), local, provider, route['model'], local_name)
+    model = route['model']
+    extra = {}
+    if provider == 'openrouter':
+        if not model.endswith(':free'):
+            raise ValueError('Only explicit free OpenRouter models may be routed here.')
+        # Gateway-side defense even if a formerly free endpoint changes its pricing.
+        extra['provider'] = {'max_price': {'prompt': 0, 'completion': 0}, 'allow_fallbacks': False}
+    effort = route.get('reasoning', 'default')
+    if effort != 'default':
+        if effort not in route.get('reasoning_options', []):
+            raise ValueError('Unsupported reasoning configuration. Re-save the connection.')
+        if provider == 'openrouter':
+            extra['reasoning'] = {'effort': effort, 'exclude': True}
+        else:
+            # extra_body works with the pinned OpenAI SDK, which predates reasoning_effort.
+            extra['reasoning_effort'] = effort
+    primary = ChatOpenAI(model=model, api_key=key, base_url=PROVIDERS[provider]['base_url'],
+                         streaming=streaming, temperature=0.6 if effort != 'default' else 0.1,
+                         max_tokens=4096, max_retries=0, request_timeout=35,
+                         model_kwargs={'extra_body': extra} if extra else {})
+    return RoutedModel(primary, local, provider, model, local_name)

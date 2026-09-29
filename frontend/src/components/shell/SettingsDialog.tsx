@@ -16,12 +16,14 @@
  * catalogue that goes stale the moment someone pulls a new model.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Check, Cpu, Github, PanelRight, Server, X } from "lucide-react";
+const ModelConnections = lazy(() => import("./ModelConnections").then(m => ({ default: m.ModelConnections })));
 import type { ModelStatus } from "../../types/workspace";
 
 interface SettingsDialogProps {
   open: boolean;
+  embedded?: boolean;
   onClose: () => void;
   models: ModelStatus | null;
   onSelectModel: (name: string) => void;
@@ -37,6 +39,7 @@ interface SettingsDialogProps {
 
 export function SettingsDialog({
   open,
+  embedded = false,
   onClose,
   models,
   onSelectModel,
@@ -62,7 +65,7 @@ export function SettingsDialog({
   useEffect(() => {
     if (open) {
       setQuery("");
-      setProviderChoice(models?.provider ?? "ollama");
+      setProviderChoice(models?.provider && ["ollama", "openai", "deepseek", "openrouter"].includes(models.provider) ? models.provider : "ollama");
       setProviderApiKeyInput("");
       setProviderModelInput(models?.provider === "ollama" ? "" : models?.provider_model ?? "");
       setProviderFeedback(null);
@@ -78,7 +81,7 @@ export function SettingsDialog({
 
   useEffect(() => {
     if (open && models) {
-      setProviderChoice(models.provider);
+      setProviderChoice(["ollama", "openai", "deepseek", "openrouter"].includes(models.provider) ? models.provider : "ollama");
       setProviderModelInput(models.provider === "ollama" ? "" : models.provider_model);
     }
   }, [open, models?.provider, models?.provider_model]);
@@ -138,32 +141,32 @@ export function SettingsDialog({
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center p-4"
-      style={{ background: "rgba(0,0,0,0.6)", backdropFilter: "blur(3px)" }}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="settings-title"
+      className={embedded ? "w-full" : "fixed inset-0 z-[100] flex items-center justify-center p-4"}
+      style={embedded ? undefined : { background: "rgba(0,0,0,0.6)", backdropFilter: "blur(3px)" }}
+      role={embedded ? "region" : "dialog"}
+      aria-modal={embedded ? undefined : true}
+      aria-labelledby={embedded ? "profile-model-settings-title" : "settings-title"}
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
         ref={ref}
-        className="max-h-[85vh] w-full max-w-[560px] overflow-hidden rounded-2xl border sf-line shadow-2xl shadow-black/60 sf-surface"
+        className={embedded ? "w-full sf-surface" : "max-h-[85vh] w-full max-w-[560px] overflow-hidden rounded-2xl border sf-line shadow-2xl shadow-black/60 sf-surface"}
         onKeyDown={(e) => {
-          if (e.key === "Escape") onClose();
+          if (!embedded && e.key === "Escape") onClose();
         }}
       >
         <div className="flex items-center justify-between border-b sf-line px-5 py-3.5">
-          <h2 id="settings-title" className="sf-text text-[15px] font-semibold">
+          <h2 id={embedded ? "profile-model-settings-title" : "settings-title"} className="sf-text text-[15px] font-semibold">
             Settings
           </h2>
-          <button type="button" onClick={onClose} aria-label="Close" className="sf-iconbtn h-7 w-7">
+          {!embedded && <button type="button" onClick={onClose} aria-label="Close" className="sf-iconbtn h-7 w-7">
             <X className="h-4 w-4" />
-          </button>
+          </button>}
         </div>
 
-        <div className="max-h-[62vh] overflow-y-auto px-5 py-4">
+        <div className={embedded ? "px-5 py-4" : "max-h-[62vh] overflow-y-auto px-5 py-4"}>
           {/* Model */}
           <section>
             <h3 className="sf-dim flex items-center gap-1.5 text-[12.5px] font-semibold">
@@ -174,7 +177,10 @@ export function SettingsDialog({
               {models?.free && " · runs on this machine · no key, no bill"}
             </p>
 
+            <Suspense fallback={<p className="sf-mute text-xs">Loading model connections…</p>}><ModelConnections models={models}/></Suspense>
+            <details className="mt-4"><summary className="sf-dim cursor-pointer text-xs">Legacy provider settings (may be metered)</summary>
             <div className="mt-3 rounded-xl border sf-line bg-[var(--sf-raised)] p-3">
+              <p className="sf-mute mb-3 text-xs">Saving here disables task routing. Paid models may charge. Changing between OpenAI and local embeddings requires re-indexing.</p>
               <label className="sf-dim block text-[11px] font-medium" htmlFor="provider-choice">Chat and review provider</label>
               <select
                 id="provider-choice"
@@ -238,6 +244,8 @@ export function SettingsDialog({
                 </button>
               </div>
             </div>
+
+            </details>
 
             {models && !models.available && (
               <div

@@ -1,7 +1,7 @@
 """
 multi_review_agent.py — Orchestrates cross-file-aware code review across multiple files.
 
-ARCHITECTURE (v3 — planned, batched, cached):
+ARCHITECTURE (v4 — planned, batched, fresh per run):
 
   Phase -1 — Plan  (instant, CPU-only, deterministic)
     `review_planner.plan_review` decides each file's dispatch and records why:
@@ -24,14 +24,13 @@ ARCHITECTURE (v3 — planned, batched, cached):
 
   Phase 1 — Deterministic results  (instant, CPU-only)
     Every static file gets a full deterministic review (structure, security
-    patterns, complexity, score) — NOT a placeholder. Results are cached against
-    the file's content hash, so an unchanged file is answered from disk in
-    microseconds instead of being re-analysed and re-explained.
+    patterns, complexity, score) — NOT a placeholder. The report is generated
+    from the current run's analysis, never from previously saved review text.
 
   Phase 2 — Concurrent model calls  (bounded by semaphore)
     Singles get their own call with repo_context injected; batches share one call
-    and are split back into per-file sections. Both are cached by content hash.
-    Cache hits are labelled with the digest and date they were reviewed.
+    and are split back into per-file sections. Both run fresh each time, using
+    the current files, cross-file context, and model configuration.
 
   Phase 3 — Repo summary  (one final LLM call)
     Synthesises all per-file findings into an overall health assessment.
@@ -59,13 +58,14 @@ from typing import AsyncGenerator, Awaitable, Callable
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.services.llm_factory import get_chat_llm
+from app.services.provider_catalog import safe_error, safe_stream_error
 from app.services.review_agent import (
     split_batch_review,
     stream_batch_code_review,
     stream_code_review,
     stream_fast_code_review,
 )
-from app.services import review_cache, review_planner
+from app.services.review_annotations import annotation_events, model_annotation_events, INLINE_COMMENT_INSTRUCTIONS
 from app.services.review_planner import (
     DEFAULT_LLM_BUDGET,
     ROUTE_FULL,
@@ -383,14 +383,37 @@ class _ProviderCircuit:
         }
 
 
-#: Process-wide circuit shared by every review. One user's broken provider is the
-#: same provider for the next request, so the knowledge is kept across requests.
-_PROVIDER_CIRCUIT = _ProviderCircuit()
+class _TenantCircuit:
+    """A broken key must not trip another account's review circuit."""
+    def __init__(self):
+        from collections import OrderedDict
+        self.states = OrderedDict()
+
+    def __getattr__(self, name):
+        import json
+        from app.core.tenant import current_user_id
+        from app.services.model_service import read_selection
+        selection = read_selection()
+        # Selections, not secrets. Switching routes gets a fresh circuit.
+        identity = (current_user_id() or '__local__', json.dumps(selection, sort_keys=True))
+        if identity not in self.states:
+            self.states[identity] = _ProviderCircuit()
+        self.states.move_to_end(identity)
+        while len(self.states) > 256:
+            self.states.popitem(last=False)
+        return getattr(self.states[identity], name)
+
+
+_PROVIDER_CIRCUIT = _TenantCircuit()
 
 
 def _fast_route() -> str:
     """Ollama fast model if it is pulled, else "" (meaning: use the provider)."""
     settings = get_settings()
+    from app.services.provider_connections import resolve
+    route = resolve("review")
+    if route and route["provider"] != "ollama":
+        return ""  # Explicit cloud route takes precedence; local stays fallback only.
     fast_model = getattr(settings, "ollama_fast_model", "") or ""
     return fast_model if fast_model and _model_available(fast_model) else ""
 
@@ -454,6 +477,7 @@ def _static_triage(file_info: dict, analysis: FileAnalysis | None = None) -> str
         else "(large file — complexity risk higher)" if analysis.total_lines > 600
         else ""
     )
+    score_display = "Not rated — parsing failed; findings are partial." if analysis.parse_error else f"**{score}/10** {score_note}"
     parse_note = f"\n\n> ⚠️ Parse failed ({analysis.parse_error}) — fell back to pattern scanning." if analysis.parse_error else ""
 
     return (
@@ -464,11 +488,10 @@ def _static_triage(file_info: dict, analysis: FileAnalysis | None = None) -> str
         f"### Complexity\n"
         f"  {len(analysis.functions)} definitions | max complexity: {analysis.max_complexity} "
         f"| avg: {analysis.avg_complexity:.1f}\n\n"
-        f"## 🔒 Security\n{_render(security_findings, 'No security issues found by static analysis.')}\n\n"
-        f"## ⚠️ Code Quality\n{_render(quality_findings, 'No significant quality issues.')}\n\n"
-        f"## 📊 Score\n**{score}/10** {score_note}{parse_note}\n\n"
-        f"> ℹ️ Static analysis (outside LLM review budget for this batch). "
-        f"Increase `REVIEW_MAX_FULL_FILES` in your `.env` to include this file in LLM review."
+        f"## 🔒 Security\n{_render(security_findings, 'No security findings in the partial scan.' if analysis.parse_error else 'No security issues found by static analysis.')}\n\n"
+        f"## ⚠️ Code Quality\n{_render(quality_findings, 'No quality findings in the partial scan.' if analysis.parse_error else 'No significant quality issues.')}\n\n"
+        f"## 📊 Score\n{score_display}{parse_note}\n\n"
+        f"> ℹ️ Static analysis only — this report is not a model assessment."
     )
 
 
@@ -598,7 +621,7 @@ async def stream_multi_review(
     should_stop: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """
-    Stream a planned, batched, cached review of multiple files.
+    Stream a fresh planned, batched review of multiple files.
 
     Phase -1: plan each file's dispatch (static / batch / single) with reasons.
     Phase 0:  build cross-file repo context.
@@ -606,9 +629,10 @@ async def stream_multi_review(
     Phase 2:  run model reviews — one call per single, one per batch.
     Phase 3:  stream each file's section as it is ready, then the repo summary.
 
-    Every model result is cached under a key derived from the file content, the
-    model and the planner version, so re-reviewing an unchanged file costs a
-    dictionary lookup instead of a call. Cache hits are labelled in the output.
+    Review results are never read from or written to the legacy review cache.
+    The planner and static analysis still limit model work, but every eligible
+    model call runs again even when a file is unchanged. Cache flags from older
+    deployments do not re-enable result reuse.
 
     `should_stop` is an async predicate checked before every model call and between
     streamed sections; the route hands it `Request.is_disconnected`, so closing the
@@ -624,8 +648,7 @@ async def stream_multi_review(
     stop = should_stop or _never_stopped
     # Set once the reader is known to be gone. The workers check this flag as well
     # as the predicate: after a Stop, `is_disconnected` stays true, but a task that
-    # is already past its check must not start a *second* model call, and a cached
-    # lookup should not be paid for either.
+    # is already past its check must not start a *second* model call.
     abandoned = False
     #: Indexes whose section has been yielded — the "what did you actually review"
     #: set the closing marker counts against the plan.
@@ -645,20 +668,14 @@ async def stream_multi_review(
     concurrency  = max(1, int(getattr(settings, "review_concurrency", 3)))
     semaphore    = asyncio.Semaphore(concurrency)
     per_summaries: list[str] = [""] * n
-    #: Indexes that received a model review this run — including cache hits,
-    #: because they were reviewed; the run simply did not have to pay for it twice.
+    #: Indexes that actually received a model review in this run.
     llm_succeeded: set[int] = set()
-    cache_hits: set[int] = set()
     #: Files that should have had a model review but did not get one (provider
     #: error, timeout, or a batch that omitted them). Counted separately from the
     #: files the planner deliberately left to static analysis, because "the parser
     #: covered this" and "the model failed on this" are different statements.
     fallback_only: set[int] = set()
     started_at = _time.monotonic()
-
-    cache_enabled = bool(getattr(settings, "review_cache_enabled", True))
-    provider      = getattr(settings, "llm_provider", "") or ""
-    cache_mode    = "fast" if review_mode == "fast" else "agentic"
 
     # ── Phase -1: score, then plan ────────────────────────────────────────────
     scores = {idx: _triage_score(f) for idx, f in enumerate(files)}
@@ -693,48 +710,24 @@ async def stream_multi_review(
         plan_ms=plan_ms, context_ms=context_ms,
     )
 
-    # ── Cache helpers ─────────────────────────────────────────────────────────
-    def _file_key(idx: int, kind: str) -> str:
-        info = files[idx]
-        return review_cache.file_key(
-            info.get("content", ""),
-            info.get("file_name", ""),
-            info.get("language", ""),
-            provider=provider if kind != "static" else "static",
-            model="" if kind != "static" else "analyzer",
-            mode=cache_mode if kind != "static" else "static",
-        )
-
-    def _cache_read(idx: int, kind: str) -> str | None:
-        if not cache_enabled:
-            return None
-        entry = review_cache.get(_file_key(idx, kind))
-        return entry["value"] if entry else None
-
-    def _cache_write(idx: int, kind: str, value: str) -> None:
-        if not cache_enabled or not value.strip():
+    # Deliver line comments before slow model calls. Hashes bind them to the
+    # reviewed content so a re-index cannot attach findings to different lines.
+    for idx, info in enumerate(files):
+        if await stopping():
+            yield _cancelled_marker(files, streamed, started_at)
             return
-        review_cache.put(
-            _file_key(idx, kind), value, kind=kind,
-            meta={"file": files[idx].get("file_name", ""), "tier": kind},
-        )
-
-    def _provenance(idx: int, kind: str) -> str:
-        """The note that turns "no work happened" into evidence a reader can check."""
-        entry = review_cache.get(_file_key(idx, kind)) if cache_enabled else None
-        digest = review_cache.hash_content(files[idx].get("content", ""))[:12]
-        when = ""
-        if entry and entry.get("created"):
-            when = _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(entry["created"]))
-        return (
-            f"\n\n> ♻️ **Cached review** — this file is byte-identical to the copy "
-            f"reviewed{f' on {when}' if when else ''} (sha256 `{digest}…`). "
-            f"No model call was made for it in this run.\n"
-        )
+        analysis = plan.analyses.get(idx)
+        if analysis is None:
+            analysis = await asyncio.to_thread(
+                analyze_file, info.get("content", ""), info.get("file_name", ""), info.get("language", ""),
+            )
+            plan.analyses[idx] = analysis
+        for event in annotation_events(info.get("file_path") or info["file_name"], info.get("content", ""), analysis):
+            yield event
 
     # Per-file timings, filled by the workers and read by the markers below.
     #
-    # A side table rather than a fifth element of the result tuple, because four
+    # A side table rather than an extra element of the result tuple, because four
     # places build those tuples and none of them cares about timing — widening the
     # tuple would touch every one of them to move one number.
     #
@@ -746,22 +739,15 @@ async def stream_multi_review(
     stage_ms: dict[int, dict] = {}
 
     # ── Phase 1+2: static work and model work ─────────────────────────────────
-    async def run_static(idx: int) -> list[tuple[int, str, bool, str | None]]:
+    async def run_static(idx: int) -> list[tuple[int, str, str | None]]:
         if await stopping():
             return []
-        cached = _cache_read(idx, "static")
-        if cached is not None:
-            return [(idx, cached + _provenance(idx, "static"), True, None)]
         text = await asyncio.to_thread(_static_triage, files[idx], plan.analyses.get(idx))
-        _cache_write(idx, "static", text)
-        return [(idx, text, False, None)]
+        return [(idx, text, None)]
 
-    async def run_single(idx: int) -> list[tuple[int, str, bool, str | None]]:
+    async def run_single(idx: int) -> list[tuple[int, str, str | None]]:
         if await stopping():
             return []
-        cached = _cache_read(idx, "single")
-        if cached is not None:
-            return [(idx, cached + _provenance(idx, "single"), True, None)]
 
         if not _PROVIDER_CIRCUIT.allows_call():
             logger.warning(
@@ -789,7 +775,7 @@ async def stream_multi_review(
                     files[idx]["file_name"],
                     files[idx]["content"],
                     files[idx].get("language", ""),
-                    repo_context=ctx,
+                    repo_context=ctx + "\n" + INLINE_COMMENT_INSTRUCTIONS,
                     model_override=model_override,
                 ):
                     tokens.append(token)
@@ -812,16 +798,16 @@ async def stream_multi_review(
                 # The provider's message goes to the log, not into the user's
                 # review: "402 Insufficient Balance" is an operator's problem, and
                 # a review that contains billing text reads as broken software.
-                logger.warning("LLM review failed for %s: %s", files[idx].get("file_name"), exc)
+                logger.warning("LLM review failed for %s: %s", files[idx].get("file_name"), safe_error(exc))
                 _PROVIDER_CIRCUIT.record_failure("provider call failed")
-                return _static_fallback(idx, "model call failed")
+                return _static_fallback(idx, safe_error(exc))
 
         error = next((t for t in tokens if t.startswith("__ERROR__")), None)
         if error:
             logger.warning("review stream reported an error for %s: %s",
-                           files[idx].get("file_name", ""), error[:200])
+                           files[idx].get("file_name", ""), safe_stream_error(error))
             _PROVIDER_CIRCUIT.record_failure("provider reported an error")
-            return _static_fallback(idx, "model call failed")
+            return _static_fallback(idx, safe_stream_error(error))
 
         _PROVIDER_CIRCUIT.record_success()
 
@@ -829,34 +815,20 @@ async def stream_multi_review(
             t for t in tokens
             if not is_protocol_token(t)
         ).strip()
-        _cache_write(idx, "single", review_text)
-        return [(idx, review_text, False, None)]
+        return [(idx, review_text, None)]
 
-    def _static_fallback(idx: int, reason: str) -> list[tuple[int, str, bool, str | None]]:
+    def _static_fallback(idx: int, reason: str) -> list[tuple[int, str, str | None]]:
         """A model that failed is a fact to report, not a file to drop."""
         fallback_only.add(idx)
         text = _static_triage(files[idx], plan.analyses.get(idx))
-        return [(idx, text, False, reason or "model unavailable")]
+        return [(idx, text, reason or "model unavailable")]
 
-    async def run_batch(batch_id: str) -> list[tuple[int, str, bool, str | None]]:
+    async def run_batch(batch_id: str) -> list[tuple[int, str, str | None]]:
         if await stopping():
             return []
         batch = plan.batches[batch_id]
         members = [files[i] for i in batch.indexes]
         names = [m["file_name"] for m in members]
-
-        key = review_cache.batch_key(
-            review_planner.chunk_hashes(members),
-            provider=provider, model="", mode=cache_mode,
-        )
-        entry = review_cache.get(key) if cache_enabled else None
-        if entry:
-            split = split_batch_review(entry["value"], names)
-            if len(split) == len(names):
-                return [
-                    (idx, split[files[idx]["file_name"]] + _provenance(idx, "single"), True, None)
-                    for idx in batch.indexes
-                ]
 
         if not _PROVIDER_CIRCUIT.allows_call():
             return [
@@ -904,19 +876,13 @@ async def stream_multi_review(
             if not is_protocol_token(t)
         ).strip()
         split = split_batch_review(combined, names)
-        if combined:
-            review_cache.put(key, combined, kind="batch_llm",
-                             meta={"files": names, "batch_id": batch_id})
 
-        results: list[tuple[int, str, bool, str | None]] = []
+        results: list[tuple[int, str, str | None]] = []
         for idx in batch.indexes:
             name = files[idx]["file_name"]
             body = split.get(name)
             if body:
-                # Cache the per-file slice too: the same file may be batched with
-                # different neighbours next time, and a batch hit would miss.
-                _cache_write(idx, "single", body)
-                results.append((idx, body, False, None))
+                results.append((idx, body, None))
             else:
                 # The model answered about its neighbours but not this file. Say
                 # so, and give the deterministic report rather than a wrong one.
@@ -1004,7 +970,7 @@ async def stream_multi_review(
                 await _reap(tasks)
                 yield _cancelled_marker(files, streamed, started_at)
                 return
-            for idx, review_text, was_cached, fallback_reason in results:
+            for idx, review_text, fallback_reason in results:
                 file_info = files[idx]
                 file_name = file_info["file_name"]
                 file_id   = file_info.get("file_path") or file_name
@@ -1013,28 +979,10 @@ async def stream_multi_review(
                 yield _section_payload(file_info)
                 streamed.add(idx)
 
-                if was_cached:
-                    cache_hits.add(idx)
-                    # A cache hit is only an LLM review when a model produced it. A
-                    # static report served from cache is still static analysis, and
-                    # counting it as LLM coverage would overstate how much of the repo
-                    # a model actually saw.
-                    if dispatch.kind != "static":
-                        llm_succeeded.add(idx)
-                    tier_label = dispatch.tier
-                    yield status_event(
-                        f"Cache hit: `{file_name}` (no model call)",
-                        step="file", id=file_id, file=file_name,
-                        index=idx + 1, total=n, tier=tier_label, cached=True,
-                    )
-                    yield review_text
-                    per_summaries[idx] = f"**{file_name}**: {review_text[:400]}"
-                    yield status_event(
-                        f"Review done: `{file_name}`",
-                        step="complete", id=file_id, file=file_name,
-                        index=idx + 1, total=n, tier=tier_label, cached=True,
-                    )
-                    continue
+                if dispatch.kind != "static" and not fallback_reason:
+                    review_text, comments = model_annotation_events(file_id, file_info["content"], review_text)
+                    for comment in comments:
+                        yield comment
 
                 if dispatch.kind == "static":
                     yield status_event(
@@ -1052,7 +1000,7 @@ async def stream_multi_review(
                     continue
 
                 # A model review — single or one file of a batch.
-                tier_label = dispatch.tier
+                tier_label = "static" if fallback_reason else dispatch.tier
                 yield status_event(
                     f"Reviewing `{file_name}`",
                     step="file", id=file_id, file=file_name,
@@ -1073,7 +1021,8 @@ async def stream_multi_review(
                         + ("..." if len(review_text) > 400 else "")
                     )
                 yield status_event(
-                    f"Review done: `{file_name}`",
+                    f"Static fallback: `{file_name}` — {fallback_reason}" if fallback_reason else f"Review done: `{file_name}`",
+                    fallback_reason=fallback_reason,
                     step="complete", id=file_id, file=file_name,
                     index=idx + 1, total=n, tier=tier_label,
                     **stage_ms.get(idx, {}),
@@ -1092,7 +1041,7 @@ async def stream_multi_review(
     elapsed_ms = int((_time.monotonic() - started_at) * 1000)
 
     # The slowest file, by model time. `max` over the *measured* subset: a file
-    # answered from cache or by the parser has no `llm_ms` at all, and counting
+    # answered by the parser has no `llm_ms` at all, and counting
     # those as zero would report "the slowest model call took 0 ms" on a run where
     # no model ran. Key presence rather than truthiness for the same reason — an
     # instant local answer genuinely measures 0 ms, and a 0 ms sample is still the
@@ -1103,11 +1052,11 @@ async def stream_multi_review(
         _worst = max(_by_llm, key=lambda idx: _by_llm[idx]["llm_ms"])
         slowest = (files[_worst]["file_name"], _by_llm[_worst])
     yield status_event(
-        f"{plan_stats['model_calls']} model call(s), {len(cache_hits)} cache hit(s) in {elapsed_ms} ms",
+        f"{plan_stats['model_calls']} planned model call(s) in {elapsed_ms} ms",
         step="timing", stage="files",
         elapsed_ms=elapsed_ms,
         model_calls=plan_stats["model_calls"],
-        cache_hits=len(cache_hits),
+        cache_hits=0,
         static_only=plan_stats["static_only"],
         batched_files=plan_stats["batched_files"],
         batch_count=plan_stats["batch_count"],
@@ -1134,10 +1083,10 @@ async def stream_multi_review(
             "static":  static_count,
             "pct":     round((llm_count / n) * 100) if n else 0,
             # Extra detail for the "why" of a coverage number: a planner decision
-            # is not the same as a provider failure, and a cache hit is not a
-            # missed review.
-            "cache_hits": len(cache_hits),
-            "cached_llm": len([i for i in cache_hits if plan.of(i).kind != "static"]),
+            # is not the same as a provider failure. Keep zero-valued legacy
+            # cache fields for stream clients; no result reuse happens.
+            "cache_hits": 0,
+            "cached_llm": 0,
             "planned_static": planned_static,
             "provider_circuit": _PROVIDER_CIRCUIT.snapshot(),
             "fallback_static": len(fallback_only),
@@ -1168,20 +1117,13 @@ async def stream_multi_review(
                 " These are files the parser fully determined — a model review of them "
                 "would restate the analyzer rather than add to it."
             )
-            cache_note = (
-                f" {len(cache_hits)} file(s) were served from the content-hash cache "
-                f"(byte-identical to a previous review), so this run made "
-                f"{plan_stats['model_calls']} model call(s) for {n} files."
-                if cache_hits else ""
-            )
             coverage_context = (
                 f"\n\n**Review coverage:** {llm_count}/{n} files had a model review; "
-                f"{static_count} used deterministic static analysis only.{fallback_note}{cache_note}"
+                f"{static_count} used deterministic static analysis only.{fallback_note}"
             )
         else:
             coverage_context = (
-                f"\n\n**Review coverage:** all {n} files had a model review "
-                f"({len(cache_hits)} served from cache)."
+                f"\n\n**Review coverage:** all {n} files had a model review in this run."
             )
 
         # The summary is another model call, and it is subject to the same
@@ -1256,7 +1198,7 @@ async def stream_multi_review(
 
                 if valid_drafts:
                     # Aggregator: synthesise drafts into one final streaming answer
-                    aggregator_llm = get_chat_llm(streaming=True, review=True)
+                    aggregator_llm = get_chat_llm(streaming=True, review=True, task="reasoning")
                     agg_content = "\n\n---\n\n".join(
                         f"[Draft {i+1} from {mixture_models[i]}]\n{d}"
                         for i, d in enumerate(valid_drafts)
@@ -1285,7 +1227,7 @@ async def stream_multi_review(
             else:
                 # ── Single-model path (default — no config change needed) ───────
                 yield status_event("Generating repo summary", **summary_meta)
-                llm = get_chat_llm(streaming=True, review=True)
+                llm = get_chat_llm(streaming=True, review=True, task="reasoning")
                 messages = [
                     SystemMessage(content=summary_system),
                     HumanMessage(content=summary_prompt),
