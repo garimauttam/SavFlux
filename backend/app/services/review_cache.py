@@ -1,43 +1,11 @@
 """
-review_cache.py — Content-addressed results cache for the review pipeline.
+Legacy review-result cache storage and maintenance helpers.
 
-WHY THIS FILE EXISTS
---------------------
-Reviewing a file is expensive in exactly one dimension: the LLM call. On a 67-file
-repo at ~2.7s per file, three concurrent, that is ~60s of wall clock for a full
-pass — and a full pass used to happen every time, including for the 60 files that
-had not changed since the last one. The static analyzer had already proven their
-findings in 4.5ms each; the model was being asked to re-describe work that was
-finished and whose answer was already known.
-
-So results are cached against a key derived from everything that can change them:
-
-    sha256(content) · file_name · language · provider · model · mode · planner_version
-
-(see `file_key` — the exact bytes matter, and so does `planner_version`, because a
-new planner routes differently and an old answer would then be attributed to the
-wrong decision.)
-
-WHAT A HIT MEANS
-----------------
-A hit means: *the same model was asked the same question about the same bytes
-before, and this is what it said.* It is evidence, not a shortcut — so the review
-carries a provenance note naming the digest and the date, and the file is counted
-as reviewed (because it was) rather than as reviewed-again. A cached result that
-silently looked like a fresh one would be exactly the kind of dishonesty this
-codebase is built to avoid.
-
-WHY NOT CACHE THE SUMMARIES OR THE PATCHES?
-The repo summary depends on the *set* of findings, and a patch depends on the
-working copy. Both are cheap relative to the model calls, and caching either
-would mean reasoning about staleness for no measurable gain. This module caches
-per-file and per-batch review text only.
-
-STORAGE
--------
-`chroma_data/review_cache.json`, one entry per key, LRU-evicted by count and by
-bytes. Thread-safe, atomic writes, and every operation degrades to "miss" rather
-than raising — a review must never fail because a cache file is corrupt.
+The active review pipeline no longer imports or uses this cache. These helpers
+remain for inspecting and explicitly clearing results persisted by older versions
+(and for testing the legacy format). They are not a personalization store.
+Entries are scoped to the authenticated account via data_file(). Existing files
+are not automatically deleted, migrated, or repurposed for personalization.
 """
 
 from __future__ import annotations

@@ -132,7 +132,7 @@ def is_connected() -> bool:
 
 def _headers(token: str) -> dict:
     return {
-        "Authorization": f"Bearer {token}",
+        **({"Authorization": f"Bearer {token}"} if token else {}),
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "SavFlux",
@@ -142,8 +142,8 @@ def _headers(token: str) -> dict:
 def _classify(status: int, remaining: str | None) -> tuple[str, str]:
     if status in (401,):
         return "auth", "GitHub rejected the token. Create a new one with the 'repo' scope and reconnect."
-    if status == 403 and remaining == "0":
-        return "rate_limit", "GitHub's rate limit for this token is exhausted. It resets within the hour."
+    if status == 429 or (status == 403 and remaining == "0"):
+        return "rate_limit", "GitHub's API rate limit was reached. Wait for it to reset before retrying."
     if status == 403:
         return "auth", "The token is missing a permission this request needs (usually 'repo' for private repositories)."
     if status == 404:
@@ -162,9 +162,10 @@ async def _request(
     token: Optional[str] = None,
     params: dict | None = None,
     json_body: dict | None = None,
+    allow_anonymous: bool = False,
 ) -> Any:
     tok = token if token is not None else get_token()
-    if not tok:
+    if not tok and not (allow_anonymous and method == "GET"):
         raise GitHubError("GitHub is not connected.", status=0, kind="auth")
     url = path if path.startswith("http") else f"{_API}{path}"
     try:
@@ -378,7 +379,7 @@ async def list_repos(
 
 
 async def get_repo(slug: str) -> dict:
-    raw = await _request("GET", f"/repos/{slug}")
+    raw = await _request("GET", f"/repos/{slug}", allow_anonymous=True)
     out = shape_repo(raw)
     # `shape_repo` already carries permissions, which come from the
     # authenticated user's view rather than the public repo object — they are
@@ -401,9 +402,12 @@ def can_write(repo: dict | None) -> bool:
     return bool((repo.get("permissions") or {}).get("push"))
 
 
-async def list_branches(slug: str, *, per_page: int = 100) -> list[dict]:
+async def list_branches(slug: str, *, per_page: int = 100, page: int = 1) -> list[dict]:
+    """Read remote branches; public repos do not require a GitHub connection."""
     raw = await _request(
-        "GET", f"/repos/{slug}/branches", params={"per_page": max(1, min(per_page, 100))}
+        "GET", f"/repos/{slug}/branches",
+        params={"per_page": max(1, min(per_page, 100)), "page": max(1, page)},
+        allow_anonymous=True,
     )
     return [
         {
@@ -431,6 +435,7 @@ async def compare_branches(slug: str, base: str, head: str) -> dict:
         "GET",
         f"/repos/{slug}/compare/{base_ref}...{head_ref}",
         params={"per_page": 100},
+        allow_anonymous=True,
     )
     if not isinstance(raw, dict):
         raise GitHubError("GitHub returned an invalid branch comparison.", kind="error")

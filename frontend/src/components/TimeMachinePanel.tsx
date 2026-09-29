@@ -7,6 +7,8 @@
  * GET /history/blame; clicking a commit re-blames at that revision.
  */
 
+import type { OnIndexed } from "../lib/repositorySelection";
+
 import { useCallback, useEffect, useState } from "react";
 import {
   History, Loader2, GitCommitHorizontal, ChevronRight, AlertTriangle,
@@ -37,7 +39,7 @@ interface TimeMachinePanelProps {
   initialSource?: string | null;
   onInitialSourceConsumed?: () => void;
   /** Re-read the index after the user indexes from this tab. */
-  onIndexed: () => void;
+  onIndexed: OnIndexed;
 }
 
 const AUTHOR_COLORS = [

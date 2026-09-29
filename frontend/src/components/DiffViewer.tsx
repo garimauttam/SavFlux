@@ -1,209 +1,437 @@
-/**
- * DiffViewer.tsx — P2 Diff Viewer ($0, difflib backend)
- *
- * Features:
- *  - Two file selectors (dropdowns from indexed files)
- *  - Fetch GET /diff/file?source= for preview + POST /diff/compare for unified diff
- *  - Unified diff with syntax (added green, removed red, hunk header cyan)
- *  - Split toggle (side-by-side via two <pre>), context lines 0-10
- *  - Stats (added/removed, similarity), Copy diff, Swap, $0 no deps
- */
-
-import { useEffect, useState } from "react";
+/** Read-only comparisons of indexed snapshots, not local files or Git branches. */
+import { useEffect, useId, useRef, useState } from "react";
+import {
+  ArrowLeftRight,
+  Copy,
+  FileCode,
+  GitCompare,
+  Loader2,
+  Search,
+} from "lucide-react";
 import { apiFetch } from "../api";
-import { GitCompare, ArrowLeftRight, Copy, Search, FileCode } from "lucide-react";
+import { ReviewSyntax } from "../lib/highlight";
+import { repositoryKey } from "../lib/repositorySelection";
 
-type IndexedFile = { source: string; file_name: string; language: string };
+type IndexedFile = {
+  source: string;
+  file_name: string;
+  language: string;
+  repo_url?: string;
+};
+type Comparison = {
+  unified_diff: string;
+  added: number;
+  removed: number;
+  similarity: number;
+  a_lines: number;
+  b_lines: number;
+  a_content: string;
+  b_content: string;
+  a_truncated?: boolean;
+  b_truncated?: boolean;
+};
+const pathName = (source: string) => source.split("::").pop() || source;
 
-export default function DiffViewer() {
+export default function DiffViewer({
+  activeRepoUrl = null,
+}: {
+  activeRepoUrl?: string | null;
+}) {
+  const id = useId();
   const [files, setFiles] = useState<IndexedFile[]>([]);
   const [sourceA, setSourceA] = useState("");
   const [sourceB, setSourceB] = useState("");
   const [context, setContext] = useState(3);
-  const [unified, setUnified] = useState("");
-  const [stats, setStats] = useState<{ added: number; removed: number; similarity: number; a_lines: number; b_lines: number } | null>(null);
-  const [aContent, setAContent] = useState("");
-  const [bContent, setBContent] = useState("");
+  const [result, setResult] = useState<Comparison | null>(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [filesLoading, setFilesLoading] = useState(true);
+  const [filesError, setFilesError] = useState("");
+  const [retry, setRetry] = useState(0);
+  const [error, setError] = useState("");
+  const [copyStatus, setCopyStatus] = useState("");
   const [query, setQuery] = useState("");
   const [split, setSplit] = useState(false);
+  const requestRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    (async () => {
+    const controller = new AbortController();
+    setFilesLoading(true);
+    setFilesError("");
+    setFiles([]);
+    setSourceA("");
+    setSourceB("");
+    void (async () => {
       try {
-        const res = await apiFetch("/api/v1/chat/indexed-files");
-        if (res.ok) {
-          const data = await res.json();
-          setFiles(data.files || []);
-          if (data.files?.length >= 2) {
-            setSourceA(data.files[0].source);
-            setSourceB(data.files[1].source);
-          } else if (data.files?.length === 1) {
-            setSourceA(data.files[0].source);
-          }
-        }
-      } catch {}
-      // Also try file-tree flat for more files
-      try {
-        const r2 = await apiFetch("/api/v1/file-tree");
-        if (r2.ok) {
-          const j2 = await r2.json();
-          const flat = (j2.flat || []).map((f: any) => ({ source: f.source, file_name: f.name, language: f.language }));
-          if (flat.length) setFiles((prev) => (prev.length ? prev : flat));
-        }
-      } catch {}
+        const res = await apiFetch("/api/v1/chat/indexed-files", {
+          signal: controller.signal,
+        });
+        if (!res.ok)
+          throw new Error(`Could not load indexed files (HTTP ${res.status}).`);
+        const data = await res.json();
+        if (!Array.isArray(data.files))
+          throw new Error("The index did not return a file list.");
+        const scoped = data.files.filter(
+          (file: IndexedFile) =>
+            !activeRepoUrl ||
+            repositoryKey(file.repo_url || file.source.split("::")[0]) ===
+              repositoryKey(activeRepoUrl),
+        );
+        if (!controller.signal.aborted) setFiles(scoped);
+      } catch (e) {
+        if (!controller.signal.aborted)
+          setFilesError(
+            e instanceof Error ? e.message : "Could not load indexed files.",
+          );
+      } finally {
+        if (!controller.signal.aborted) setFilesLoading(false);
+      }
     })();
-  }, []);
+    return () => controller.abort();
+  }, [activeRepoUrl, retry]);
 
-  const handleCompare = async () => {
-    if (!sourceA || !sourceB) { setError("Select two different files"); return; }
-    if (sourceA === sourceB) { setError("Pick two different files"); return; }
+  // Changing selectors/context invalidates the old output and cancels its request.
+  useEffect(() => {
+    requestRef.current?.abort();
+    setResult(null);
+    setError("");
+    setCopyStatus("");
+    setLoading(false);
+    return () => requestRef.current?.abort();
+  }, [sourceA, sourceB, context, activeRepoUrl]);
+
+  const blockedReason = loading
+    ? "Comparing indexed snapshots…"
+    : filesLoading
+      ? "Loading indexed files…"
+      : filesError
+        ? "Retry loading the file list before comparing."
+        : files.length < 2
+          ? "Index at least two files in this repository to compare their contents."
+          : !sourceA || !sourceB
+            ? "Choose File A and File B to compare."
+            : sourceA === sourceB
+              ? "Choose two different files to compare."
+              : "";
+
+  const compare = async () => {
+    if (blockedReason) return;
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setLoading(true);
+    setError("");
+    setCopyStatus("");
+    setResult(null);
     try {
-      setLoading(true);
-      setError(null);
       const res = await apiFetch("/api/v1/diff/compare", {
         method: "POST",
+        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source_a: sourceA, source_b: sourceB, context }),
       });
-      if (!res.ok) {
-        const j = await res.json().catch(() => ({}));
-        throw new Error(j.detail || `HTTP ${res.status}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok)
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : `Comparison failed (HTTP ${res.status}).`,
+        );
+      if (
+        typeof data.unified_diff !== "string" ||
+        typeof data.a_content !== "string" ||
+        typeof data.b_content !== "string"
+      ) {
+        throw new Error(
+          "The server did not return a complete comparison. Retry after refreshing the index.",
+        );
       }
-      const data = await res.json();
-      setUnified(data.unified_diff || "");
-      setStats({ added: data.added, removed: data.removed, similarity: data.similarity, a_lines: data.a_lines, b_lines: data.b_lines });
-      setAContent(data.a_content || "");
-      setBContent(data.b_content || "");
-    } catch (e: any) {
-      setError(e?.message || "Diff failed");
-      setUnified("");
-      setStats(null);
+      if (!controller.signal.aborted) setResult(data);
+    } catch (e) {
+      if (!controller.signal.aborted)
+        setError(e instanceof Error ? e.message : "Comparison failed.");
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  };
+  const copy = async () => {
+    if (!result?.unified_diff) return;
+    try {
+      await navigator.clipboard.writeText(result.unified_diff);
+      setCopyStatus("Diff copied.");
+    } catch {
+      setCopyStatus(
+        "Clipboard unavailable. Select and copy the unified diff instead.",
+      );
     }
   };
 
-  const handleSwap = () => {
-    const a = sourceA;
-    setSourceA(sourceB);
-    setSourceB(a);
-  };
-
-  const handleCopy = async () => {
-    if (!unified) return;
-    try { await navigator.clipboard.writeText(unified); } catch {}
-  };
-
-  const filteredFiles = query
-    ? files.filter((f) => `${f.source} ${f.file_name}`.toLowerCase().includes(query.toLowerCase())).slice(0, 100)
-    : files.slice(0, 100);
-
-  const renderUnified = () => {
-    if (!unified) return <div className="text-xs text-gray-500 p-6 text-center">No diff yet — pick two files and hit Compare.</div>;
-    const lines = unified.split("\n");
-    return (
-      <pre className="text-xs font-mono bg-black/40 border border-white/5 rounded p-3 overflow-x-auto whitespace-pre-wrap break-words max-h-[60vh] overflow-y-auto">
-        {lines.map((line, idx) => {
-          let cls = "text-gray-300";
-          if (line.startsWith("+++") || line.startsWith("---")) cls = "text-gray-500 font-bold";
-          else if (line.startsWith("@@")) cls = "text-cyan-400 bg-cyan-500/10";
-          else if (line.startsWith("+")) cls = "text-emerald-300 bg-emerald-500/10";
-          else if (line.startsWith("-")) cls = "text-red-300 bg-red-500/10";
-          return <div key={idx} className={cls}>{line || " "}</div>;
-        })}
-      </pre>
-    );
-  };
-
-  const renderSplit = () => {
-    if (!aContent || !bContent) return renderUnified();
-    return (
-      <div className="grid md:grid-cols-2 gap-3">
-        <div>
-          <div className="text-xs font-semibold text-gray-400 mb-1 flex items-center gap-1"><FileCode className="w-3 h-3" />{sourceA} · {stats?.a_lines} lines</div>
-          <pre className="text-xs font-mono bg-black/40 border border-white/5 rounded p-3 overflow-x-auto whitespace-pre-wrap break-words max-h-[60vh] overflow-y-auto text-gray-300">{aContent}</pre>
+  const matches = files.filter((file) =>
+    `${file.source} ${file.file_name}`
+      .toLowerCase()
+      .includes(query.toLowerCase()),
+  );
+  // Search must not remove the selected option and silently mislabel its value.
+  const options = files.filter(
+    (file) =>
+      matches.includes(file) ||
+      file.source === sourceA ||
+      file.source === sourceB,
+  );
+  const picker = (
+    side: "A" | "B",
+    value: string,
+    setValue: (value: string) => void,
+  ) => (
+    <label className="block min-w-0 text-xs sf-dim">
+      File {side}
+      <select
+        aria-label={`File ${side}`}
+        value={value}
+        onChange={(event) => setValue(event.target.value)}
+        disabled={filesLoading || files.length === 0}
+        className="sf-input mt-1 block w-full min-w-0 text-sm"
+        title={value || `Choose File ${side}`}
+      >
+        <option value="">Choose a file…</option>
+        {options.map((file) => (
+          <option key={file.source} value={file.source}>
+            {pathName(file.source)}
+            {!activeRepoUrl
+              ? ` — ${file.repo_url || file.source.split("::")[0]}`
+              : ""}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+  const snapshot = (
+    source: string,
+    content: string,
+    side: string,
+    count: number,
+  ) => (
+    <section
+      className="min-w-0 overflow-hidden rounded-lg border sf-line"
+      aria-label={`File ${side} snapshot`}
+    >
+      <header className="sf-raised border-b sf-line p-3">
+        <div className="sf-text flex min-w-0 items-center gap-2 text-xs font-medium">
+          <FileCode className="h-4 w-4 shrink-0" />
+          <span className="min-w-0 truncate" title={source}>
+            {pathName(source)}
+          </span>
         </div>
-        <div>
-          <div className="text-xs font-semibold text-gray-400 mb-1 flex items-center gap-1"><FileCode className="w-3 h-3" />{sourceB} · {stats?.b_lines} lines</div>
-          <pre className="text-xs font-mono bg-black/40 border border-white/5 rounded p-3 overflow-x-auto whitespace-pre-wrap break-words max-h-[60vh] overflow-y-auto text-gray-300">{bContent}</pre>
-        </div>
+        <p className="sf-mute mt-1 text-xs">
+          File {side} · {count} lines · indexed snapshot
+        </p>
+      </header>
+      {((side === "A" ? result?.a_truncated : result?.b_truncated) ??
+        content.length >= 20000) && (
+        <p className="sf-mute border-b sf-line p-3 text-xs">
+          Preview limited to the first 20,000 characters. The unified diff
+          compares the complete indexed snapshots.
+        </p>
+      )}
+      <div className="max-h-[60vh] overflow-auto py-2">
+        {content === "" ? (
+          <p className="sf-mute p-3 text-xs">Empty file</p>
+        ) : (
+          <ReviewSyntax
+            code={content}
+            language={
+              files.find((file) => file.source === source)?.language ||
+              source.split(".").pop() ||
+              "text"
+            }
+            renderLines={(rows) =>
+              rows.map((row, i) => (
+                <div className="sf-code-line" key={i}>
+                  <span className="sf-line-number">{i + 1}</span>
+                  <code>{row}</code>
+                </div>
+              ))
+            }
+          />
+        )}
       </div>
-    );
-  };
+    </section>
+  );
 
   return (
-    <div className="space-y-4 max-w-4xl mx-auto">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <GitCompare className="w-5 h-5 text-pink-400" />
-          <h2 className="text-base font-bold text-[var(--sf-text)]">Compare indexed files</h2>
-          <span className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--sf-line)] text-[var(--sf-text-mute)]">INDEX SNAPSHOTS</span>
-          {loading && <span className="text-xs text-gray-500">diffing…</span>}
+    <section className="mx-auto w-full min-w-0 max-w-5xl space-y-4">
+      <header>
+        <div className="flex flex-wrap items-center gap-2">
+          <GitCompare className="sf-accent h-5 w-5" />
+          <h2 className="sf-text text-lg font-semibold">
+            Compare indexed files
+          </h2>
+          <span className="sf-chip">READ ONLY</span>
         </div>
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-gray-400 flex items-center gap-1">
-            Context
-            <select value={context} onChange={(e) => setContext(parseInt(e.target.value, 10))} className="px-1 py-1 rounded bg-black/30 border border-white/10 text-xs text-white">
-              {[0,1,2,3,5,10].map((n) => <option key={n} value={n}>{n}</option>)}
-            </select>
-          </label>
-          <label className="text-xs text-gray-400 flex items-center gap-1">
-            <input type="checkbox" checked={split} onChange={(e) => setSplit(e.target.checked)} className="accent-pink-500" /> Split
-          </label>
+        <p className="sf-dim mt-1 text-xs leading-relaxed">
+          Choose two indexed snapshots
+          {activeRepoUrl ? " from the selected repository" : ""}. These are not
+          live working files or branch revisions. Use <strong>Branches</strong>{" "}
+          for a GitHub branch diff.
+        </p>
+      </header>
+      <div className="sf-surface space-y-4 rounded-xl border sf-line p-4">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <Search className="sf-mute h-4 w-4 shrink-0" />
+          <input
+            aria-label="Filter files"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Filter by file path…"
+            className="sf-input min-w-0 flex-1 text-sm"
+          />
+          <span className="sf-mute text-xs">
+            {query ? `${matches.length} matches · ` : ""}
+            {files.length} files
+          </span>
         </div>
-      </div>
-
-      {error && <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded p-2">{error}</div>}
-
-      {/* File pickers */}
-      <div className="rounded-lg border border-white/10 bg-white/[0.04] p-3 space-y-3">
-        <div className="flex items-center gap-2">
-          <Search className="w-3.5 h-3.5 text-gray-500" />
-          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Filter files…" className="flex-1 bg-black/30 border border-white/10 rounded px-2 py-1 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-pink-500/50" />
-          <span className="text-xs text-gray-500">{files.length} files</span>
-        </div>
-        <div className="grid md:grid-cols-[1fr_auto_1fr] gap-2 items-end">
-          <div>
-            <label className="text-xs text-gray-400">File A</label>
-            <select value={sourceA} onChange={(e) => setSourceA(e.target.value)} className="w-full mt-1 px-2 py-1.5 rounded bg-black/30 border border-white/10 text-sm text-white">
-              <option value="">— pick file —</option>
-              {filteredFiles.map((f) => <option key={f.source} value={f.source}>{f.file_name} — {f.source.slice(0, 60)}</option>)}
-            </select>
-          </div>
-          <button onClick={handleSwap} title="Swap A ↔ B" className="p-2 rounded bg-white/10 hover:bg-white/20 text-gray-300 self-center mt-5">
-            <ArrowLeftRight className="w-4 h-4" />
+        <div className="grid items-end gap-3 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+          {picker("A", sourceA, setSourceA)}
+          <button
+            type="button"
+            onClick={() => {
+              setSourceA(sourceB);
+              setSourceB(sourceA);
+            }}
+            aria-label="Swap files"
+            title="Swap File A and File B"
+            disabled={!sourceA || !sourceB}
+            className="sf-iconbtn h-9 w-9 justify-self-center"
+          >
+            <ArrowLeftRight className="h-4 w-4" />
           </button>
-          <div>
-            <label className="text-xs text-gray-400">File B</label>
-            <select value={sourceB} onChange={(e) => setSourceB(e.target.value)} className="w-full mt-1 px-2 py-1.5 rounded bg-black/30 border border-white/10 text-sm text-white">
-              <option value="">— pick file —</option>
-              {filteredFiles.map((f) => <option key={f.source} value={f.source}>{f.file_name} — {f.source.slice(0, 60)}</option>)}
+          {picker("B", sourceB, setSourceB)}
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <label className="sf-dim flex items-center gap-2 whitespace-nowrap text-xs">
+            Diff context
+            <select
+              value={context}
+              onChange={(e) => setContext(Number(e.target.value))}
+              className="sf-input text-xs"
+            >
+              {[0, 1, 2, 3, 5, 10].map((n) => (
+                <option key={n} value={n}>
+                  {n} lines
+                </option>
+              ))}
             </select>
-          </div>
+          </label>
+          <button
+            type="button"
+            onClick={() => void compare()}
+            disabled={Boolean(blockedReason)}
+            aria-describedby={`${id}-status`}
+            className="sf-btn sf-btn-primary"
+          >
+            {loading ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <GitCompare className="h-4 w-4" />
+            )}
+            {loading ? "Comparing…" : "Compare"}
+          </button>
         </div>
-        <div className="flex justify-between items-center">
-          <div className="text-xs text-gray-500">
-            {stats ? <span className="text-emerald-300">+{stats.added}</span> : null}
-            {stats ? <span className="text-red-300"> −{stats.removed}</span> : null}
-            {stats ? <span className="text-gray-400"> · similarity {Math.round(stats.similarity * 100)}% · A {stats.a_lines} lines · B {stats.b_lines} lines</span> : null}
+        <p id={`${id}-status`} role="status" className="sf-mute text-xs">
+          {blockedReason || "Ready to compare File A → File B."}
+        </p>
+        {filesError && (
+          <div role="alert" className="text-xs text-[var(--sf-bad)]">
+            {filesError}
+            <button
+              className="sf-btn sf-btn-secondary ml-2"
+              onClick={() => setRetry((n) => n + 1)}
+            >
+              Retry loading files
+            </button>
           </div>
-          <div className="flex gap-2">
-            <button onClick={handleCopy} disabled={!unified} className="text-xs px-2.5 py-1.5 rounded bg-white/10 hover:bg-white/20 text-gray-200 disabled:opacity-40 flex items-center gap-1"><Copy className="w-3 h-3" /> Copy diff</button>
-            <button onClick={handleCompare} disabled={!sourceA || !sourceB || loading} className="text-xs px-3 py-1.5 rounded bg-pink-500 hover:bg-pink-400 text-white font-semibold disabled:opacity-40 flex items-center gap-1"><GitCompare className="w-3 h-3" /> Compare</button>
+        )}
+        {error && (
+          <p role="alert" className="text-xs text-[var(--sf-bad)]">
+            {error}
+          </p>
+        )}
+      </div>
+      {result && (
+        <div className="space-y-3" aria-label="Indexed comparison result">
+          <div className="sf-surface flex flex-wrap items-center justify-between gap-3 rounded-xl border sf-line p-3">
+            <p className="sf-dim text-xs">
+              <span className="text-[var(--sf-good)]">+{result.added}</span> /{" "}
+              <span className="text-[var(--sf-bad)]">−{result.removed}</span> ·
+              similarity {Math.round(result.similarity * 100)}%
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                className={`sf-btn ${!split ? "sf-btn-primary" : "sf-btn-secondary"}`}
+                aria-pressed={!split}
+                onClick={() => setSplit(false)}
+              >
+                Unified diff
+              </button>
+              <button
+                className={`sf-btn ${split ? "sf-btn-primary" : "sf-btn-secondary"}`}
+                aria-pressed={split}
+                onClick={() => setSplit(true)}
+              >
+                Side-by-side previews
+              </button>
+              <button
+                onClick={() => void copy()}
+                disabled={!result.unified_diff}
+                className="sf-btn sf-btn-secondary"
+              >
+                <Copy className="h-3 w-3" />
+                Copy diff
+              </button>
+            </div>
           </div>
+          {copyStatus && (
+            <p role="status" className="sf-dim text-xs">
+              {copyStatus}
+            </p>
+          )}
+          {!result.unified_diff && (
+            <p
+              role="status"
+              className="sf-dim rounded-xl border sf-line p-4 text-sm"
+            >
+              These indexed files have identical contents.
+            </p>
+          )}
+          {split ? (
+            <>
+              <p className="sf-mute text-xs">
+                Snapshot previews, not line-aligned changes. Choose Unified diff
+                to see added and removed lines.
+              </p>
+              <div className="grid min-w-0 gap-3 md:grid-cols-2">
+                {snapshot(sourceA, result.a_content, "A", result.a_lines)}
+                {snapshot(sourceB, result.b_content, "B", result.b_lines)}
+              </div>
+            </>
+          ) : (
+            result.unified_diff && (
+              <pre
+                aria-label="Unified file diff"
+                className="sf-code-typography sf-surface max-h-[60vh] overflow-auto rounded-xl border sf-line p-3"
+              >
+                {result.unified_diff.split("\n").map((line, i) => (
+                  <span
+                    key={i}
+                    className={`block whitespace-pre ${line.startsWith("+++") || line.startsWith("---") ? "sf-mute" : line.startsWith("+") ? "text-[var(--sf-good)] bg-emerald-500/10" : line.startsWith("-") ? "text-[var(--sf-bad)] bg-red-500/10" : line.startsWith("@@") ? "sf-accent" : "sf-dim"}`}
+                  >
+                    {line || " "}
+                  </span>
+                ))}
+              </pre>
+            )
+          )}
         </div>
-      </div>
-
-      {/* Diff output */}
-      <div className="rounded-lg border border-white/10 bg-white/[0.03] p-3">
-        {split ? renderSplit() : renderUnified()}
-      </div>
-
-      <div className="rounded-lg border border-[var(--sf-line)] bg-[var(--sf-surface)] px-3 py-2 text-center text-xs leading-relaxed text-[var(--sf-text-mute)]">
-        This compares two file contents already in SavFlux's index; it does not compare Git branches. Choose <strong className="font-medium text-[var(--sf-text-dim)]">Branches</strong> above for a read-only GitHub branch comparison.
-      </div>
-    </div>
+      )}
+    </section>
   );
 }

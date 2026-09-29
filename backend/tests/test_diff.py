@@ -89,3 +89,15 @@ def test_diff_api(client):
             assert resp8.status_code == 200
             # Should have called with default 3
             assert mock_compute.call_args[0][2] == 3
+
+
+def test_snapshot_preview_caps_are_explicit_and_do_not_limit_the_diff(monkeypatch):
+    import app.services.diff_service as svc
+    prefix = "same\n" * 4100
+    def content(source):
+        return {"source": source, "content": prefix + ("before\n" if source == "a.py" else "after\n"), "language": "python"}
+    monkeypatch.setattr(svc, "get_file_content", content)
+    result = svc.compute_diff("a.py", "b.py")
+    assert result["a_truncated"] and result["b_truncated"]
+    assert len(result["a_content"]) == len(result["b_content"]) == 20000
+    assert "-before" in result["unified_diff"] and "+after" in result["unified_diff"]

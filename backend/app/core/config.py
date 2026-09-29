@@ -54,7 +54,14 @@ class Settings(BaseSettings):
     # missing feature, it is a startup crash: pydantic rejects the value before
     # any route runs. That is exactly what `.env.example` used to instruct users
     # to do, so test_provider_config.py now asserts the two agree.
-    llm_provider: Literal["ollama", "deepseek", "openai", "openrouter"] = "ollama"
+    llm_provider: Literal["ollama", "deepseek", "openai", "openrouter", "groq", "gemini", "mistral"] = "ollama"
+
+    groq_api_key: Optional[str] = None
+    groq_chat_model: str = "openai/gpt-oss-20b"
+    gemini_api_key: Optional[str] = None
+    gemini_chat_model: str = "gemini-2.5-flash"
+    mistral_api_key: Optional[str] = None
+    mistral_chat_model: str = "mistral-small-latest"
 
     # --- OpenAI (used when llm_provider=openai) ---
     openai_api_key: Optional[str] = None
@@ -184,10 +191,8 @@ class Settings(BaseSettings):
     # The only cost of raising it is wall-clock time, governed by
     # review_llm_budget and review_concurrency — not by this number.
     review_max_files_per_request: int = 2000
-    # review_cache_enabled: reuse a review when the file's content hash, language,
-    # model and prompt version all match a previous run. Off = every review is a
-    # fresh model call.
-    review_cache_enabled: bool = True
+    # Review-result caching was retired. Legacy REVIEW_CACHE_ENABLED env values
+    # are ignored; every new review runs fresh static/model analysis.
 
     # --- Risk policy gate ---
     # risk_gate_enabled: require approval (or refuse) when a change is risky

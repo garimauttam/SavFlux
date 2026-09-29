@@ -22,8 +22,11 @@
  * the behaviour in code we own, keeps the box identical, and gives the case a test.
  */
 
-import type { CSSProperties } from "react";
-import { PrismLight as SyntaxHighlighter } from "react-syntax-highlighter";
+import type { CSSProperties, ReactNode } from "react";
+import {
+  PrismLight as SyntaxHighlighter,
+  createElement as syntaxElement,
+} from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 import bash from "react-syntax-highlighter/dist/esm/languages/prism/bash";
@@ -42,6 +45,8 @@ import haskell from "react-syntax-highlighter/dist/esm/languages/prism/haskell";
 import java from "react-syntax-highlighter/dist/esm/languages/prism/java";
 import ini from "react-syntax-highlighter/dist/esm/languages/prism/ini";
 import javascript from "react-syntax-highlighter/dist/esm/languages/prism/javascript";
+import jsx from "react-syntax-highlighter/dist/esm/languages/prism/jsx";
+import tsx from "react-syntax-highlighter/dist/esm/languages/prism/tsx";
 import json from "react-syntax-highlighter/dist/esm/languages/prism/json";
 import kotlin from "react-syntax-highlighter/dist/esm/languages/prism/kotlin";
 import lua from "react-syntax-highlighter/dist/esm/languages/prism/lua";
@@ -91,6 +96,8 @@ const GRAMMARS: Record<string, unknown> = {
   ini,
   java,
   javascript,
+  jsx,
+  tsx,
   json,
   kotlin,
   lua,
@@ -129,7 +136,6 @@ const ALIASES: Record<string, string> = {
   hpp: "cpp",
   html: "markup",
   js: "javascript",
-  jsx: "javascript",
   jupyter: "python",
   md: "markdown",
   mdx: "markdown",
@@ -144,7 +150,6 @@ const ALIASES: Record<string, string> = {
   "shell-session": "bash",
   svelte: "markup",
   ts: "typescript",
-  tsx: "typescript",
   vue: "markup",
   xml: "markup",
   zsh: "bash",
@@ -170,7 +175,9 @@ const REGISTERED = new Set([...Object.keys(GRAMMARS), ...Object.keys(ALIASES)]);
  * Returning `null` rather than guessing keeps the failure quiet and visible: plain
  * text in the right box, not the wrong colour scheme and not an error boundary.
  */
-export function resolveLanguage(info: string | undefined | null): string | null {
+export function resolveLanguage(
+  info: string | undefined | null,
+): string | null {
   const token = String(info ?? "")
     .trim()
     .split(/[\s,=:]+/)[0]
@@ -204,13 +211,32 @@ export interface CodeHighlightProps {
  * and a `<pre>` inside a `<p>` is invalid HTML that React fixes silently and jsdom
  * does not — the shape every call site already used is kept so no layout moves.
  */
-export function CodeHighlight({ language, children, className, customStyle }: CodeHighlightProps) {
+export function CodeHighlight({
+  language,
+  children,
+  className,
+  customStyle,
+}: CodeHighlightProps) {
   const resolved = resolveLanguage(language);
+  const codeStyle: CSSProperties = {
+    fontFamily: "var(--sf-font-mono)",
+    fontSize: "var(--sf-code-size)",
+    lineHeight: "var(--sf-code-leading)",
+    fontVariantLigatures: "none",
+    ...customStyle,
+  };
 
   if (!resolved) {
     return (
-      <pre className={className} style={customStyle}>
-        <code style={{ display: "block", padding: "0.5em 1em", whiteSpace: "pre-wrap" }}>
+      <pre className={className} style={codeStyle}>
+        <code
+          style={{
+            font: "inherit",
+            display: "block",
+            padding: "0.5em 1em",
+            whiteSpace: "pre-wrap",
+          }}
+        >
           {children}
         </code>
       </pre>
@@ -223,9 +249,60 @@ export function CodeHighlight({ language, children, className, customStyle }: Co
       style={vscDarkPlus}
       PreTag="div"
       className={className}
-      customStyle={customStyle}
+      customStyle={codeStyle}
+      codeTagProps={{
+        style: {
+          fontFamily: "inherit",
+          fontSize: "inherit",
+          lineHeight: "inherit",
+        },
+      }}
     >
       {children}
+    </SyntaxHighlighter>
+  );
+}
+
+/** Tokenize the entire file before splitting rows, preserving multiline strings/comments.
+ * CSS token colors follow the workspace theme rather than a fixed dark stylesheet.
+ */
+export function ReviewSyntax({
+  code,
+  language,
+  renderLines,
+}: {
+  code: string;
+  language: string;
+  renderLines: (lines: ReactNode[]) => ReactNode;
+}) {
+  const resolved = resolveLanguage(language);
+  if (!resolved)
+    return (
+      <div className="sf-review-syntax">{renderLines(code.split("\n"))}</div>
+    );
+  return (
+    <SyntaxHighlighter
+      language={resolved}
+      useInlineStyles={false}
+      wrapLines
+      PreTag="div"
+      CodeTag="div"
+      className="sf-review-syntax"
+      customStyle={{ margin: 0, padding: 0, background: "transparent" }}
+      renderer={({ rows, stylesheet }) =>
+        renderLines(
+          rows.map((node, key) =>
+            syntaxElement({
+              node,
+              key,
+              stylesheet,
+              useInlineStyles: false,
+            }),
+          ),
+        )
+      }
+    >
+      {code}
     </SyntaxHighlighter>
   );
 }

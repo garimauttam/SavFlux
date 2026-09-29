@@ -15,6 +15,8 @@
  * rather than hunting a strip for a label you had to already know.
  */
 
+import type { OnIndexed } from "../../lib/repositorySelection";
+
 import { useState } from "react";
 import { LIBRARY_TABS, type LibraryTab } from "../../navigation";
 import AnalyticsPanel from "../AnalyticsPanel";
@@ -29,7 +31,7 @@ import BulkOpsPanel from "../BulkOpsPanel";
 interface LibraryPanelProps {
   onUsePrompt: (text: string) => void;
   /** Re-read the index — the History tab can index from its own empty state. */
-  onIndexed: () => void;
+  onIndexed: OnIndexed;
 }
 
 export function LibraryPanel({ onUsePrompt, onIndexed }: LibraryPanelProps) {

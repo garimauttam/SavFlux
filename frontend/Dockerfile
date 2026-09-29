@@ -1,7 +1,7 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-# Node 20 to install deps and run `vite build`.
+# Node 22 to install deps and run `vite build`.
 # This stage is ONLY for building — it won't be in the final image.
-FROM node:20-slim AS build
+FROM node:22-slim AS build
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
@@ -22,7 +22,7 @@ ENV VITE_SUPABASE_ANON_KEY=$VITE_SUPABASE_ANON_KEY
 RUN npm run build                  # produces /app/dist/
 
 # ── Stage 2: Serve ────────────────────────────────────────────────────────────
-# nginx:alpine is ~25MB vs node:20-slim at ~200MB.
+# nginx:alpine is ~25MB vs node:22-slim at ~200MB.
 # We only copy the compiled static files — Node is gone from this image.
 FROM nginx:alpine AS runtime
 

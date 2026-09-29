@@ -1,5 +1,5 @@
 """
-Tests for the review planner and its caches.
+Tests for fresh review planning and legacy cache maintenance.
 
 The planner is a *budget*: it decides which files get a language model and which
 do not. A budget that is not tested is a silent omission, so the assertions here
@@ -12,8 +12,7 @@ routing table:
   * a file the analyzer proved something about always gets its own call
   * routing is deterministic: the same batch plans identically, twice
   * batching reduces calls without dropping files
-  * the cache returns a previous answer only for a byte-identical question, and
-    says out loud that it did
+  * legacy cache storage remains inspectable, but review runs never reuse it
 
 The cache tests deliberately mutate one input at a time (content, model, mode,
 prompt version) because the failure mode of a content-addressed cache is
@@ -496,38 +495,67 @@ def test_ordinary_files_share_one_model_call(isolated_data_dir):
     assert "Cached review" not in output
 
 
-def test_an_unchanged_file_is_answered_from_the_cache_and_says_so(isolated_data_dir):
-    """
-    The headline behaviour: the second run of the same repo makes no model calls,
-    and every file says why it did not need one.
-    """
+def test_unchanged_files_are_reviewed_fresh_even_with_legacy_cache_flag(isolated_data_dir):
     files = [file("auth_service.py", SENSITIVE), file("module_0.py", ORDINARY)]
-
     first_output, first_calls = _run_multi_review(files, _settings())
-    assert first_calls, "the first run must make the calls"
-    assert "Cached review" not in first_output
-
     second_output, second_calls = _run_multi_review(files, _settings())
+    assert first_calls
+    assert sorted(second_calls) == sorted(first_calls)
+    assert "Cached review" not in first_output + second_output
+    assert '"cache_hits": 0' in second_output
 
-    assert second_calls == [], "an unchanged repo must not call the model again"
-    assert second_output.count("Cached review") == 2
-    assert "sha256" in second_output          # names the digest it matched
-    assert "no model call was made" in second_output.lower()
 
-
-def test_changing_one_file_re_reviews_only_that_file(isolated_data_dir):
-    """The delta property: editing one file must not re-review the repo."""
+def test_editing_one_file_still_runs_fresh_reviews_for_the_entire_selection(isolated_data_dir):
     files = [file("module_0.py", ORDINARY), file("module_1.py", ORDINARY)]
     _run_multi_review(files, _settings())
-
     changed = [file("module_0.py", ORDINARY + "\n\ndef extra():\n    return 2\n"),
                file("module_1.py", ORDINARY)]
     output, calls = _run_multi_review(changed, _settings())
-
-    assert calls == ["module_0.py"], calls   # the edited file, and only it
-    assert "Cached review" in output          # the untouched one came from cache
-    # The unchanged file still has a full section — a hit is not a gap.
+    assert sorted(calls) == ["module_0.py", "module_1.py"]
+    assert "Cached review" not in output
     assert "module_1.py" in output
+
+
+def test_no_cache_io_for_single_batch_or_static_reviews(isolated_data_dir, monkeypatch):
+    # Existing entries are preserved for explicit cleanup, not reused, mutated,
+    # or converted into a personalization store by new review runs.
+    review_cache.put("legacy", "previous review", kind="static")
+    review_cache.flush()
+    path = review_cache._cache_path()
+    previous = path.read_bytes()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("New reviews must not access the legacy cache")
+
+    for name in ("get", "put", "flush"):
+        monkeypatch.setattr(review_cache, name, forbidden)
+    files = [file("auth_service.py", SENSITIVE), file("package-lock.json", LOCKFILE, "json")]
+    files.extend(file(f"module_{i}.py", ORDINARY) for i in range(4))
+    for _ in range(2):
+        output, calls = _run_multi_review(files, _settings(review_cache_enabled=True))
+        assert sorted(calls) == ["auth_service.py", "module_0.py+module_1.py+module_2.py+module_3.py"]
+        assert "Cached review" not in output
+        assert '"cache_hits": 0' in output
+        assert '"static": 1' in output
+    assert path.read_bytes() == previous
+
+
+def test_fresh_reviews_do_not_create_a_cache_file(isolated_data_dir):
+    settings = _settings()
+    del settings.review_cache_enabled   # current Settings has no cache switch
+    files = [file(f"module_{i}.py", ORDINARY) for i in range(4)]
+    for _ in range(2):
+        output, calls = _run_multi_review(files, settings)
+        assert calls
+        assert "Cached review" not in output
+    assert not review_cache._cache_path().exists()
+
+
+def test_legacy_env_flag_is_not_an_active_setting(monkeypatch):
+    from app.core.config import Settings
+    monkeypatch.setenv("REVIEW_CACHE_ENABLED", "true")
+    settings = Settings(_env_file=None, llm_provider="ollama")
+    assert "review_cache_enabled" not in settings.model_dump()
 
 
 def test_the_cache_does_not_answer_a_different_model(isolated_data_dir):
@@ -547,14 +575,14 @@ def test_switching_mode_is_not_a_cache_hit(isolated_data_dir):
     assert calls, "the agentic review is a different review"
 
 
-def test_cache_can_be_turned_off(isolated_data_dir):
+def test_legacy_disabled_flag_also_runs_fresh_reviews(isolated_data_dir):
     files = [file("auth_service.py", SENSITIVE)]
     settings = _settings(review_cache_enabled=False)
 
     _run_multi_review(files, settings)
     _, calls = _run_multi_review(files, settings)
 
-    assert calls, "with the cache off, every run is a fresh call"
+    assert calls, "every run is fresh regardless of the legacy cache flag"
 
 
 def test_a_batch_that_omits_a_file_falls_back_to_static_for_that_file(isolated_data_dir):
@@ -611,20 +639,20 @@ def test_a_failing_batch_does_not_lose_its_files(isolated_data_dir):
     assert "provider exploded" not in output  # the provider's words stay in the log
 
 
-def test_run_telemetry_reports_calls_and_cache_hits(isolated_data_dir):
+def test_run_telemetry_reports_fresh_calls_and_zero_cache_hits(isolated_data_dir):
     files = [file("auth_service.py", SENSITIVE), file("module_0.py", ORDINARY)]
     _run_multi_review(files, _settings())
     output, _ = _run_multi_review(files, _settings())
 
     assert '"step": "timing"' in output
-    assert '"cache_hits": 2' in output
+    assert '"cache_hits": 0' in output
     assert '"step": "planned"' in output
 
 
 def test_the_cache_endpoints_report_and_clear(isolated_data_dir, client):
     """
-    The cache is user-visible state, so it is reachable over the API: stats
-    without a key (it is a read), clearing with one (it throws away paid work).
+    Legacy entries can be inspected and deleted by the signed-in owner; new
+    review runs never reuse them.
     """
     from app.services import review_cache
 
@@ -632,6 +660,9 @@ def test_the_cache_endpoints_report_and_clear(isolated_data_dir, client):
 
     stats = client.get("/api/v1/review/cache")
     assert stats.status_code == 200
+    assert stats.json()["enabled"] is False
+    assert client.get("/api/v1/review/cache", headers={"Authorization": ""}).status_code == 401
+    assert client.delete("/api/v1/review/cache", headers={"Authorization": ""}).status_code == 401
     body = stats.json()
     assert body["entries"] >= 1
     assert set(body) >= {"entries", "bytes", "hits", "writes", "hit_rate"}
@@ -738,10 +769,10 @@ def test_an_open_circuit_still_produces_a_review(isolated_data_dir):
         assert name in output
 
 
-def test_coverage_does_not_count_a_cached_static_report_as_an_llm_review(isolated_data_dir):
+def test_repeated_static_analysis_is_fresh_and_not_counted_as_an_llm_review(isolated_data_dir):
     """
     Overstating model coverage is the one number in this pipeline a user cannot
-    verify by eye, so it is tested directly: a static report served from cache is
+    verify by eye, so it is tested directly: a freshly generated static report is
     static analysis, not a model review.
     """
     from app.services import multi_review_agent as mra
@@ -754,13 +785,13 @@ def test_coverage_does_not_count_a_cached_static_report_as_an_llm_review(isolate
              patch.object(mra, "get_chat_llm", lambda *a, **k: _DeadLLM()):
             return "".join([tok async for tok in mra.stream_multi_review(files)])
 
-    asyncio.run(collect())            # cold: both files analysed and cached
-    output = asyncio.run(collect())   # warm: both served from cache
+    asyncio.run(collect())
+    output = asyncio.run(collect())   # both files are analysed again
 
-    assert output.count("Cached review") == 2
+    assert "Cached review" not in output
     assert '"llm": 0' in output
     assert '"static": 2' in output
-    assert '"cache_hits": 2' in output
+    assert '"cache_hits": 0' in output
 
 
 def test_an_open_circuit_skips_the_summary_call_too(isolated_data_dir):
@@ -798,3 +829,82 @@ def test_a_healthy_circuit_still_asks_the_model_for_the_summary(isolated_data_di
     # the run had to *try* the model first, which is what this asserts.
     assert "Generating repo summary" in output
     assert "deterministic summary (provider not answering)" not in output
+
+
+def test_legacy_cache_endpoints_are_account_scoped(tmp_path, monkeypatch, client):
+    from app.core import paths
+    from app.core.tenant import reset_current_user_id, set_current_user_id
+
+    monkeypatch.setattr(paths, "get_settings", lambda: SimpleNamespace(
+        chroma_persist_directory=str(tmp_path),
+    ))
+
+    async def verify_owner(token):
+        return {"id": token, "email": "test@example.com"}
+
+    monkeypatch.setattr("app.core.auth_middleware.verify_access_token", verify_owner)
+    review_cache.reset()
+    for owner, count in (("owner-a", 2), ("owner-b", 1)):
+        context = set_current_user_id(owner)
+        try:
+            for index in range(count):
+                review_cache.put(str(index), f"{owner}'s old review", kind="single")
+            review_cache.flush()
+        finally:
+            reset_current_user_id(context)
+
+    def headers(owner):
+        return {"Authorization": f"Bearer {owner}"}
+
+    assert client.get("/api/v1/review/cache", headers=headers("owner-a")).json()["entries"] == 2
+    assert client.get("/api/v1/review/cache", headers=headers("owner-b")).json()["entries"] == 1
+    response = client.delete("/api/v1/review/cache", headers=headers("owner-a"))
+    assert response.status_code == 200
+    assert response.json() == {"removed": 2, "entries": 0}
+    assert client.get("/api/v1/review/cache", headers=headers("owner-b")).json()["entries"] == 1
+    assert client.get("/api/v1/review/cache", headers=headers("owner-a")).json()["entries"] == 0
+
+
+def test_model_comments_are_emitted_for_the_right_source(isolated_data_dir):
+    import json
+    source = "https://github.com/o/r::auth_service.py"
+    info = {**file("auth_service.py", SENSITIVE), "file_path": source}
+    quote = "    response = requests.get(url, verify=False, timeout=10)"
+    line = SENSITIVE.splitlines().index(quote) + 1
+
+    async def model(*args, **kwargs):
+        assert "savflux-comments" in kwargs["repo_context"]
+        yield "Model report\n```savflux-comments\n" + json.dumps({"comments": [{
+            "line": line, "end_line": line, "quote": quote,
+            "title": "Validate TLS", "reason": "Avoid interception.",
+            "suggestion": "Remove verify=False.", "severity": "high",
+        }]}) + "\n```"
+
+    output, _ = _run_multi_review([info], _settings(), fake_stream=model)
+    from app.services.stream_protocol import STATUS_OPEN, STATUS_CLOSE, decode_status
+    import re
+    markers = [decode_status(payload) for payload in re.findall(
+        re.escape(STATUS_OPEN) + r"(.*?)" + re.escape(STATUS_CLOSE), output,
+    )]
+    comments = [m for m in markers if m.get("origin") == "model"]
+    assert len(comments) == 1
+    assert comments[0]["id"] == source
+    assert comments[0]["line"] == line
+    assert any(m.get("step") == "complete" and m.get("tier") == "full" for m in markers)
+
+
+def test_failed_model_review_is_labelled_static_fallback(isolated_data_dir):
+    from app.services.stream_protocol import STATUS_OPEN, STATUS_CLOSE, decode_status, error_event
+    import re
+
+    async def model(*args, **kwargs):
+        yield error_event("provider unavailable")
+
+    output, _ = _run_multi_review([file("auth_service.py", SENSITIVE)], _settings(), fake_stream=model)
+    markers = [decode_status(payload) for payload in re.findall(
+        re.escape(STATUS_OPEN) + r"(.*?)" + re.escape(STATUS_CLOSE), output,
+    )]
+    completion = next(m for m in markers if m.get("step") == "complete" and m.get("file") == "auth_service.py")
+    assert completion["tier"] == "static"
+    assert completion["fallback_reason"]
+    assert "Static fallback" in completion["message"]

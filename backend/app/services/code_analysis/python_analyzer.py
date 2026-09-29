@@ -888,6 +888,7 @@ def _add_complexity_findings(analysis: FileAnalysis) -> None:
                     title=f"`{fn.name}` is very complex",
                     severity=Severity.HIGH,
                     line=fn.line,
+                    end_line=fn.end_line,
                     message=f"Cyclomatic complexity {fn.complexity} means at least "
                     f"{fn.complexity} paths to cover. Functions above 20 are where defects "
                     "concentrate, and full branch coverage is impractical.",
@@ -904,6 +905,7 @@ def _add_complexity_findings(analysis: FileAnalysis) -> None:
                     title=f"`{fn.name}` is complex",
                     severity=Severity.MEDIUM,
                     line=fn.line,
+                    end_line=fn.end_line,
                     message=f"Cyclomatic complexity {fn.complexity} (threshold 10).",
                     evidence=f"def {fn.name}(...)  # {fn.length} lines",
                     confidence=1.0,

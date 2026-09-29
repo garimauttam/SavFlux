@@ -30,7 +30,7 @@
  * read once here and passed down, and the panels that need it are told.
  */
 
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Cloud, Cpu, Database, FolderTree, Github, HardDrive } from "lucide-react";
 import { ActivityRail } from "./components/shell/ActivityRail";
 import { TopBar } from "./components/shell/TopBar";
@@ -46,9 +46,12 @@ import FileTreePanel from "./components/FileTreePanel";
 import { ChangesPanel } from "./components/ChangesPanel";
 import { ShareView } from "./components/ShareView";
 import { LibraryPanel } from "./components/shell/LibraryPanel";
+import { ProfilePanel } from "./components/shell/ProfilePanel";
 import { SettingsDialog } from "./components/shell/SettingsDialog";
 import { useGitHub, useModels } from "./hooks/useIntegrations";
 import { useTheme } from "./hooks/useTheme";
+import { useAuthUserId } from "./lib/authUser";
+import { branchStorageKey, loadRepoBranch, repositoryKey, type IndexedSelection } from "./lib/repositorySelection";
 import { apiFetch } from "./api";
 import { AuthGate } from "./components/AuthGate";
 import { DEFAULT_TAB, SHORTCUT_BY_KEY, type Tab } from "./navigation";
@@ -79,22 +82,12 @@ function PanelLoader({ label }: { label: string }) {
   );
 }
 
-const ACTIVE_REPO_KEY = "savflux:activeRepoUrl";
-const BRANCH_KEY = "savflux:branch";
-
-function loadActiveRepo(): string | null {
-  try {
-    return localStorage.getItem(ACTIVE_REPO_KEY);
-  } catch {
-    return null;
-  }
+function activeRepoKey(userId: string): string {
+  return `savflux:${userId}:activeRepoUrl`;
 }
-function loadBranch(): string {
-  try {
-    return localStorage.getItem(BRANCH_KEY) ?? "";
-  } catch {
-    return "";
-  }
+function loadActiveRepo(userId: string): string | null {
+  try { return localStorage.getItem(activeRepoKey(userId)); }
+  catch { return null; }
 }
 
 /** Share route — https://savflux.app/s/{id}. */
@@ -110,10 +103,19 @@ function App() {
 }
 
 function Workspace() {
+  const userId = useAuthUserId();
   const [indexedFiles, setIndexedFiles] = useState<IndexedFile[]>([]);
   const [indexedRepos, setIndexedRepos] = useState<IndexedRepo[]>([]);
-  const [activeRepoUrl, setActiveRepoUrl] = useState<string | null>(loadActiveRepo);
-  const [branch, setBranch] = useState<string>(loadBranch);
+  const [activeRepoUrl, setActiveRepoUrl] = useState<string | null>(() => loadActiveRepo(userId));
+  const [branchSelections, setBranchSelections] = useState<Record<string, string>>({});
+  const branch = activeRepoUrl
+    ? branchSelections[repositoryKey(activeRepoUrl)] ?? loadRepoBranch(userId, activeRepoUrl)
+    : "";
+  const rememberBranch = useCallback((url: string, selected: string) => {
+    setBranchSelections((current) => ({ ...current, [repositoryKey(url)]: selected }));
+    try { localStorage.setItem(branchStorageKey(userId, url), selected); }
+    catch { /* The in-memory choice still works when storage is unavailable. */ }
+  }, [userId]);
   const [branches, setBranches] = useState<GitHubBranch[]>([]);
   const [defaultBranch, setDefaultBranch] = useState("");
   const [branchesLoading, setBranchesLoading] = useState(false);
@@ -129,27 +131,41 @@ function Workspace() {
   const models = useModels();
   const theme = useTheme();
 
-  const fetchIndexed = useCallback(async () => {
+  const indexRead = useRef(0);
+  const fetchIndexed = useCallback(async (selection?: IndexedSelection) => {
+    const requestId = ++indexRead.current;
+    // This callback runs only after successful ingestion, never on selection or
+    // a failed clone. Update the header even if the follow-up index read fails.
+    if (selection) {
+      rememberBranch(selection.repoUrl, selection.branch);
+      setActiveRepoUrl(selection.repoUrl);
+      try { localStorage.setItem(activeRepoKey(userId), selection.repoUrl); }
+      catch { /* private mode */ }
+    }
     try {
       const [filesRes, reposRes] = await Promise.all([
         apiFetch("/api/v1/chat/indexed-files"),
         apiFetch("/api/v1/ingest/repos"),
       ]);
+      if (!filesRes.ok || !reposRes.ok) throw new Error("Could not refresh the index");
       const filesData = await filesRes.json();
       const reposData = await reposRes.json();
+      if (requestId !== indexRead.current) return;
       setIndexedFiles(filesData.files ?? []);
       const repos: IndexedRepo[] = reposData.repos ?? [];
       setIndexedRepos(repos);
       setActiveRepoUrl((current) => {
         const next =
-          repos.length === 1 && !current
+          selection
+            ? repos.find((repo) => repositoryKey(repo.repo_url) === repositoryKey(selection.repoUrl))?.repo_url ?? selection.repoUrl
+            : repos.length === 1 && !current
             ? repos[0].repo_url
-            : current && !repos.find((r) => r.repo_url === current)
+            : current && !repos.some((r) => repositoryKey(r.repo_url) === repositoryKey(current))
               ? null
               : current;
         try {
-          if (next) localStorage.setItem(ACTIVE_REPO_KEY, next);
-          else localStorage.removeItem(ACTIVE_REPO_KEY);
+          if (next) localStorage.setItem(activeRepoKey(userId), next);
+          else localStorage.removeItem(activeRepoKey(userId));
         } catch {
           /* private mode */
         }
@@ -159,60 +175,51 @@ function Workspace() {
       // The shell must render even if this endpoint is down — an unreachable
       // index is a state to show, not a reason to show nothing.
     }
-  }, []);
+  }, [rememberBranch, userId]);
 
   useEffect(() => {
     void fetchIndexed();
+    return () => { indexRead.current += 1; };
   }, [fetchIndexed]);
 
-  // Branches come from GitHub for the selected repository. A repository that
-  // is not on GitHub (uploaded files) simply has none, and the picker says so
-  // rather than pretending the list is empty for a different reason.
+  // Public repos can list refs without a connected GitHub account. Load every
+  // page, and never replace an explicit selection just because a lookup failed
+  // or the branch isn't on the first page.
   useEffect(() => {
     const slug = repoSlugFromUrl(activeRepoUrl);
-    if (!slug || !github.status?.connected) {
-      setBranches([]);
-      setDefaultBranch("");
-      return;
-    }
+    setBranches([]);
+    setDefaultBranch("");
+    setBranchesLoading(false);
+    if (!slug) return;
     let cancelled = false;
+    const controller = new AbortController();
+    const path = slug.split("/").map(encodeURIComponent).join("/");
     setBranchesLoading(true);
-    (async () => {
+    void (async () => {
       try {
-        const [branchesRes, repoRes] = await Promise.all([
-          apiFetch(`/api/v1/github/repos/${slug}/branches`),
-          apiFetch(`/api/v1/github/repos/${slug}`),
-        ]);
-        if (cancelled) return;
-        const [branchesData, repoData] = await Promise.all([
-          branchesRes.ok ? branchesRes.json() : Promise.resolve({ branches: [] }),
-          repoRes.ok ? repoRes.json() : Promise.resolve({ default_branch: "" }),
-        ]);
-        const nextBranches: GitHubBranch[] = branchesData.branches ?? [];
-        const nextDefault: string = repoData.default_branch ?? "";
-        setBranches(nextBranches);
-        setDefaultBranch(nextDefault);
-        setBranch((current) => {
-          const validCurrent = nextBranches.some((item) => item.name === current);
-          const next = validCurrent ? current : nextDefault || nextBranches[0]?.name || "";
-          try {
-            if (next) localStorage.setItem(BRANCH_KEY, next);
-            else localStorage.removeItem(BRANCH_KEY);
-          } catch {
-            /* private mode */
-          }
-          return next;
-        });
-      } catch {
-        if (!cancelled) {
-          setBranches([]);
-          setDefaultBranch("");
-        }
-      } finally {
-        if (!cancelled) setBranchesLoading(false);
-      }
+        const response = await apiFetch(`/api/v1/github/repos/${path}`, { signal: controller.signal });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled) setDefaultBranch(data.default_branch ?? "");
+      } catch { /* Default is optional; keep the user's explicit choice. */ }
     })();
-    return () => { cancelled = true; };
+    void (async () => {
+      try {
+        let page: number | null = 1;
+        const items: GitHubBranch[] = [];
+        while (page !== null) {
+          const response = await apiFetch(`/api/v1/github/repos/${path}/branches?page=${page}`, { signal: controller.signal });
+          if (!response.ok) break;
+          const data = await response.json();
+          if (cancelled) return;
+          items.push(...(data.branches ?? []));
+          setBranches([...new Map(items.map((item) => [item.name, item])).values()]);
+          page = data.next_page ?? null;
+        }
+      } catch { /* Keep any already loaded refs and the saved selection. */ }
+      finally { if (!cancelled) setBranchesLoading(false); }
+    })();
+    return () => { cancelled = true; controller.abort(); };
   }, [activeRepoUrl, github.status?.connected]);
 
   // "Show me this code" — raised by citations anywhere in the app, and by the
@@ -321,24 +328,38 @@ function Workspace() {
   const selectRepo = useCallback((url: string | null) => {
     setActiveRepoUrl(url);
     try {
-      if (url) localStorage.setItem(ACTIVE_REPO_KEY, url);
-      else localStorage.removeItem(ACTIVE_REPO_KEY);
-    } catch {
-      /* private mode */
-    }
-  }, []);
+      if (url) localStorage.setItem(activeRepoKey(userId), url);
+      else localStorage.removeItem(activeRepoKey(userId));
+    } catch { /* private mode */ }
+  }, [userId]);
 
-  const selectBranch = useCallback((b: string) => {
-    setBranch(b);
-    try {
-      localStorage.setItem(BRANCH_KEY, b);
-    } catch {
-      /* private mode */
-    }
-  }, []);
+  const selectBranch = useCallback((selected: string) => {
+    if (activeRepoUrl) rememberBranch(activeRepoUrl, selected);
+  }, [activeRepoUrl, rememberBranch]);
 
   const hasIndex = indexedFiles.length > 0;
   const githubConnected = Boolean(github.status?.connected && github.status?.valid);
+
+  const renderSettings = (embedded = false) => (
+    <SettingsDialog
+        embedded={embedded}
+        open={embedded || isSettingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        models={models.models}
+        onSelectModel={(name) => void models.select(name)}
+        onSelectMixtureModels={models.selectMixture}
+        onSelectProvider={models.selectProvider}
+        onForgetProviderKey={models.forgetProviderKey}
+        providerBusy={models.busy}
+        providerError={models.error}
+        onOpenGitHub={() => {
+          setSettingsOpen(false);
+          setGitHubOpen(true);
+        }}
+        contextOpen={contextOpen}
+        onToggleContext={() => setContextOpen(!contextOpen)}
+      />
+  );
 
   const body = (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -360,6 +381,7 @@ function Workspace() {
             onIndexed={fetchIndexed}
           />
         )}
+        {activeTab === "profile" && <ProfilePanel github={github.status} onConnectGitHub={() => setGitHubOpen(true)} modelsContent={renderSettings(true)} isDark={theme.isDark} onToggleTheme={theme.toggle} />}
         {activeTab === "review" && <ReviewPanel indexedFiles={indexedFiles} onIndexed={fetchIndexed} />}
         {activeTab === "write" && <CodeWriterPanel indexedFiles={indexedFiles} />}
         {activeTab === "explorer" && <FileTreePanel onOpenFile={(src) => openFileAt(src)} onIndexed={fetchIndexed} />}
@@ -431,7 +453,7 @@ function Workspace() {
         hasIndex={hasIndex}
         githubConnected={githubConnected}
         onConnectGitHub={() => setGitHubOpen(true)}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => setActiveTab("profile")}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -439,7 +461,7 @@ function Workspace() {
           repos={repoOptions}
           activeRepoUrl={activeRepoUrl}
           onSelectRepo={selectRepo}
-          branch={branch}
+          branch={branch || defaultBranch}
           branches={branches.map((b) => b.name)}
           onSelectBranch={selectBranch}
           branchesLoading={branchesLoading}
@@ -449,6 +471,7 @@ function Workspace() {
           modelsBusy={models.busy}
           onSelectModel={(name) => void models.select(name)}
           onConnectGitHub={() => setGitHubOpen(true)}
+          onOpenProfile={() => setActiveTab("profile")}
           onSignOut={() => window.dispatchEvent(new Event("savflux:signout"))}
           onOpenCommandPalette={() => setPaletteOpen(true)}
           contextOpen={contextOpen}
@@ -501,23 +524,7 @@ function Workspace() {
         onConnect={github.connect}
         onDisconnect={github.disconnect}
       />
-      <SettingsDialog
-        open={isSettingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        models={models.models}
-        onSelectModel={(name) => void models.select(name)}
-        onSelectMixtureModels={models.selectMixture}
-        onSelectProvider={models.selectProvider}
-        onForgetProviderKey={models.forgetProviderKey}
-        providerBusy={models.busy}
-        providerError={models.error}
-        onOpenGitHub={() => {
-          setSettingsOpen(false);
-          setGitHubOpen(true);
-        }}
-        contextOpen={contextOpen}
-        onToggleContext={() => setContextOpen(!contextOpen)}
-      />
+      {renderSettings()}
     </div>
   );
 }

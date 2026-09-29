@@ -531,7 +531,11 @@ def test_the_repo_never_imports_a_provider_it_does_not_accept():
                 offenders.append(f"{path.relative_to(backend)}:{number}")
 
     assert not offenders, f"these import a rejected provider: {offenders}"
-    assert "gemini" not in providers, "gemini was added back; update the docs and deps too"
+    # Gemini is now supported through its documented OpenAI-compatible endpoint;
+    # it requires no separate Google SDK or unpinned provider adapter.
+    from app.services.provider_catalog import PROVIDERS
+    assert "gemini" in providers
+    assert PROVIDERS["gemini"]["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai"
 
 
 # ── The offline claim ───────────────────────────────────────────────────────

@@ -6,7 +6,8 @@ route that forwards a callable. What those cannot reach is the part that only sh
 on a real server — when a client disconnects from a `StreamingResponse`, Starlette may
 *abandon* the response's generator instead of unwinding it, and an abandoned frame runs
 no `finally` of mine at all. This drives `main.app` through the raw ASGI interface,
-sends `http.disconnect` after the first body chunk, and asks what the app did next.
+sends `http.disconnect` either before model work or once a model starts, and asks
+what the app did next.
 
 What this harness can prove is bounded by scheduling: the response's teardown is
 requested synchronously but delivered on a later pass of the loop, so the assertions
@@ -28,7 +29,7 @@ from starlette.requests import Request
 REVIEW_TIMEOUT = 10.0
 
 
-async def _post_and_hang_up(app, path: str, body: dict, *, hang_up_after: int = 1):
+async def _post_and_hang_up(app, path: str, body: dict, *, hang_up_after: int = 1, disconnect_when=None):
     """POST `body` through ASGI and disconnect once `hang_up_after` chunks arrive."""
     receive_queue: asyncio.Queue = asyncio.Queue()
     await receive_queue.put(
@@ -81,7 +82,16 @@ async def _post_and_hang_up(app, path: str, body: dict, *, hang_up_after: int = 
         raise AssertionError(f"unexpected ASGI message: {message['type']}")
 
     async def run():
-        await app(scope, receive, send)
+        async def disconnect_on_signal():
+            await disconnect_when.wait()
+            await receive_queue.put({"type": "http.disconnect"})
+        signal_task = asyncio.create_task(disconnect_on_signal()) if disconnect_when else None
+        try:
+            await app(scope, receive, send)
+        finally:
+            if signal_task:
+                signal_task.cancel()
+                await asyncio.gather(signal_task, return_exceptions=True)
 
     return run, chunks
 
@@ -103,11 +113,13 @@ class _Patches:
         return False
 
 
-def _sleeping_review(recorder):
+def _sleeping_review(recorder, started=None):
     """A per-file review that never finishes on its own, and records how it ended."""
 
     async def fake(file_name, content, language, repo_context="", model_override=""):  # noqa: ANN001
         recorder["started"].append(file_name)
+        if started:
+            started.set()
         try:
             await asyncio.sleep(60)
         except asyncio.CancelledError:
@@ -139,9 +151,9 @@ def _sleeping_batch(recorder):
     return fake
 
 
-def _scenario(tmp_path, *, blind_poll: bool) -> dict:
+def _scenario(tmp_path, *, blind_poll: bool, early: bool = False) -> dict:
     """
-    Six model-bound files, two at a time, and a client that vanishes after one chunk.
+    Six model-bound files, two at a time; disconnect early or with calls in flight.
 
     The files carry security-sensitive constructs *and* enough lines for the planner to
     judge them un-settleable by the parser alone: a file it routes static has no model
@@ -179,9 +191,10 @@ def _scenario(tmp_path, *, blind_poll: bool) -> dict:
     )
 
     async def scenario():
+        model_started = asyncio.Event()
         patches = [
-            patch.object(mra, "stream_fast_code_review", _sleeping_review(recorder)),
-            patch.object(mra, "stream_code_review", _sleeping_review(recorder)),
+            patch.object(mra, "stream_fast_code_review", _sleeping_review(recorder, model_started)),
+            patch.object(mra, "stream_code_review", _sleeping_review(recorder, model_started)),
             patch.object(mra, "stream_batch_code_review", _sleeping_batch(recorder)),
             patch.object(mra, "get_settings", lambda: settings),
         ]
@@ -193,7 +206,9 @@ def _scenario(tmp_path, *, blind_poll: bool) -> dict:
 
         with _Patches(patches):
             run, _chunks = await _post_and_hang_up(
-                app, "/api/v1/review/multi", {"files": files}, hang_up_after=1,
+                app, "/api/v1/review/multi", {"files": files},
+                hang_up_after=1 if early else 10**9,
+                disconnect_when=None if early else model_started,
             )
             # Its own task, as it is in production: the server runs one task per
             # response, and the stream hangs its cleanup off that task finishing.
@@ -237,3 +252,9 @@ def test_a_disconnect_the_poll_never_sees_completes_no_reviews(tmp_path, isolate
 
     assert run["finished"] == [], run["finished"]
     assert len(run["started"]) <= 2, run["started"]
+
+
+def test_disconnect_before_annotations_start_makes_no_model_calls(tmp_path, isolated_data_dir, client):
+    run = _scenario(tmp_path, blind_poll=False, early=True)
+    assert run["started"] == []
+    assert run["finished"] == []

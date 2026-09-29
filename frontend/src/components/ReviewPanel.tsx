@@ -2,14 +2,16 @@
  * ReviewPanel.tsx — Unified code review panel.
  *
  * Input tabs:
- *   "From repo"  — folder-tree checkbox picker; 1 file = single review,
- *                  2+ files = multi-file review with combined summary
+ *   "From repo"  — folder-tree selection → planned stream → code + line comments;
+ *                  multiple files also receive a combined summary
  *   "Paste code" — paste raw code, always single review
  *   "PR Diff"    — unified diff → impact + inline comments (+ optional AI review)
  *
- * The Single / Multi distinction is invisible to the user — they just
- * pick files and click Run. The panel routes internally.
+ * Indexed files share one code-first workspace. Paste and PR-diff modes retain
+ * their dedicated views; complete markdown reports remain available for export.
  */
+
+import type { OnIndexed } from "../lib/repositorySelection";
 
 import { useState, useMemo, useEffect, useRef } from "react";
 import { formatDuration } from "../lib/stream";
@@ -42,6 +44,7 @@ import {
   Clock3,
   CheckCircle2,
   GitPullRequest,
+  PanelLeft,
 } from "lucide-react";
 import { IndexedFile } from "../types";
 import { PRReviewPanel } from "./PRReviewPanel";
@@ -51,6 +54,7 @@ import { StopButton } from "./StopButton";
 import { IndexPrompt } from "./IndexPrompt";
 import { useReview } from "../hooks/useReview";
 import { useMultiReview, ReviewSection } from "../hooks/useMultiReview";
+import { ReviewCodeWorkspace } from "./review/ReviewCodeWorkspace";
 import { CodeHighlight } from "../lib/highlight";
 
 interface ReviewPanelProps {
@@ -63,7 +67,7 @@ interface ReviewPanelProps {
   /** Called after the initial selection has been applied, so the parent can clear it. */
   onInitialSourceConsumed?: () => void;
   /** Re-read the index after the user indexes from this page. */
-  onIndexed: () => void;
+  onIndexed: OnIndexed;
 }
 
 // ── Language → icon colour ────────────────────────────────────────────────────
@@ -309,10 +313,9 @@ function sectionStatusStyle(status: ReviewSection["status"]) {
  * Where a file's review came from.
  *
  * The review planner decides per file whether the parser is enough, whether the
- * file shares a batched model call, or whether it earns a call of its own; and a
- * file whose bytes have not changed is answered from the content-hash cache
- * without a call at all. Showing that is the difference between "this was fast"
- * and "this was fast because nothing was skipped".
+ * file shares a batched model call, or whether it earns a call of its own.
+ * Historical cached results remain explicitly labelled for compatibility with
+ * older review streams. New review runs never reuse cached results.
  */
 function ReviewProvenanceChip({ section }: { section: ReviewSection }) {
   if (section.cached) {
@@ -361,6 +364,7 @@ function ReviewProvenanceChip({ section }: { section: ReviewSection }) {
 
 function SectionStatusBadge({ section }: { section: ReviewSection }) {
   const label =
+    section.fallbackReason ? "Static fallback" :
     section.status === "complete" ? "Complete" :
     section.status === "error" ? "Error" :
     section.status === "skipped" ? "No output" :
@@ -370,7 +374,7 @@ function SectionStatusBadge({ section }: { section: ReviewSection }) {
     "Pending";
 
   return (
-    <span className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[10px] font-medium ${sectionStatusStyle(section.status)}`}>
+    <span className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[10px] font-medium ${section.fallbackReason ? "border-amber-500/30 bg-amber-500/10 text-amber-300" : sectionStatusStyle(section.status)}`}>
       {section.status === "complete" ? (
         <CheckCircle2 className="w-3 h-3" />
       ) : section.status === "error" ? (
@@ -460,8 +464,12 @@ function buildTree(files: IndexedFile[]): FolderNode {
     commonPrefix = commonPrefix + firstSegments[0] + "/";
   }
 
+  const repoCount = new Set(files.map(item => item.repo_url)).size;
   const treeFiles: TreeFile[] = files.map((f) => {
-    const relPath = buildRelPath(f.source, commonPrefix);
+    // Stable source IDs contain a repository URL, not filesystem folders.
+    const stable = f.source.includes("::");
+    const relative = stable ? f.source.split("::").slice(1).join("::") : buildRelPath(f.source, commonPrefix);
+    const relPath = repoCount > 1 ? `${repoLabel(f.repo_url) || "Repository"}/${relative}` : relative;
     const parts = relPath.split("/");
     return {
       file: f,
@@ -775,6 +783,9 @@ export function ReviewPanel({
   const [pasteName, setPasteName]       = useState("snippet.py");
 
   // UI
+  const [inputOpen, setInputOpen] = useState(true);
+  const [outputView, setOutputView] = useState<"code" | "report">("code");
+  const [runKey, setRunKey] = useState(0);
   const [traceExpanded, setTraceExpanded] = useState(true);
   const outputRef = useRef<HTMLDivElement | null>(null);
   const outputEndRef = useRef<HTMLDivElement | null>(null);
@@ -865,7 +876,9 @@ export function ReviewPanel({
   };
 
   // ── Run review ────────────────────────────────────────────────────────────
-  const isMulti = selected.size > 1;
+  // The output belongs to the submitted run, never the current checkbox count.
+  // All indexed-file selections use the same planned stream, even one file.
+  const isMulti = tab === "file";
 
   const handleReview = () => {
     if (tab === "paste" && pastedCode.trim()) {
@@ -876,11 +889,10 @@ export function ReviewPanel({
     if (selected.size === 0) return;
     const files = indexedFiles.filter((f) => selected.has(f.source));
     setReviewedSources(files.map((f) => f.source));
-    if (files.length === 1) {
-      single.reviewFile(files[0]);
-    } else {
-      multi.reviewFiles(files);
-    }
+    setRunKey(key => key + 1);
+    setInputOpen(false);
+    setOutputView("code");
+    multi.reviewFiles(files);
   };
 
   // ── Download ──────────────────────────────────────────────────────────────
@@ -950,10 +962,12 @@ export function ReviewPanel({
   ), [multi.sections]);
 
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive || (isMulti && outputView !== "report")) return;
     outputEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [
     isActive,
+    outputView,
+    isMulti,
     single.review.length,
     single.agentSteps.length,
     multi.sections.length,
@@ -973,18 +987,24 @@ export function ReviewPanel({
     <div className="flex flex-col h-full">
 
       {/* ── Header ── */}
-      <div className="px-6 py-3 border-b border-gray-700 bg-gray-900 flex items-center justify-between">
+      <div className="px-4 py-3 border-b border-gray-700 bg-gray-900 flex flex-wrap gap-2 items-center justify-between">
         <div>
           <h2 className="text-sm font-semibold text-white flex items-center gap-2">
             <Zap className="w-4 h-4 text-yellow-400" />
             Code Review Agent
           </h2>
           <p className="text-xs text-gray-500 mt-0.5">
-            Select files from your repo, or paste code — AI reviews them autonomously
+            Select files or paste code — fresh analysis on every run
           </p>
         </div>
-        {hasOutput && (
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {tab === "pr" ? <button className="sf-btn sf-btn-secondary" onClick={() => setTab("file")}>Back to files</button> : <button className="sf-iconbtn h-8 w-8" aria-label={inputOpen ? "Hide review selection" : "Show review selection"} aria-expanded={inputOpen} onClick={() => setInputOpen(v => !v)}><PanelLeft size={16}/></button>}
+          {isMulti && hasOutput && <div className="flex rounded-lg border sf-line p-0.5" aria-label="Review view">
+            <button aria-pressed={outputView === "code"} onClick={() => setOutputView("code")} className={`sf-btn text-xs ${outputView === "code" ? "sf-accent-soft sf-accent" : "sf-btn-ghost"}`}>Code & comments</button>
+            <button aria-pressed={outputView === "report"} onClick={() => setOutputView("report")} className={`sf-btn text-xs ${outputView === "report" ? "sf-accent-soft sf-accent" : "sf-btn-ghost"}`}>Report</button>
+          </div>}
+          {isActive && !inputOpen && <StopButton onClick={handleStop} />}
+          {hasOutput && <div className="flex items-center gap-2">
             <button
               onClick={handleDownload}
               className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-blue-400 transition-colors"
@@ -997,16 +1017,19 @@ export function ReviewPanel({
               onClick={() => {
                 single.reset();
                 multi.reset();
+                setInputOpen(true);
+                setRunKey(key => key + 1);
                 setSelected(new Set());
                 setReviewedSources([]);
               }}
-              className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 transition-colors"
+              disabled={isActive}
+              className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 transition-colors disabled:opacity-40"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               New review
             </button>
-          </div>
-        )}
+          </div>}
+        </div>
       </div>
 
       {/* ── Body ── */}
@@ -1018,14 +1041,15 @@ export function ReviewPanel({
       <div className="flex flex-1 overflow-hidden">
 
         {/* Left: input panel */}
-        <div className="w-72 shrink-0 border-r border-gray-700 flex flex-col bg-gray-900">
+        <div aria-hidden={!inputOpen} className="sf-collapse shrink-0 border-r border-gray-700 flex flex-col bg-gray-900" style={{ width: inputOpen ? 288 : 0, opacity: inputOpen ? 1 : 0, visibility: inputOpen ? "visible" : "hidden" }}>
 
           {/* Tabs: From repo | Paste code */}
           <div className="flex border-b border-gray-700">
             {(["file", "paste", "pr"] as const).map((t) => (
               <button
                 key={t}
-                onClick={() => { setTab(t); single.reset(); multi.reset(); }}
+                disabled={isActive}
+                onClick={() => { setTab(t); single.reset(); multi.reset(); setInputOpen(true); }}
                 className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium transition-colors ${
                   tab === t
                     ? "text-yellow-400 border-b-2 border-yellow-400"
@@ -1058,6 +1082,7 @@ export function ReviewPanel({
                   {/* Select all row */}
                   <div className="px-3 pt-3 pb-2 border-b border-gray-800">
                     <button
+                      disabled={isActive}
                       onClick={toggleAll}
                       className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium border transition-colors ${
                         allSelected
@@ -1102,7 +1127,7 @@ export function ReviewPanel({
                   </div>
 
                   {/* Tree */}
-                  <div className="flex-1 overflow-y-auto py-2 px-2">
+                  <fieldset disabled={isActive} className="flex-1 overflow-y-auto py-2 px-2">
                     <FolderTreeNode
                       node={tree}
                       depth={0}
@@ -1111,7 +1136,7 @@ export function ReviewPanel({
                       onToggleFolder={toggleFolder}
                       defaultOpen={true}
                     />
-                  </div>
+                  </fieldset>
                 </>
               )}
             </div>
@@ -1166,8 +1191,10 @@ export function ReviewPanel({
           </div>
         </div>
 
+        {/* Code-first workspace; reports remain available without guessing anchors. */}
+        {isMulti && hasOutput && <div className="min-w-0 flex-1" style={{ display: outputView === "code" ? "flex" : "none" }}><ReviewCodeWorkspace key={runKey} sections={multi.sections} active={isActive} currentStep={currentStep} error={activeError} stopped={activeStopped} /></div>}
         {/* ── Right: output ── */}
-        <div ref={outputRef} className="flex-1 overflow-y-auto bg-gray-950 flex flex-col">
+        <div style={isMulti && hasOutput && outputView === "code" ? { display: "none" } : undefined} ref={outputRef} className="flex-1 overflow-y-auto bg-gray-950 flex flex-col">
 
           {/* Cited evidence — opened by clicking a line-precise chat citation.
               Rendered above the review output so the span the reader came to
@@ -1192,10 +1219,11 @@ export function ReviewPanel({
                 <Zap className="w-7 h-7 text-yellow-400" />
               </div>
               <div>
-                <h3 className="text-white font-semibold mb-1">Autonomous Code Review</h3>
+                <h3 className="text-white font-semibold mb-1">Code review, in context</h3>
                 <p className="text-sm text-gray-500 max-w-sm">
-                  Select one file for a deep single-file review, or pick multiple files
-                  for a combined review with a repo-wide health summary.
+                  Choose files to review their code with line comments, reasoning
+                  and suggested changes. Full reports and cross-file summaries stay
+                  available alongside the code.
                 </p>
               </div>
               <div className="grid grid-cols-3 gap-2 text-xs text-gray-500 mt-2">

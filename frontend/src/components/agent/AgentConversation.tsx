@@ -30,6 +30,8 @@
  * call" rather than "0 ms". A tidier layout is not worth a tidier claim.
  */
 
+import type { OnIndexed } from "../../lib/repositorySelection";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -44,7 +46,6 @@ import {
   MessageSquare,
   Mic,
   Send,
-  Search,
   ShieldAlert,
   ShieldCheck,
   Square,
@@ -57,6 +58,7 @@ import {
 import { apiFetch } from "../../api";
 import { useChat } from "../../hooks/useChat";
 import { openFileAt } from "../../lib/openFile";
+import { RepositoryIndexForm } from "../RepositoryIndexForm";
 import { usePublicIngest } from "../../hooks/usePublicIngest";
 import { repoDisplayName } from "../../lib/github";
 import { AGENT_TAGS, decodeStatus, drainMarkers, flushTail } from "../../lib/stream";
@@ -84,7 +86,7 @@ interface AgentConversationProps {
   models: ModelStatus | null;
   onOpenGitHub: () => void;
   /** Re-read the index. The empty state can index a public URL or an upload. */
-  onIndexed: () => void;
+  onIndexed: OnIndexed;
 }
 
 const STARTERS = [
@@ -375,11 +377,10 @@ function EmptyState({
   hasIndex: boolean;
   onOpenGitHub: () => void;
   /** Called after a public URL or an upload finishes indexing. */
-  onIndexed: () => void;
+  onIndexed: OnIndexed;
   modelBlocked: boolean;
   modelHint: string | null;
 }) {
-  const [url, setUrl] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { ingesting, progress, error, ingestUrl, upload } = usePublicIngest(onIndexed);
 
@@ -410,34 +411,9 @@ function EmptyState({
             promising them. */}
         <div className="w-full max-w-md space-y-2.5">
           <p className="sf-mute text-[11.5px]">
-            Or paste a public URL, or upload a folder — no account needed.
+            Or paste a public URL, or upload a folder — no GitHub connection needed.
           </p>
-          <div className="flex gap-2">
-            <input
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !ingesting) void ingestUrl(url);
-              }}
-              placeholder="https://github.com/owner/repo"
-              aria-label="Public repository URL"
-              className="sf-input min-w-0 flex-1"
-              disabled={!!ingesting}
-            />
-            <button
-              type="button"
-              onClick={() => void ingestUrl(url)}
-              disabled={!!ingesting || !url.trim()}
-              className="sf-btn sf-btn-primary shrink-0"
-            >
-              {ingesting === url.trim() ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Search className="h-3.5 w-3.5" />
-              )}
-              Index
-            </button>
-          </div>
+          <RepositoryIndexForm busy={!!ingesting} onIndex={ingestUrl} />
           <label className="sf-btn sf-btn-ghost w-full cursor-pointer justify-center">
             <Upload className="h-3.5 w-3.5" />
             {ingesting ? "Indexing…" : "Upload files from this computer"}

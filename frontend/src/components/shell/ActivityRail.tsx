@@ -1,24 +1,13 @@
-/**
- * ActivityRail.tsx — the left navigation column.
- *
- * WHY A RAIL AND NOT A TAB STRIP
- * ------------------------------
- * Seventeen tabs in a row did not fit a laptop, scrolled behind arrows, and
- * made the sections that matter look arbitrary. Nine destinations in a vertical
- * rail fit every screen without scrolling, and grouping them by what you are
- * doing (Work / Understand / Ship / Keep) means the two you want are usually
- * adjacent instead of seventeen clicks apart.
- *
- * The rail expands to show labels on hover-park or by pin, because icon-only
- * navigation is a guessing game for a product with a first-run user: nobody
- * knows that the pink bot icon is the agent. The labels are always in the DOM
- * (`sr-only` when collapsed) so the destination stays reachable by screen
- * reader and by test, and the tooltip is a convenience rather than the only
- * way to know.
- */
+/** Navigation stays at the width explicitly chosen by the user, including on touch. */
 
-import { useEffect, useRef, useState } from "react";
-import { ChevronsLeft, ChevronsRight, Github, Plus, Settings2 } from "lucide-react";
+import { useEffect, useId, useState } from "react";
+import {
+  Github,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  UserRound,
+} from "lucide-react";
 import { NAV_GROUPS, type Tab } from "../../navigation";
 
 interface ActivityRailProps {
@@ -39,18 +28,8 @@ export function ActivityRail({
   onConnectGitHub,
   onOpenSettings,
 }: ActivityRailProps) {
-  // Pinned, not merely hovered.
-  //
-  // The first version of this rail expanded on hover and collapsed on leave,
-  // which sounds polite and is actually hostile: reaching for the composer or
-  // a citation — the two things you do constantly — collapsed the labels out
-  // from under you, so the rail changed width every few seconds. Pinning means
-  // the navigation stays put, and hovering only matters when it is *pinned
-  // closed*, which is the one case where the reader has asked for less.
-  //
-  // The pinned state is remembered, and defaults to open on a screen wide
-  // enough for the labels: nine unfamiliar glyphs with no text is a guessing
-  // game for anyone arriving for the first time.
+  const navigationId = useId();
+  // Layout preference only; no review or source data is persisted.
   const [pinned, setPinned] = useState(() => {
     try {
       const stored = localStorage.getItem("savflux:railPinned");
@@ -65,14 +44,8 @@ export function ActivityRail({
       return true;
     }
   });
-  const [hovered, setHovered] = useState(false);
-  const railRef = useRef<HTMLDivElement>(null);
-
-  // Hover is a desktop affordance. On a touch device there is no hover, so the
-  // pinned state is the only thing that opens the labels; the `title`
-  // attributes carry the names either way.
-  const isTouch = typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)")?.matches;
-  const open = !isTouch && (pinned || hovered);
+  // Explicit controls work on mouse, keyboard and touch; hover never reopens it.
+  const open = pinned;
 
   useEffect(() => {
     try {
@@ -82,25 +55,11 @@ export function ActivityRail({
     }
   }, [pinned]);
 
-  useEffect(() => {
-    const el = railRef.current;
-    if (!el) return;
-    const enter = () => setHovered(true);
-    const leave = () => setHovered(false);
-    el.addEventListener("mouseenter", enter);
-    el.addEventListener("mouseleave", leave);
-    return () => {
-      el.removeEventListener("mouseenter", enter);
-      el.removeEventListener("mouseleave", leave);
-    };
-  }, []);
-
   return (
     <div
-      ref={railRef}
       data-testid="activity-rail"
       data-expanded={open ? "true" : "false"}
-      className="sf-surface flex shrink-0 flex-col border-r sf-line transition-[width] duration-150 ease-out"
+      className="sf-surface flex shrink-0 flex-col border-r sf-line transition-[width] duration-200 motion-reduce:transition-none ease-out"
       style={{ width: open ? "var(--sf-rail-open)" : "var(--sf-rail)" }}
     >
       {/* Wordmark — the product name, not a tab. */}
@@ -109,22 +68,54 @@ export function ActivityRail({
           S
         </div>
         {open && (
-          <span className="sf-text truncate text-[13px] font-semibold tracking-tight">SavFlux</span>
+          <span className="sf-text truncate text-[13px] font-semibold tracking-tight">
+            SavFlux
+          </span>
         )}
       </div>
 
-      <nav
-        aria-label="Sections"
-        className="scrollbar-none flex-1 overflow-y-auto overflow-x-hidden py-2"
+      {/* Always visible, even when the navigation scrolls on a short screen. */}
+      <div
+        className={`flex h-11 shrink-0 items-center ${open ? "justify-between pl-4 pr-2" : "justify-center"}`}
       >
-        {NAV_GROUPS.map((group) => (
+        {open && (
+          <span className="sf-mute text-[10px] font-semibold uppercase tracking-[0.08em]">
+            Work
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => setPinned((v) => !v)}
+          title={open ? "Collapse sidebar" : "Expand sidebar"}
+          aria-label={open ? "Collapse sidebar" : "Expand sidebar"}
+          aria-expanded={open}
+          aria-controls={navigationId}
+          className="sf-iconbtn h-9 w-9 shrink-0"
+        >
+          {open ? (
+            <PanelLeftClose aria-hidden className="h-4 w-4" />
+          ) : (
+            <PanelLeftOpen aria-hidden className="h-4 w-4" />
+          )}
+        </button>
+      </div>
+
+      <nav
+        id={navigationId}
+        aria-label="Sections"
+        className="scrollbar-none min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-2"
+      >
+        {/* Profile has a single, persistent home in the footer below. */}
+        {NAV_GROUPS.filter((group) => group.id !== "account").map((group) => (
           <div key={group.id} className="mb-1.5 px-2">
-            {open && (
+            {open && group.id !== "work" && (
               <div className="sf-mute px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em]">
                 {group.label}
               </div>
             )}
-            {open && <div className="mx-2 mb-1 h-px sf-line" />}
+            {open && group.id !== "work" && (
+              <div className="mx-2 mb-1 h-px sf-line" />
+            )}
             <ul className="space-y-0.5">
               {group.items.map((item) => {
                 const selected = item.id === active;
@@ -185,39 +176,46 @@ export function ActivityRail({
         )}
       </nav>
 
-      <div className="flex flex-col items-center gap-1 border-t sf-line p-2">
-        <button
-          type="button"
-          onClick={onOpenSettings}
-          title="Settings"
-          aria-label="Settings"
-          className="sf-iconbtn h-8 w-8"
-        >
-          <Settings2 className="h-4 w-4" />
-        </button>
+      <div className="flex shrink-0 flex-col gap-1 border-t sf-line p-2">
         {!hasIndex && (
           <button
             type="button"
             onClick={() => onSelect("repos")}
             title="Add a repository"
             aria-label="Add a repository"
-            className="sf-iconbtn h-8 w-8"
+            className={`sf-iconbtn h-9 w-full text-xs ${open ? "justify-start gap-2.5 px-2" : "justify-center"}`}
           >
-            <Plus className="h-4 w-4" />
+            <Plus aria-hidden className="h-4 w-4 shrink-0" />
+            {open && <span>Add repository</span>}
           </button>
         )}
-        {!isTouch && (
-          <button
-            type="button"
-            onClick={() => setPinned((v) => !v)}
-            title={pinned ? "Collapse the sidebar" : "Keep the sidebar open"}
-            aria-label={pinned ? "Collapse the sidebar" : "Keep the sidebar open"}
-            aria-pressed={pinned}
-            className="sf-iconbtn h-8 w-8"
-          >
-            {pinned ? <ChevronsLeft className="h-4 w-4" /> : <ChevronsRight className="h-4 w-4" />}
-          </button>
-        )}
+        <button
+          type="button"
+          role="tab"
+          aria-selected={active === "profile"}
+          onClick={onOpenSettings}
+          title="Profile — account & settings"
+          aria-label="Profile"
+          className={[
+            "flex min-h-12 w-full items-center rounded-lg text-left transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--sf-accent)]",
+            open ? "gap-2.5 px-2" : "justify-center",
+            active === "profile"
+              ? "sf-accent-soft text-[var(--sf-accent)]"
+              : "sf-dim hover:bg-[var(--sf-raised)] hover:text-[var(--sf-text)]",
+          ].join(" ")}
+        >
+          <span className="sf-accent-soft sf-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[var(--sf-accent-line)]">
+            <UserRound aria-hidden className="h-4 w-4" />
+          </span>
+          {open && (
+            <span className="min-w-0">
+              <span className="block text-[13px] font-medium">Profile</span>
+              <span className="sf-mute block truncate text-[11px]">
+                Account & settings
+              </span>
+            </span>
+          )}
+        </button>
       </div>
     </div>
   );

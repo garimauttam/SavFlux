@@ -114,4 +114,6 @@ def compute_diff(source_a: str, source_b: str, context: int = 3) -> dict[str, An
         "b_lines": len(b_lines),
         "a_content": a["content"][:20000],  # cap for frontend preview
         "b_content": b["content"][:20000],
+        "a_truncated": len(a["content"]) > 20000,
+        "b_truncated": len(b["content"]) > 20000,
     }

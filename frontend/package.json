@@ -10,9 +10,12 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "report:bundle": "node scripts/bundle-report.mjs",
-    "report:bundle:gate": "node scripts/bundle-report.mjs --entry-budget-kb 320"
+    "report:bundle:gate": "node scripts/bundle-report.mjs --entry-budget-kb 320",
+    "predev": "node scripts/check-setup.mjs",
+    "test:setup": "node --test scripts/check-setup.test.mjs"
   },
   "dependencies": {
+    "@fontsource/geist-mono": "^5.2.7",
     "@supabase/supabase-js": "^2.117.2",
     "@types/diff": "^7.0.2",
     "diff": "^9.0.0",
@@ -42,5 +45,8 @@
     "typescript": "^5.4.5",
     "vite": "^7.3.6",
     "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

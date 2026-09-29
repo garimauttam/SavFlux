@@ -241,7 +241,7 @@ def test_coverage_separates_a_planner_decision_from_a_provider_failure(isolated_
     assert coverage["pct"] == round(coverage["llm"] / 5 * 100)
 
 
-def test_coverage_reports_cache_hits_without_calling_them_misses(isolated_data_dir):
+def test_repeated_batch_review_reports_fresh_coverage_without_cache_hits(isolated_data_dir):
     files = [
         {"file_name": f"module_{i}.py", "content": ORDINARY, "language": "py"}
         for i in range(4)
@@ -251,8 +251,8 @@ def test_coverage_reports_cache_hits_without_calling_them_misses(isolated_data_d
     assert first["cache_hits"] == 0
 
     second = _coverage_token(_run(files))
-    assert second["cache_hits"] == 4              # every file served from cache
-    assert second["llm"] == 4                     # and still counted as reviewed
+    assert second["cache_hits"] == 0              # no prior result is reused
+    assert second["llm"] == 4                     # freshly reviewed in this run
     assert second["static"] == 0
     assert second["pct"] == 100
 

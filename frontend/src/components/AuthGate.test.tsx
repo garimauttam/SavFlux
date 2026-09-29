@@ -105,3 +105,95 @@ describe("AuthGate", () => {
     await waitFor(() => expect(auth.updateUser).toHaveBeenCalledWith({ password: "a-new-secure-password" }));
   });
 });
+
+function onAuthEvent(event: string, current: typeof session | null = session) {
+  const calls = auth.onAuthStateChange.mock.calls;
+  act(() => calls[calls.length - 1][0](event, current));
+}
+
+async function openWorkspace() {
+  auth.getSession.mockResolvedValue({ data: { session }, error: null });
+  render(<AuthGate><input aria-label="Workspace draft" defaultValue="" /></AuthGate>);
+  const input = await screen.findByLabelText("Workspace draft");
+  fireEvent.change(input, { target: { value: "keep my work" } });
+  return input;
+}
+
+it("keeps the workspace DOM and draft on repeated same-session SIGNED_IN events", async () => {
+  const input = await openWorkspace();
+  const requests = vi.mocked(fetch).mock.calls.length;
+  onAuthEvent("SIGNED_IN");
+  onAuthEvent("SIGNED_IN");
+  onAuthEvent("INITIAL_SESSION");
+  expect(screen.getByLabelText("Workspace draft")).toBe(input);
+  expect(input).toHaveValue("keep my work");
+  expect(fetch).toHaveBeenCalledTimes(requests);
+});
+
+it("revalidates a refreshed token in the background without remounting", async () => {
+  const input = await openWorkspace();
+  let finish!: (response: Response) => void;
+  vi.mocked(fetch).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  const refreshed = { ...session, access_token: "refreshed-token" };
+  onAuthEvent("TOKEN_REFRESHED", refreshed);
+  onAuthEvent("SIGNED_IN", refreshed); // dedupe while the same check is in flight
+  expect(screen.getByLabelText("Workspace draft")).toBe(input);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  await act(async () => { finish(new Response("{}")); });
+  expect(screen.getByLabelText("Workspace draft")).toBe(input);
+  expect(input).toHaveValue("keep my work");
+});
+
+it("preserves drafts on a temporary background failure and allows retry", async () => {
+  const input = await openWorkspace();
+  const refreshed = { ...session, access_token: "refreshed-token" };
+  auth.getSession.mockResolvedValue({ data: { session: refreshed }, error: null });
+  vi.mocked(fetch).mockRejectedValueOnce(new Error("offline"));
+  onAuthEvent("TOKEN_REFRESHED", refreshed);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Could not reach");
+  expect(screen.getByLabelText("Workspace draft")).toBe(input);
+  fireEvent.click(screen.getByRole("button", { name: "Retry connection" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+  expect(input).toHaveValue("keep my work");
+});
+
+it("fails closed when the backend rejects a refreshed token", async () => {
+  await openWorkspace();
+  vi.mocked(fetch).mockResolvedValueOnce(new Response('{"detail":"Session revoked"}', { status: 401 }));
+  onAuthEvent("TOKEN_REFRESHED", { ...session, access_token: "revoked" });
+  expect(await screen.findByRole("alert")).toHaveTextContent("Session revoked");
+  expect(screen.queryByLabelText("Workspace draft")).not.toBeInTheDocument();
+});
+
+it("does not reopen the workspace when verification finishes after sign-out", async () => {
+  await openWorkspace();
+  let finish!: (response: Response) => void;
+  vi.mocked(fetch).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  onAuthEvent("TOKEN_REFRESHED", { ...session, access_token: "late" });
+  onAuthEvent("SIGNED_OUT", null);
+  await act(async () => { finish(new Response("{}")); });
+  expect(screen.queryByLabelText("Workspace draft")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
+});
+
+it("unmounts the old account immediately and verifies the new account", async () => {
+  const oldInput = await openWorkspace();
+  let finish!: (response: Response) => void;
+  vi.mocked(fetch).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  onAuthEvent("SIGNED_IN", { ...session, access_token: "other-token", user: { id: "user-2", email: "other@example.com" } });
+  expect(screen.queryByLabelText("Workspace draft")).not.toBeInTheDocument();
+  await act(async () => { finish(new Response("{}")); });
+  const newInput = await screen.findByLabelText("Workspace draft");
+  expect(newInput).not.toBe(oldInput);
+  expect(newInput).toHaveValue("");
+});
+
+it("ignores an old session read that completes after SIGNED_OUT", async () => {
+  let finish!: (result: unknown) => void;
+  auth.getSession.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  render(<AuthGate><div>private workspace</div></AuthGate>);
+  onAuthEvent("SIGNED_OUT", null);
+  await act(async () => { finish({ data: { session }, error: null }); });
+  expect(screen.queryByText("private workspace")).not.toBeInTheDocument();
+  expect(fetch).not.toHaveBeenCalled();
+});

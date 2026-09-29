@@ -111,7 +111,7 @@ def test_every_review_marker_is_a_canonical_json_object():
         assert len(json.dumps(marker).encode("utf-8")) <= MAX_STATUS_BYTES
         assert marker["step"] in {
             "planned", "file", "complete", "timing", "coverage", "summary",
-            "summary_complete", "tool", "tool_done", "writing", "starting",
+            "summary_complete", "tool", "tool_done", "writing", "starting", "analysis", "finding",
         }, marker["step"]
 
 

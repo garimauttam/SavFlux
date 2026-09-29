@@ -18,6 +18,8 @@
  *   to what?" It's the visual that makes reviewers stop and say "oh, this is real."
  */
 
+import type { OnIndexed } from "../lib/repositorySelection";
+
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import ForceGraph2D from "react-force-graph-2d";
 import { Network, Search, RefreshCw, Loader2, Info, X, ShieldAlert, Flame, TestTube2, ArrowUpRight, Zap, Filter, Download, Eye, EyeOff, Layers } from "lucide-react";
@@ -74,7 +76,7 @@ interface GraphPanelProps {
   /** Called when user double-clicks a node — navigates to Code Review */
   onNavigateToReview: (fileSource: string) => void;
   /** Re-read the index after the user indexes from this page. */
-  onIndexed: () => void;
+  onIndexed: OnIndexed;
 }
 
 export function GraphPanel({
